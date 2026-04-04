@@ -187,6 +187,11 @@ function ChatContent() {
           {hasUnreadByPharmacist
             ? "약사가 확인 중입니다"
             : "약사가 읽었습니다"}
+          {hasUnreadByPharmacist && (
+            <p style={{ color: "var(--text-mid)", fontSize: "14px", textAlign: "center", margin: "6px 0 0" }}>
+              약사 선생님은 약국 근무 중이라 답변에 시간이 걸릴 수 있어요. 보통 24시간 이내에 답변드려요.
+            </p>
+          )}
         </div>
       )}
       {role === "pharmacist" && (

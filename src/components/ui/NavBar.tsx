@@ -63,19 +63,19 @@ export default function NavBar({
       <div className="flex items-center gap-4">
         <Link
           href="/#how"
-          className="hidden md:block text-sm text-text-muted no-underline hover:text-text-dark transition-colors"
+          className="hidden md:block text-sm text-text-mid no-underline hover:text-text-dark transition-colors"
         >
           이용방법
         </Link>
         <Link
           href="/#pharmacists"
-          className="hidden md:block text-sm text-text-muted no-underline hover:text-text-dark transition-colors"
+          className="hidden md:block text-sm text-text-mid no-underline hover:text-text-dark transition-colors"
         >
           약사 소개
         </Link>
         <Link
           href="/signup"
-          className="px-5 py-2 bg-sage-deep text-white rounded-full text-[13px] font-medium no-underline hover:bg-sage-mid transition-colors"
+          className="px-5 py-2 bg-sage-deep text-white rounded-full text-[14px] font-medium no-underline hover:bg-sage-mid transition-colors"
         >
           시작하기
         </Link>

@@ -304,7 +304,7 @@ function QuestionnaireContent() {
 
           {/* Single Select */}
           {q.type === "single" && q.options && (
-            <div className={q.options.length >= 5 ? "option-grid" : "option-list"}>
+            <div className={q.options.length >= 6 ? "option-grid" : "option-list"}>
               {q.options.map((opt) => {
                 const text = getOptionText(opt);
                 const emoji = getOptionEmoji(opt);
@@ -345,7 +345,7 @@ function QuestionnaireContent() {
                 })}
               </div>
             ) : (
-              <div className={q.options.length >= 5 ? "option-grid" : "option-list"}>
+              <div className={q.options.length >= 6 ? "option-grid" : "option-list"}>
                 {q.options.map((opt) => {
                   const text = getOptionText(opt);
                   const emoji = getOptionEmoji(opt);

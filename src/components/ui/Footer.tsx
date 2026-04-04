@@ -11,25 +11,25 @@ export default function Footer() {
           <div className="flex gap-5 flex-wrap">
             <Link
               href="#"
-              className="text-[13px] text-white/40 no-underline hover:text-white/80 transition-colors"
+              className="text-[14px] text-white/50 no-underline hover:text-white/80 transition-colors"
             >
               이용약관
             </Link>
             <Link
               href="#"
-              className="text-[13px] text-white/40 no-underline hover:text-white/80 transition-colors"
+              className="text-[14px] text-white/50 no-underline hover:text-white/80 transition-colors"
             >
               개인정보처리방침
             </Link>
             <Link
               href="#"
-              className="text-[13px] text-white/40 no-underline hover:text-white/80 transition-colors"
+              className="text-[14px] text-white/50 no-underline hover:text-white/80 transition-colors"
             >
               자주 묻는 질문
             </Link>
           </div>
         </div>
-        <div className="text-xs leading-[1.7] pt-5 border-t border-white/[0.06]">
+        <div className="text-[14px] leading-[1.7] pt-5 border-t border-white/[0.06]">
           약사톡은 의료 행위를 하지 않으며, 영양 상담 연결 서비스를 제공합니다.
           본 서비스는 의사의 진료를 대체하지 않습니다.
         </div>

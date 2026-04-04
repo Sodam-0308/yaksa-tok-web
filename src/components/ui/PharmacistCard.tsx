@@ -58,10 +58,10 @@ export default function PharmacistCard({
               </span>
             )}
           </div>
-          <div className="text-[13px] text-text-muted mb-1.5">
+          <div className="text-[14px] text-text-mid mb-1.5">
             {data.pharmacyName} · {data.location}
           </div>
-          <span className="inline-flex items-center gap-1 text-xs text-sage-deep font-medium bg-sage-pale px-2.5 py-[3px] rounded-full">
+          <span className="inline-flex items-center gap-1 text-[14px] text-sage-deep font-medium bg-sage-pale px-2.5 py-[3px] rounded-full">
             📍 {data.distance} · {data.walkTime}
           </span>
         </div>
@@ -70,14 +70,14 @@ export default function PharmacistCard({
       {/* Match Rate */}
       {data.matchRate !== undefined && (
         <div className="flex items-center gap-2 mb-3">
-          <span className="text-[11px] text-text-muted">내 증상 매칭률</span>
+          <span className="text-[14px] text-text-mid">내 증상 매칭률</span>
           <div className="flex-1 h-1 bg-border rounded-sm overflow-hidden">
             <div
               className="h-full bg-terra rounded-sm transition-[width] duration-600"
               style={{ width: `${data.matchRate}%` }}
             />
           </div>
-          <span className="text-xs font-semibold text-terra">
+          <span className="text-[14px] font-semibold text-terra">
             {data.matchRate}%
           </span>
         </div>
@@ -88,7 +88,7 @@ export default function PharmacistCard({
         {data.specialties.map((s) => (
           <span
             key={s.label}
-            className={`px-2.5 py-1 rounded-full text-[11px] font-medium ${tagStyles[s.variant]}`}
+            className={`px-2.5 py-1 rounded-full text-[14px] font-medium ${tagStyles[s.variant]}`}
           >
             {s.isMatch && "✦ "}
             {s.label}
@@ -99,15 +99,15 @@ export default function PharmacistCard({
       {/* Bottom */}
       <div className="flex items-center justify-between pt-3.5 border-t border-border">
         <div className="flex gap-4">
-          <span className="text-xs text-text-muted">
+          <span className="text-[14px] text-text-mid">
             개선 사례 <strong className="text-text-dark font-semibold">{data.caseCount}건</strong>
           </span>
-          <span className="text-xs text-text-muted">
+          <span className="text-[14px] text-text-mid">
             평균 답변 <strong className="text-text-dark font-semibold">{data.avgResponseTime}</strong>
           </span>
         </div>
         <button
-          className="px-4.5 py-2 bg-sage-deep text-white border-none rounded-full text-[13px] font-medium cursor-pointer hover:bg-sage-mid transition-colors font-body"
+          className="px-4.5 py-2 bg-sage-deep text-white border-none rounded-full text-[14px] font-medium cursor-pointer hover:bg-sage-mid transition-colors font-body"
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
