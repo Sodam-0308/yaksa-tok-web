@@ -1,9 +1,178 @@
 "use client";
 
 import { useState, useEffect, useRef, Suspense } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { SYMPTOMS } from "@/lib/symptoms";
+
+/* ══════════════════════════════════════════
+   SVG 아이콘 컴포넌트
+   ══════════════════════════════════════════ */
+
+function IconBattery() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <rect x="4" y="6" width="14" height="12" rx="2" stroke="#3B6D11" strokeWidth="1.5" />
+      <rect x="18" y="9" width="2" height="6" rx="0.5" fill="#3B6D11" />
+      <rect x="6" y="8" width="4" height="8" rx="1" fill="#C06B45" opacity="0.6" />
+    </svg>
+  );
+}
+
+function IconBowl() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 28 28" fill="none">
+      <path d="M5 13 Q7 10 14 10 Q21 10 23 13" stroke="#854F0B" strokeWidth="1.6" fill="#854F0B" opacity="0.35" />
+      <path d="M5 13 Q5 22 14 22 Q23 22 23 13" stroke="#854F0B" strokeWidth="1.6" strokeLinecap="round" fill="none" />
+      <line x1="5" y1="13" x2="23" y2="13" stroke="#854F0B" strokeWidth="1.6" />
+    </svg>
+  );
+}
+
+function IconMoon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#185FA5" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" />
+      <circle cx="18" cy="6" r="1" fill="#185FA5" stroke="none" />
+    </svg>
+  );
+}
+
+function IconFemale() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#993C1D" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="9" r="5" />
+      <line x1="12" y1="14" x2="12" y2="22" />
+      <line x1="9" y1="19" x2="15" y2="19" />
+    </svg>
+  );
+}
+
+function IconSkin() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 28 28" fill="none">
+      <path d="M6 10 Q6 4 14 4 Q22 4 22 10 L22 18 Q22 24 14 24 Q6 24 6 18Z" stroke="#993C1D" strokeWidth="1.5" />
+      <circle cx="9" cy="12" r="1.4" fill="#C06B45" opacity="0.55" />
+      <circle cx="19" cy="10" r="1.2" fill="#C06B45" opacity="0.5" />
+      <circle cx="14" cy="16" r="1.5" fill="#C06B45" opacity="0.5" />
+      <circle cx="8" cy="18" r="1" fill="#C06B45" opacity="0.4" />
+      <circle cx="18" cy="17" r="1.1" fill="#C06B45" opacity="0.45" />
+      <circle cx="12" cy="9" r="0.8" fill="#C06B45" opacity="0.35" />
+    </svg>
+  );
+}
+
+function IconAllergy() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <path d="M4 10 Q8 8 12 10 Q16 12 20 10" stroke="#0F6E56" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M4 14 Q8 12 12 14 Q16 16 20 14" stroke="#0F6E56" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="7" cy="6" r="1.2" fill="#0F6E56" opacity="0.4" />
+      <circle cx="14" cy="5" r="0.9" fill="#0F6E56" opacity="0.4" />
+      <circle cx="18" cy="7" r="1" fill="#0F6E56" opacity="0.4" />
+      <circle cx="10" cy="18" r="0.8" fill="#0F6E56" opacity="0.4" />
+    </svg>
+  );
+}
+
+function IconKnot() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <path d="M5 12 Q8 6 11 12 Q14 18 17 12" stroke="#854F0B" strokeWidth="1.8" strokeLinecap="round" />
+      <circle cx="11" cy="12" r="2.5" stroke="#854F0B" strokeWidth="1.4" fill="none" />
+    </svg>
+  );
+}
+
+function IconSadFace() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <circle cx="11" cy="10" r="6" stroke="#534AB7" strokeWidth="1.5" />
+      <path d="M8 13 Q11 10 14 13" stroke="#534AB7" strokeWidth="1.3" strokeLinecap="round" />
+      <circle cx="9" cy="9" r="0.8" fill="#534AB7" />
+      <circle cx="13" cy="9" r="0.8" fill="#534AB7" />
+      <path d="M6 4 L8 6" stroke="#534AB7" strokeWidth="1" strokeLinecap="round" />
+      <path d="M16 4 L14 6" stroke="#534AB7" strokeWidth="1" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconHair() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <path d="M8 4 L7 20" stroke="#993C1D" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M12 4 L12 20" stroke="#993C1D" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M16 4 L17 20" stroke="#993C1D" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconScale() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <path d="M5 16 Q5 8 11 8 Q17 8 17 16" stroke="#3B6D11" strokeWidth="1.4" strokeLinecap="round" />
+      <line x1="5" y1="16" x2="17" y2="16" stroke="#3B6D11" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M11 12 L11 16" stroke="#3B6D11" strokeWidth="1.2" strokeLinecap="round" />
+      <circle cx="11" cy="11" r="0.7" fill="#3B6D11" />
+    </svg>
+  );
+}
+
+function IconAntiAging() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 26 26" fill="none">
+      <path d="M4 11 A9 9 0 1 1 7 21" stroke="#993C1D" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M7 9 L4 11 L2 8" stroke="#993C1D" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <line x1="13" y1="13" x2="13" y2="8" stroke="#993C1D" strokeWidth="1.5" strokeLinecap="round" />
+      <line x1="13" y1="13" x2="17" y2="13" stroke="#993C1D" strokeWidth="1.5" strokeLinecap="round" />
+      <circle cx="13" cy="13" r="1" fill="#993C1D" />
+    </svg>
+  );
+}
+
+function IconImmune() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 26 26" fill="none">
+      <path d="M13 3 L5 7 L5 14 Q5 20 13 23 Q21 20 21 14 L21 7 Z" stroke="#0F6E56" strokeWidth="1.5" strokeLinejoin="round" />
+      <path d="M11 9 L14 12 L11 15 L14 18" stroke="#C06B45" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+    </svg>
+  );
+}
+
+/* ══════════════════════════════════════════
+   증상 데이터
+   ══════════════════════════════════════════ */
+
+interface LandingSymptom {
+  id: string;
+  label: string;
+  bg: string;
+  icon: React.ReactNode;
+}
+
+const MAIN_SYMPTOMS: LandingSymptom[] = [
+  { id: "만성피로", label: "만성피로", bg: "#EAF3DE", icon: <IconBattery /> },
+  { id: "소화장애", label: "소화장애", bg: "#FAEEDA", icon: <IconBowl /> },
+  { id: "불면/수면", label: "불면/수면", bg: "#E6F1FB", icon: <IconMoon /> },
+  { id: "여성건강/생리통", label: "여성건강/생리통", bg: "#FAECE7", icon: <IconFemale /> },
+  { id: "피부", label: "피부", bg: "#FAECE7", icon: <IconSkin /> },
+  { id: "비염/알레르기", label: "비염/알레르기", bg: "#E1F5EE", icon: <IconAllergy /> },
+  { id: "변비/장건강", label: "변비/장건강", bg: "#FAEEDA", icon: <IconKnot /> },
+  { id: "우울/불안/스트레스", label: "우울/불안/스트레스", bg: "#EEEDFE", icon: <IconSadFace /> },
+  { id: "탈모", label: "탈모", bg: "#FAECE7", icon: <IconHair /> },
+  { id: "체중 관리/붓기", label: "체중 관리/붓기", bg: "#EAF3DE", icon: <IconScale /> },
+  { id: "항노화/항산화", label: "항노화/항산화", bg: "#FAECE7", icon: <IconAntiAging /> },
+  { id: "면역력저하", label: "면역력저하", bg: "#E1F5EE", icon: <IconImmune /> },
+];
+
+const EXTRA_SYMPTOMS = [
+  "두통/목어깨결림",
+  "수족냉증",
+  "안구건조",
+  "관절/뼈",
+  "간 건강",
+  "갱년기",
+  "남성건강",
+];
 
 export default function LandingClient() {
   return (
@@ -14,19 +183,11 @@ export default function LandingClient() {
 }
 
 function LandingContent() {
-  const searchParams = useSearchParams();
-  const [selectedSymptoms, setSelectedSymptoms] = useState<string[]>([]);
+  const router = useRouter();
   const [navScrolled, setNavScrolled] = useState(false);
+  const [showMore, setShowMore] = useState(false);
+  const [customSymptom, setCustomSymptom] = useState("");
   const revealRefs = useRef<(HTMLElement | null)[]>([]);
-
-  // URL 파라미터에서 증상 자동 선택
-  useEffect(() => {
-    const symptomParam = searchParams.get("symptom");
-    if (symptomParam) {
-      const preselected = symptomParam.split(",").map((s) => s.trim());
-      setSelectedSymptoms(preselected);
-    }
-  }, [searchParams]);
 
   // Nav scroll effect
   useEffect(() => {
@@ -55,16 +216,9 @@ function LandingContent() {
     }
   };
 
-  const toggleSymptom = (id: string) => {
-    setSelectedSymptoms((prev) =>
-      prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]
-    );
+  const goToQuestionnaire = (symptom: string) => {
+    router.push(`/questionnaire?symptom=${encodeURIComponent(symptom)}&reset=1`);
   };
-
-  const signupHref =
-    selectedSymptoms.length > 0
-      ? `/signup?symptom=${encodeURIComponent(selectedSymptoms.join(","))}`
-      : "/signup";
 
   return (
     <div className="landing-page">
@@ -81,7 +235,7 @@ function LandingContent() {
 
       <section className="hero">
         <div className="hero-inner">
-          <p className="hero-sub">근거리 전문 약사 매칭 서비스</p>
+          <p className="hero-sub">가까운 상담 전문 약사 매칭 서비스</p>
           <h1>
             요즘 어디가
             <br />
@@ -91,28 +245,171 @@ function LandingContent() {
             해당하는 증상을 골라주세요. 가까운 전문 약사가 도와드릴게요.
           </p>
 
-          <div className="symptom-grid">
-            {SYMPTOMS.map((s) => (
-              <div
-                key={s.id}
-                className={`symptom-chip${selectedSymptoms.includes(s.id) ? " selected" : ""}`}
-                onClick={() => toggleSymptom(s.id)}
-              >
-                <span className="emoji">{s.emoji}</span>
-                <span className="chip-title">{s.label}</span>
-              </div>
+          {/* 메인 증상 10개 — 4열 그리드 */}
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(4, 1fr)",
+            gap: 10,
+            maxWidth: 440,
+            margin: "0 auto",
+          }}>
+            {MAIN_SYMPTOMS.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => goToQuestionnaire(s.id)}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "12px 4px 10px",
+                    borderRadius: 14,
+                    border: "2px solid transparent",
+                    background: "var(--white, #fff)",
+                    cursor: "pointer",
+                    transition: "all 0.15s",
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.06)",
+                  }}
+                >
+                  <div style={{
+                    width: 40,
+                    height: 40,
+                    borderRadius: "50%",
+                    background: s.bg,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                  }}>
+                    {s.icon}
+                  </div>
+                  <span style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: "var(--text-dark, #2C3630)",
+                    textAlign: "center",
+                    lineHeight: 1.3,
+                    wordBreak: "keep-all",
+                  }}>
+                    {s.label}
+                  </span>
+                </button>
             ))}
           </div>
 
-          <div className={`hero-next${selectedSymptoms.length > 0 ? " show" : ""}`}>
-            <p className="hero-next-text">
-              <strong>{selectedSymptoms.join(", ")}</strong> 관련 전문 약사{" "}
-              <strong>3명</strong>이 근처에 있어요
-            </p>
-            <Link href={signupHref} className="btn-start">
-              무료로 상담 시작 <span className="arrow">→</span>
-            </Link>
+          {/* 찾는 증상이 없나요? */}
+          <div style={{ textAlign: "center", marginTop: 16 }}>
+            <button
+              type="button"
+              onClick={() => setShowMore((v) => !v)}
+              style={{
+                padding: "8px 20px",
+                borderRadius: 100,
+                fontSize: 14,
+                fontWeight: 600,
+                background: "var(--sage-pale, #EDF4F0)",
+                color: "var(--sage-deep, #4A6355)",
+                border: "none",
+                cursor: "pointer",
+              }}
+            >
+              {showMore ? "접기 ▲" : "찾는 증상이 없나요? ▼"}
+            </button>
           </div>
+
+          {/* 더보기 증상 태그 */}
+          {showMore && (
+            <div style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 8,
+              justifyContent: "center",
+              marginTop: 12,
+              maxWidth: 440,
+              marginLeft: "auto",
+              marginRight: "auto",
+            }}>
+              {EXTRA_SYMPTOMS.map((label) => (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => goToQuestionnaire(label)}
+                    style={{
+                      padding: "7px 16px",
+                      borderRadius: 100,
+                      fontSize: 14,
+                      fontWeight: 500,
+                      background: "var(--white, #fff)",
+                      color: "var(--text-mid, #3D4A42)",
+                      border: "1.5px solid var(--border, rgba(94,125,108,0.14))",
+                      cursor: "pointer",
+                      transition: "all 0.15s",
+                    }}
+                  >
+                    {label}
+                  </button>
+              ))}
+            </div>
+          )}
+
+          {/* 증상 직접 입력 */}
+          {showMore && (
+            <div style={{
+              maxWidth: 440,
+              margin: "14px auto 0",
+              display: "flex",
+              gap: 8,
+              flexWrap: "wrap",
+            }}>
+              <input
+                type="text"
+                value={customSymptom}
+                onChange={(e) => setCustomSymptom(e.target.value)}
+                placeholder="증상을 직접 입력하세요"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1.5px solid var(--border, rgba(94,125,108,0.14))",
+                  fontSize: 14,
+                  color: "var(--text-dark, #2C3630)",
+                  outline: "none",
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                  background: "var(--white, #fff)",
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && customSymptom.trim()) {
+                    e.preventDefault();
+                    goToQuestionnaire(customSymptom.trim());
+                  }
+                }}
+              />
+              {customSymptom.trim() && (
+                <button
+                  type="button"
+                  onClick={() => goToQuestionnaire(customSymptom.trim())}
+                  style={{
+                    padding: "10px 16px",
+                    borderRadius: 10,
+                    fontSize: 14,
+                    fontWeight: 700,
+                    background: "var(--terra, #C06B45)",
+                    color: "#fff",
+                    border: "none",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                    display: "flex",
+                    alignItems: "center",
+                    flexShrink: 0,
+                  }}
+                >
+                  시작하기
+                </button>
+              )}
+            </div>
+          )}
 
           <div className="hero-trust">
             <div className="trust-item">
@@ -165,6 +462,11 @@ function LandingContent() {
               </div>
             </div>
           </div>
+          <div className="reveal" ref={addRevealRef} style={{ textAlign: "center", marginTop: 40 }}>
+            <Link href="/questionnaire" className="btn-start">
+              무료로 상담 시작 <span className="arrow">→</span>
+            </Link>
+          </div>
         </div>
       </section>
 
@@ -184,11 +486,9 @@ function LandingContent() {
                 <span className="p-tag p-tag-t">만성피로</span>
               </div>
             </div>
-            <div className="pharm-cases">
-              개선 사례
-              <br />
-              <strong>24건</strong>
-            </div>
+            <Link href="/feed" style={{ color: "#C06B45", fontSize: 14, fontWeight: 700, textDecoration: "underline", textUnderlineOffset: 3, whiteSpace: "nowrap", flexShrink: 0 }}>
+              개선 사례 보기 →
+            </Link>
           </div>
           <div className="pharm-card reveal reveal-d1" ref={addRevealRef}>
             <div className="pharm-avatar">👨‍⚕️</div>
@@ -200,11 +500,9 @@ function LandingContent() {
                 <span className="p-tag p-tag-b">비염</span>
               </div>
             </div>
-            <div className="pharm-cases">
-              개선 사례
-              <br />
-              <strong>18건</strong>
-            </div>
+            <Link href="/feed" style={{ color: "#C06B45", fontSize: 14, fontWeight: 700, textDecoration: "underline", textUnderlineOffset: 3, whiteSpace: "nowrap", flexShrink: 0 }}>
+              개선 사례 보기 →
+            </Link>
           </div>
           <div className="pharm-card reveal reveal-d2" ref={addRevealRef}>
             <div className="pharm-avatar">👩‍⚕️</div>
@@ -216,11 +514,9 @@ function LandingContent() {
                 <span className="p-tag p-tag-s">생리통</span>
               </div>
             </div>
-            <div className="pharm-cases">
-              개선 사례
-              <br />
-              <strong>31건</strong>
-            </div>
+            <Link href="/feed" style={{ color: "#C06B45", fontSize: 14, fontWeight: 700, textDecoration: "underline", textUnderlineOffset: 3, whiteSpace: "nowrap", flexShrink: 0 }}>
+              개선 사례 보기 →
+            </Link>
           </div>
         </div>
       </section>

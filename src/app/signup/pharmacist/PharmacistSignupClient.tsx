@@ -1,0 +1,501 @@
+"use client";
+
+import { useState, useRef, useEffect, useCallback, Suspense } from "react";
+import { useRouter } from "next/navigation";
+
+/* ══════════════════════════════════════════
+   상수
+   ══════════════════════════════════════════ */
+
+const TOTAL_STEPS = 5;
+
+const SPECIALTIES = [
+  "만성피로", "소화장애", "불면", "비염", "두통",
+  "생리통", "여드름", "아토피", "우울·불안", "안구건조",
+  "수족냉증", "붓기", "난임·임신준비", "아이성장", "갱년기",
+] as const;
+
+const C = {
+  sageDeep: "#4A6355", sageBright: "#7FA48E", sagePale: "#EDF4F0",
+  sageLight: "#B3CCBE", sageMid: "#5E7D6C",
+  terra: "#C06B45",
+  textDark: "#2C3630", textMid: "#3D4A42",
+  border: "rgba(94, 125, 108, 0.14)", white: "#fff",
+};
+
+/* ══════════════════════════════════════════
+   메인 컴포넌트
+   ══════════════════════════════════════════ */
+
+function PharmacistSignupContent() {
+  const router = useRouter();
+  const [step, setStep] = useState(1);
+
+  /* ── Step 1: 본인 인증 ── */
+  const [phone, setPhone] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [otp, setOtp] = useState(["", "", "", ""]);
+  const [timer, setTimer] = useState(0);
+  const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /* ── Step 2: 기본 정보 ── */
+  const [name, setName] = useState("");
+  const [birthDate, setBirthDate] = useState("");
+
+  /* ── Step 3: 면허 인증 ── */
+  const [license, setLicense] = useState("");
+
+  /* ── Step 4: 약국 정보 ── */
+  const [pharmacyName, setPharmacyName] = useState("");
+  const [pharmacyAddr, setPharmacyAddr] = useState("");
+  const [bizNumber, setBizNumber] = useState("");
+
+  /* ── Step 5: 전문 분야 ── */
+  const [specialties, setSpecialties] = useState<Set<string>>(new Set());
+
+  /* ── 완료 ── */
+  const [done, setDone] = useState(false);
+
+  /* ═══ Timer ═══ */
+  useEffect(() => {
+    if (timer <= 0) {
+      if (timerRef.current) clearInterval(timerRef.current);
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      setTimer((t) => {
+        if (t <= 1 && timerRef.current) clearInterval(timerRef.current);
+        return t - 1;
+      });
+    }, 1000);
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [timer > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ═══ Phone helpers ═══ */
+  const formatPhone = (v: string) => {
+    const d = v.replace(/[^0-9]/g, "").slice(0, 11);
+    if (d.length > 7) return `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}`;
+    if (d.length > 3) return `${d.slice(0, 3)}-${d.slice(3)}`;
+    return d;
+  };
+  const phoneDigits = phone.replace(/-/g, "");
+
+  const sendOTP = () => {
+    if (phoneDigits.length < 10) return;
+    setOtpSent(true);
+    setTimer(180);
+  };
+
+  useEffect(() => {
+    if (otpSent) requestAnimationFrame(() => otpRefs.current[0]?.focus());
+  }, [otpSent]);
+
+  const handleOtpChange = (i: number, v: string) => {
+    const digit = v.replace(/[^0-9]/g, "");
+    const next = [...otp];
+    next[i] = digit;
+    setOtp(next);
+    if (digit && i < 3) otpRefs.current[i + 1]?.focus();
+  };
+
+  const handleOtpKeyDown = (i: number, e: React.KeyboardEvent) => {
+    if (e.key === "Backspace" && !otp[i] && i > 0) otpRefs.current[i - 1]?.focus();
+    if (e.key === "Enter" && otpFilled) verifyOTP();
+  };
+
+  const otpFilled = otp.every((d) => d !== "");
+  const verifyOTP = () => { if (otpFilled) setStep(2); };
+  const timerDisplay = `${String(Math.floor(timer / 60)).padStart(2, "0")}:${String(timer % 60).padStart(2, "0")}`;
+
+  /* ═══ Biz number format ═══ */
+  const formatBiz = (v: string) => {
+    const d = v.replace(/[^0-9]/g, "").slice(0, 10);
+    if (d.length > 5) return `${d.slice(0, 3)}-${d.slice(3, 5)}-${d.slice(5)}`;
+    if (d.length > 3) return `${d.slice(0, 3)}-${d.slice(3)}`;
+    return d;
+  };
+
+  /* ═══ Validity ═══ */
+  const step2Valid = name.trim() && birthDate;
+  const step3Valid = license.trim().length > 0;
+  const step4Valid = pharmacyName.trim() && pharmacyAddr.trim() && bizNumber.replace(/[^0-9]/g, "").length === 10;
+  const step5Valid = specialties.size > 0 && specialties.size <= 3;
+
+  /* ═══ Specialty toggle ═══ */
+  const toggleSpec = (s: string) => {
+    setSpecialties((prev) => {
+      const n = new Set(prev);
+      n.has(s) ? n.delete(s) : (n.size < 3 && n.add(s));
+      return n;
+    });
+  };
+
+  /* ═══ Navigation ═══ */
+  const goBack = useCallback(() => {
+    if (step === 1) router.push("/signup");
+    else setStep((s) => s - 1);
+  }, [step, router]);
+
+  const handleComplete = () => setDone(true);
+
+  /* ═══ Enter key ═══ */
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== "Enter") return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "TEXTAREA") return;
+      if (done) return;
+      if (step === 1 && !otpSent && phoneDigits.length >= 10) { e.preventDefault(); sendOTP(); }
+      else if (step === 1 && otpSent && otpFilled) { e.preventDefault(); verifyOTP(); }
+      else if (step === 2 && step2Valid) { e.preventDefault(); setStep(3); }
+      else if (step === 3 && step3Valid) { e.preventDefault(); setStep(4); }
+      else if (step === 4 && step4Valid) { e.preventDefault(); setStep(5); }
+      else if (step === 5 && step5Valid) { e.preventDefault(); handleComplete(); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ═══ Progress dots ═══ */
+  const dots = Array.from({ length: TOTAL_STEPS }, (_, i) => {
+    const idx = i + 1;
+    if (idx < step) return "done";
+    if (idx === step) return "active";
+    return "";
+  });
+
+  if (done) {
+    return (
+      <div className="signup-page">
+        <div className="signup-container">
+          <div className="signup-card">
+            <div className="step animate-fade-up">
+              <div style={{ textAlign: "center", paddingTop: 20 }}>
+                <div className="success-check">
+                  <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+                </div>
+
+                <h1 className="step-title" style={{ textAlign: "center" }}>
+                  {name || "약사"}님, 환영합니다!
+                </h1>
+                <div className="success-text">
+                  약사톡과 함께 환자의 건강을 개선해주세요.
+                </div>
+
+                {/* 안내 카드 */}
+                <div style={{
+                  display: "flex", flexDirection: "column", gap: 10,
+                  margin: "28px 0 32px", textAlign: "left",
+                }}>
+                  <div style={{
+                    padding: "14px 16px", borderRadius: 12,
+                    background: C.sagePale, fontSize: 14, color: C.textMid, lineHeight: 1.6,
+                  }}>
+                    📋 내 정보에서 상담 시간과 추가 질문을 설정해보세요
+                  </div>
+                  <div style={{
+                    padding: "14px 16px", borderRadius: 12,
+                    background: C.sagePale, fontSize: 14, color: C.textMid, lineHeight: 1.6,
+                  }}>
+                    📝 개선 사례를 올리면 환자가 먼저 찾아와요
+                  </div>
+                </div>
+
+                <button className="btn-next" onClick={() => router.push("/dashboard")}>
+                  대시보드로 이동 <span className="arrow">→</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="page-footer">
+          약사톡은 의료 행위를 하지 않으며, 영양 상담 연결 서비스를 제공합니다.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="signup-page">
+      <nav>
+        <button className="nav-back" onClick={goBack} aria-label="뒤로가기">←</button>
+        <div className="nav-title">약사 가입</div>
+      </nav>
+
+      <div className="signup-container">
+        <div className="signup-card">
+
+          {/* ═══════════ Step 1: 본인 인증 ═══════════ */}
+          {step === 1 && (
+            <div className="step animate-fade-up">
+              <div className="step-progress">
+                {dots.map((cls, i) => <div key={i} className={`progress-dot ${cls}`} />)}
+              </div>
+
+              <h1 className="step-title">
+                휴대폰 번호를<br />알려주세요
+              </h1>
+              <p className="step-desc">본인 확인을 위해 인증번호를 보내드릴게요.</p>
+
+              <div className="input-group">
+                <div className="phone-row">
+                  <input
+                    type="tel"
+                    className="input-field"
+                    placeholder="010-0000-0000"
+                    maxLength={13}
+                    value={phone}
+                    onChange={(e) => setPhone(formatPhone(e.target.value))}
+                  />
+                  <button
+                    className={`btn-send-otp${otpSent ? " sent" : ""}`}
+                    disabled={phoneDigits.length < 10}
+                    onClick={sendOTP}
+                  >
+                    {otpSent ? "재전송" : "인증번호 받기"}
+                  </button>
+                </div>
+              </div>
+
+              {otpSent && (
+                <div className="input-group">
+                  <label className="input-label">인증번호 4자리</label>
+                  <div className="otp-row">
+                    {otp.map((digit, i) => (
+                      <input
+                        key={i}
+                        ref={(el) => { otpRefs.current[i] = el; }}
+                        type="tel"
+                        maxLength={1}
+                        value={digit}
+                        onChange={(e) => handleOtpChange(i, e.target.value)}
+                        onKeyDown={(e) => handleOtpKeyDown(i, e)}
+                        className={`otp-input${digit ? " filled" : ""}`}
+                      />
+                    ))}
+                  </div>
+                  <div className="otp-timer">{timer > 0 ? timerDisplay : "시간 초과"}</div>
+                  <div className="otp-resend">
+                    인증번호가 안 왔나요? <button onClick={sendOTP}>다시 받기</button>
+                  </div>
+                </div>
+              )}
+
+              <button className="btn-next" disabled={!otpFilled} onClick={verifyOTP}>
+                인증 확인 <span className="arrow">→</span>
+              </button>
+
+              <div className="terms">
+                계속 진행하시면 <a href="#">이용약관</a>과 <a href="#">개인정보처리방침</a>에 동의하시는 것으로 간주합니다.
+              </div>
+            </div>
+          )}
+
+          {/* ═══════════ Step 2: 기본 정보 ═══════════ */}
+          {step === 2 && (
+            <div className="step animate-slide-left">
+              <div className="step-progress">
+                {dots.map((cls, i) => <div key={i} className={`progress-dot ${cls}`} />)}
+              </div>
+
+              <h1 className="step-title">
+                기본 정보를<br />알려주세요
+              </h1>
+              <p className="step-desc">약사 인증에 필요한 정보예요.</p>
+
+              <div className="input-group">
+                <label className="input-label">이름</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="홍길동"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </div>
+
+              <div className="input-group">
+                <label className="input-label">생년월일</label>
+                <input
+                  type="date"
+                  className="input-field"
+                  value={birthDate}
+                  onChange={(e) => setBirthDate(e.target.value)}
+                  style={{ colorScheme: "light" }}
+                />
+              </div>
+
+              <button className="btn-next" disabled={!step2Valid} onClick={() => setStep(3)}>
+                다음 <span className="arrow">→</span>
+              </button>
+            </div>
+          )}
+
+          {/* ═══════════ Step 3: 면허 인증 ═══════════ */}
+          {step === 3 && (
+            <div className="step animate-slide-left">
+              <div className="step-progress">
+                {dots.map((cls, i) => <div key={i} className={`progress-dot ${cls}`} />)}
+              </div>
+
+              <h1 className="step-title">
+                약사 면허를<br />인증해주세요
+              </h1>
+              <p className="step-desc">약사 면허를 확인하여 인증합니다.</p>
+
+              <div className="input-group">
+                <label className="input-label">약사 면허번호</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="예: 제 12345호"
+                  value={license}
+                  onChange={(e) => setLicense(e.target.value)}
+                />
+              </div>
+
+              <div style={{
+                padding: "12px 16px", borderRadius: 10,
+                background: C.sagePale, fontSize: 14,
+                color: C.textMid, lineHeight: 1.6, marginBottom: 20,
+              }}>
+                면허 인증��� 가입 후 관리자 확인 절차를 거칩니다. 허위 정보 입력 시 서비스 이용이 제한될 수 있어요.
+              </div>
+
+              <button className="btn-next" disabled={!step3Valid} onClick={() => setStep(4)}>
+                다음 <span className="arrow">→</span>
+              </button>
+            </div>
+          )}
+
+          {/* ═══════════ Step 4: 약국 정보 ═══════════ */}
+          {step === 4 && (
+            <div className="step animate-slide-left">
+              <div className="step-progress">
+                {dots.map((cls, i) => <div key={i} className={`progress-dot ${cls}`} />)}
+              </div>
+
+              <h1 className="step-title">
+                약국 정보를<br />입력해주세요
+              </h1>
+              <p className="step-desc">환자가 약국을 찾을 때 사용되는 정보예요.</p>
+
+              <div className="input-group">
+                <label className="input-label">약국 이름</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="예: 그린약국"
+                  value={pharmacyName}
+                  onChange={(e) => setPharmacyName(e.target.value)}
+                />
+              </div>
+
+              <div className="input-group">
+                <label className="input-label">약국 주소</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="예: 서울특별시 강남구 테헤란로 123"
+                  value={pharmacyAddr}
+                  onChange={(e) => setPharmacyAddr(e.target.value)}
+                />
+                <div style={{ fontSize: 13, color: C.sageMid, marginTop: 6 }}>
+                  추후 카카오맵 주소 검색으로 연동됩니다
+                </div>
+              </div>
+
+              <div className="input-group">
+                <label className="input-label">사업자등록번호</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="000-00-00000"
+                  maxLength={12}
+                  value={bizNumber}
+                  onChange={(e) => setBizNumber(formatBiz(e.target.value))}
+                />
+              </div>
+
+              <button className="btn-next" disabled={!step4Valid} onClick={() => setStep(5)}>
+                다음 <span className="arrow">→</span>
+              </button>
+            </div>
+          )}
+
+          {/* ═══════════ Step 5: 전문 분야 ═══════════ */}
+          {step === 5 && (
+            <div className="step animate-slide-left">
+              <div className="step-progress">
+                {dots.map((cls, i) => <div key={i} className={`progress-dot ${cls}`} />)}
+              </div>
+
+              <h1 className="step-title">
+                전문 분야를<br />선택해주세요
+              </h1>
+              <p className="step-desc">특히 자신 있는 분야를 선택해주세요. (최대 3개)</p>
+
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 16 }}>
+                {SPECIALTIES.map((s) => {
+                  const sel = specialties.has(s);
+                  return (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => toggleSpec(s)}
+                      style={{
+                        padding: "10px 16px",
+                        borderRadius: 100,
+                        fontSize: 14,
+                        fontWeight: sel ? 700 : 500,
+                        background: sel ? C.sageDeep : C.white,
+                        color: sel ? C.white : C.textMid,
+                        border: `1.5px solid ${sel ? C.sageDeep : C.border}`,
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      {s}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {specialties.size >= 3 && (
+                <div style={{ fontSize: 14, color: C.terra, marginBottom: 12 }}>
+                  전문 분야는 최대 3개까지 선택할 수 있어요
+                </div>
+              )}
+
+              <div style={{
+                padding: "12px 16px", borderRadius: 10,
+                background: C.sagePale, fontSize: 14,
+                color: C.textMid, lineHeight: 1.6, marginBottom: 24,
+              }}>
+                상담 가능 분야는 가입 후 내 정보에서 추가할 수 있어요
+              </div>
+
+              <button className="btn-next" disabled={!step5Valid} onClick={handleComplete}>
+                가입 완료 <span className="arrow">→</span>
+              </button>
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      <div className="page-footer">
+        약사톡은 의료 행위를 하지 않으며, 영양 상담 연결 서비스를 제공합니다.
+      </div>
+    </div>
+  );
+}
+
+export default function PharmacistSignupClient() {
+  return (
+    <Suspense>
+      <PharmacistSignupContent />
+    </Suspense>
+  );
+}

@@ -134,7 +134,7 @@ export default function PharmacistClient() {
         <div className="prof-section">
           <div className="prof-match-card">
             <div className="prof-match-score">{data.matchRate}%</div>
-            <div className="prof-match-info">
+            <div className="prof-match-info" style={{ minWidth: 0 }}>
               <div className="prof-match-title">내 증상과 매칭률</div>
               <div className="prof-match-desc">{data.matchDesc}</div>
             </div>
@@ -277,8 +277,8 @@ export default function PharmacistClient() {
       </div>
 
       {/* Bottom CTA */}
-      <div className="prof-bottom-cta">
-        <div className="cta-info">
+      <div className="prof-bottom-cta" style={{ flexWrap: "wrap" }}>
+        <div className="cta-info" style={{ minWidth: 0 }}>
           <div className="cta-free">무료 상담</div>
           <div className="cta-sub">약사가 수락하면 채팅이 시작돼요</div>
         </div>
@@ -286,6 +286,7 @@ export default function PharmacistClient() {
           className={`cta-btn${requested ? " requested" : ""}`}
           onClick={handleRequest}
           disabled={requested}
+          style={{ flexShrink: 1 }}
         >
           {requested ? "요청 완료 ✓" : "상담 요청하기"}
         </button>

@@ -11,13 +11,19 @@ interface PharmacistData {
   pharmacyName: string;
   location: string;
   distance: string;
-  walkTime: string;
-  matchRate: number;
+  travelTime: string;
+  matchLevel: 1 | 2 | 3;
   badge?: string;
   specialties: { label: string; variant: string; isMatch?: boolean }[];
   caseCount: number;
   avgResponseTime: string;
 }
+
+const MATCH_LEVEL_INFO: Record<1 | 2 | 3, { stars: string; label: string }> = {
+  3: { stars: "✦✦✦", label: "전문 분야 매칭" },
+  2: { stars: "✦✦", label: "상담 분야 매칭" },
+  1: { stars: "✦", label: "기본 매칭" },
+};
 
 const MOCK_PHARMACISTS: PharmacistData[] = [
   {
@@ -27,8 +33,8 @@ const MOCK_PHARMACISTS: PharmacistData[] = [
     pharmacyName: "초록숲 약국",
     location: "서울 강남",
     distance: "1.2km",
-    walkTime: "도보 16분",
-    matchRate: 94,
+    travelTime: "도보 16분",
+    matchLevel: 3,
     badge: "TOP 매칭",
     specialties: [
       { label: "소화장애 전문", variant: "match", isMatch: true },
@@ -45,8 +51,8 @@ const MOCK_PHARMACISTS: PharmacistData[] = [
     pharmacyName: "자연담은 약국",
     location: "서울 서초",
     distance: "2.8km",
-    walkTime: "도보 38분",
-    matchRate: 82,
+    travelTime: "차로 8분",
+    matchLevel: 2,
     specialties: [
       { label: "불면·수면 전문", variant: "match", isMatch: true },
       { label: "소화 관리", variant: "s" },
@@ -62,8 +68,8 @@ const MOCK_PHARMACISTS: PharmacistData[] = [
     pharmacyName: "봄빛 약국",
     location: "서울 강남",
     distance: "4.1km",
-    walkTime: "도보 54분",
-    matchRate: 76,
+    travelTime: "차로 12분",
+    matchLevel: 1,
     specialties: [
       { label: "피로·에너지 전문", variant: "match", isMatch: true },
       { label: "피부 관리", variant: "r" },
@@ -113,7 +119,7 @@ function MatchContent() {
   const sorted = useMemo(() => {
     const list = [...MOCK_PHARMACISTS];
     if (sortBy === "match")
-      list.sort((a, b) => b.matchRate - a.matchRate);
+      list.sort((a, b) => b.matchLevel - a.matchLevel);
     else if (sortBy === "distance")
       list.sort((a, b) => parseFloat(a.distance) - parseFloat(b.distance));
     else if (sortBy === "cases")
@@ -131,7 +137,7 @@ function MatchContent() {
   };
 
   return (
-    <div className="match-page">
+    <div className="match-page" style={{ paddingBottom: 80 }}>
       <nav>
         <button className="nav-back" onClick={() => router.push("/questionnaire")} aria-label="뒤로가기">
           ←
@@ -200,7 +206,7 @@ function MatchContent() {
                     value={sortBy}
                     onChange={(e) => setSortBy(e.target.value as SortKey)}
                   >
-                    <option value="match">매칭률순</option>
+                    <option value="match">매칭 등급순</option>
                     <option value="distance">거리순</option>
                     <option value="cases">개선 사례순</option>
                   </select>
@@ -236,46 +242,143 @@ function MatchContent() {
                             {p.pharmacyName} · {p.location}
                           </div>
                           <span className="match-pharm-distance">
-                            📍 {p.distance} · {p.walkTime}
+                            📍 {p.distance}
                           </span>
                         </div>
                       </div>
 
-                      {/* Match Rate */}
-                      <div className="match-row">
-                        <span className="match-label">내 증상 매칭률</span>
-                        <div className="match-bar-bg">
-                          <div
-                            className="match-bar"
-                            style={{ width: `${p.matchRate}%` }}
-                          />
-                        </div>
-                        <span className="match-pct">{p.matchRate}%</span>
+                      {/* Match Level Stars */}
+                      <div style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "8px 12px",
+                        backgroundColor: "var(--terra-pale, #FBF5F1)",
+                        borderRadius: 8,
+                        marginBottom: 4,
+                      }}>
+                        <span style={{
+                          color: "#C06B45",
+                          fontSize: 16,
+                          fontWeight: 700,
+                          letterSpacing: 2,
+                        }}>
+                          {MATCH_LEVEL_INFO[p.matchLevel].stars}
+                        </span>
+                        <span style={{
+                          color: "var(--text-dark, #2C3630)",
+                          fontSize: 14,
+                          fontWeight: 600,
+                        }}>
+                          {MATCH_LEVEL_INFO[p.matchLevel].label}
+                        </span>
                       </div>
 
-                      {/* Tags */}
-                      <div className="match-pharm-tags">
-                        {p.specialties.map((s) => (
-                          <span
-                            key={s.label}
-                            className={`p-tag p-tag-${s.variant}`}
-                          >
-                            {s.isMatch && "✦ "}
-                            {s.label}
-                          </span>
-                        ))}
+                      {/* Quick Stats */}
+                      <div style={{
+                        display: "flex",
+                        gap: 8,
+                        marginBottom: 4,
+                      }}>
+                        <div style={{
+                          flex: 1,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          padding: "10px 12px",
+                          backgroundColor: "var(--sage-pale, #EDF4F0)",
+                          borderRadius: 8,
+                        }}>
+                          <span style={{ fontSize: 18 }}>⚡</span>
+                          <span style={{
+                            fontSize: 14,
+                            fontWeight: 600,
+                            color: "var(--text-dark, #2C3630)",
+                          }}>{p.avgResponseTime} 내 답변</span>
+                        </div>
+                        <div style={{
+                          flex: 1,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          padding: "10px 12px",
+                          backgroundColor: "var(--sage-pale, #EDF4F0)",
+                          borderRadius: 8,
+                        }}>
+                          <span style={{ fontSize: 18 }}>⭐</span>
+                          <span style={{
+                            fontSize: 14,
+                            fontWeight: 600,
+                            color: "var(--text-dark, #2C3630)",
+                          }}>개선 {p.caseCount}건</span>
+                        </div>
+                        <div style={{
+                          flex: 1,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          padding: "10px 12px",
+                          backgroundColor: "var(--sage-pale, #EDF4F0)",
+                          borderRadius: 8,
+                        }}>
+                          <span style={{ fontSize: 18 }}>🏥</span>
+                          <span style={{
+                            fontSize: 14,
+                            fontWeight: 600,
+                            color: "var(--text-dark, #2C3630)",
+                          }}>{p.travelTime}</span>
+                        </div>
                       </div>
+
+                      {/* Tags — 전문 분야 / 상담 가능 분리 */}
+                      {(() => {
+                        const expert = p.specialties.filter((s) => s.isMatch);
+                        const consult = p.specialties.filter((s) => !s.isMatch);
+                        return (
+                          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                            {expert.length > 0 && (
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                <span style={{
+                                  fontSize: 13,
+                                  fontWeight: 700,
+                                  color: "var(--terra, #C06B45)",
+                                  whiteSpace: "nowrap",
+                                }}>전문 분야</span>
+                                {expert.map((s) => (
+                                  <span
+                                    key={s.label}
+                                    className={`p-tag p-tag-${s.variant}`}
+                                  >
+                                    ✦ {s.label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            {consult.length > 0 && (
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                <span style={{
+                                  fontSize: 13,
+                                  fontWeight: 700,
+                                  color: "var(--sage-mid, #5E7D6C)",
+                                  whiteSpace: "nowrap",
+                                }}>상담 가능</span>
+                                {consult.map((s) => (
+                                  <span
+                                    key={s.label}
+                                    className={`p-tag p-tag-${s.variant}`}
+                                  >
+                                    {s.label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {/* Bottom */}
                       <div className="match-pharm-bottom">
-                        <div className="match-pharm-stats">
-                          <div className="match-pharm-stat">
-                            개선 사례 <strong>{p.caseCount}건</strong>
-                          </div>
-                          <div className="match-pharm-stat">
-                            평균 답변 <strong>{p.avgResponseTime}</strong>
-                          </div>
-                        </div>
+                        <div />
                         <button
                           className="match-pharm-action"
                           onClick={(e) => handleRequestConsult(p.name, e)}
@@ -303,7 +406,7 @@ function MatchContent() {
       </div>
 
       {/* Bottom Info */}
-      <div className="match-bottom-info">
+      <div className="match-bottom-info" style={{ position: "static" }}>
         <div className="bottom-info-text">
           상담 요청은 <strong>무료</strong>예요. 약사가 수락하면 채팅이 시작돼요.
         </div>
