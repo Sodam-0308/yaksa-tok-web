@@ -215,6 +215,22 @@ function MypageContent() {
   const [newTimes, setNewTimes] = useState<Set<TimeSlot>>(new Set());
   const [swipedId, setSwipedId] = useState<string | null>(null);
 
+  /* ── 지난 상담 복용 상태 ── */
+  type DoseStatus = "taking" | "completed" | "stopped";
+  const [doseStatus, setDoseStatus] = useState<Record<string, DoseStatus>>({});
+  const [statusModalId, setStatusModalId] = useState<string | null>(null);
+  const [statusDraft, setStatusDraft] = useState<DoseStatus>("completed");
+  const getDoseStatus = (id: string): DoseStatus => doseStatus[id] ?? "completed";
+  const openStatusModal = (id: string) => {
+    setStatusDraft(getDoseStatus(id));
+    setStatusModalId(id);
+  };
+  const saveStatus = () => {
+    if (!statusModalId) return;
+    setDoseStatus((prev) => ({ ...prev, [statusModalId]: statusDraft }));
+    setStatusModalId(null);
+  };
+
   /* ── 복용 가이드 아코디언 (각각 독립 펼침/접힘) ── */
   const [expandedGuides, setExpandedGuides] = useState<Set<number>>(new Set([0]));
   const toggleGuide = (idx: number) => {
@@ -421,7 +437,7 @@ function MypageContent() {
               <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text-dark, #2C3630)" }}>
                 {formatDate(selectedDate)}
                 {dayOffset > 0 && (
-                  <span style={{ fontSize: 13, fontWeight: 500, color: "var(--text-muted, #7A8A80)", marginLeft: 6 }}>
+                  <span style={{ fontSize: 13, fontWeight: 500, color: "#3D4A42", marginLeft: 6 }}>
                     ({dayLabels[dayOffset]})
                   </span>
                 )}
@@ -481,7 +497,7 @@ function MypageContent() {
                             }}
                           >
                             <HeartIcon filled={isChecked} size={20} />
-                            <span style={{ fontSize: 13, fontWeight: 500, color: isChecked ? "#4A6355" : "#7A8A80" }}>{t.slot}</span>
+                            <span style={{ fontSize: 13, fontWeight: 500, color: isChecked ? "#4A6355" : "#3D4A42" }}>{t.slot}</span>
                           </button>
                         );
                       })}
@@ -574,6 +590,7 @@ function MypageContent() {
                 border: gi === 0 ? "1.5px solid #F0D9CC" : "1px solid rgba(94,125,108,0.14)",
                 marginBottom: 12,
                 overflow: "hidden",
+                fontStyle: "normal",
               }}
             >
               {/* 클릭 가능한 헤더 */}
@@ -638,7 +655,7 @@ function MypageContent() {
                         <span style={{ fontSize: 14, fontWeight: 500, color: "#2C3630" }}>{item.timing}</span>
                       </div>
                       {item.memo && (
-                        <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontStyle: "italic" }}>
+                        <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontStyle: "normal" }}>
                           {item.memo}
                         </div>
                       )}
@@ -690,10 +707,10 @@ function MypageContent() {
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630", marginBottom: 2, fontFamily: "'Noto Sans KR', sans-serif" }}>
-                    {isPast ? "체크할 시간이에요!" : `다음 체크 예정: 4월 27일`}
+                    {isPast ? "체크할 시간이에요!" : "다음 체크 예정"}
                   </div>
                   <div style={{ fontSize: 14, color: isPast ? "#C06B45" : "#4A6355", fontWeight: 600 }}>
-                    {isPast ? "밀린 체크를 지금 해보세요" : `D-${diffDays}`}
+                    {isPast ? "밀린 체크를 지금 해보세요" : `4월 27일 · D-${diffDays}`}
                   </div>
                 </div>
                 <button
@@ -784,7 +801,17 @@ function MypageContent() {
           <>
           {/* 진행 중 */}
           {CONSULTS.filter((c) => c.status === "active").map((c) => (
-            <Link key={c.id} href={`/chat/${c.id}`} className="my-consult-card active">
+            <Link
+              key={c.id}
+              href={`/chat/${c.id}`}
+              className="my-consult-card active"
+              style={{
+                background: "#EDF4F0",
+                borderRadius: 12,
+                padding: 16,
+                borderLeft: "none",
+              }}
+            >
               <div className="my-consult-top">
                 <span className="my-consult-pharm">
                   {c.pharmacist} · {c.pharmacy}
@@ -803,24 +830,75 @@ function MypageContent() {
 
           {/* 지난 상담 */}
           <div className="my-consult-past-label">지난 상담</div>
-          {CONSULTS.filter((c) => c.status === "completed").map((c) => (
-            <div key={c.id} className="my-consult-card past">
-              <div className="my-consult-top">
-                <span className="my-consult-pharm">{c.pharmacist}</span>
-                <span className="my-consult-date">{c.date}</span>
-              </div>
-              <div className="my-consult-bottom">
-                <div className="my-consult-tags">
-                  {c.symptoms.map((s) => (
-                    <span key={s.label} className={`my-tag ${TAG_CLASS[s.category]}`}>
-                      {s.label}
-                    </span>
-                  ))}
+          {CONSULTS.filter((c) => c.status === "completed").map((c) => {
+            const st = getDoseStatus(c.id);
+            const stLabel = st === "taking" ? "복용 중" : st === "completed" ? "복용 완료" : "복용 중단";
+            const stTheme =
+              st === "taking"
+                ? { bg: "#EDF4F0", color: "#4A6355", border: "#B3CCBE" }
+                : st === "stopped"
+                  ? { bg: "#FAECE7", color: "#993C1D", border: "#E8C9BD" }
+                  : { bg: "#F0F0F0", color: "#3D4A42", border: "#D6D6D6" };
+            const cardBg =
+              st === "stopped" ? "#FBF5F1" :
+              st === "completed" ? "#F5F5F5" :
+              "#EDF4F0";
+            return (
+              <div
+                key={c.id}
+                className="my-consult-card past"
+                style={{
+                  background: cardBg,
+                  borderRadius: 12,
+                  padding: 16,
+                  borderLeft: "none",
+                }}
+              >
+                <div className="my-consult-top">
+                  <span className="my-consult-pharm">{c.pharmacist}</span>
+                  <span className="my-consult-date">{c.date}</span>
                 </div>
-                <span className="my-consult-status done">완료</span>
+                <div className="my-consult-bottom">
+                  <div className="my-consult-tags">
+                    {c.symptoms.map((s) => (
+                      <span key={s.label} className={`my-tag ${TAG_CLASS[s.category]}`}>
+                        {s.label}
+                      </span>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => openStatusModal(c.id)}
+                    aria-label={`복용 상태 변경 — 현재 ${stLabel}`}
+                    onMouseEnter={(e) => { e.currentTarget.style.opacity = "0.85"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; }}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 6,
+                      background: stTheme.bg,
+                      color: stTheme.color,
+                      border: `1px solid ${stTheme.border}`,
+                      borderRadius: 100,
+                      padding: "6px 12px",
+                      minHeight: 32,
+                      fontSize: 13,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                      whiteSpace: "nowrap",
+                      transition: "opacity 0.15s",
+                    }}
+                  >
+                    {stLabel}
+                    <svg width="8" height="8" viewBox="0 0 10 6" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
+                      <path d="M1 1 L5 5 L9 1" stroke={stTheme.color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           </>
           )}
         </section>
@@ -943,6 +1021,129 @@ function MypageContent() {
               </button>
               <button className="my-btn primary" onClick={() => setShowLogout(false)} type="button">
                 로그아웃
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════ 복용 상태 변경 모달 ═══════ */}
+      {statusModalId && (
+        <div
+          onClick={() => setStatusModalId(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 200,
+            padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff",
+              borderRadius: 16,
+              padding: "24px 20px 20px",
+              width: "100%",
+              maxWidth: 360,
+              boxShadow: "0 10px 40px rgba(0,0,0,0.2)",
+            }}
+          >
+            <h3 style={{ fontSize: 17, fontWeight: 700, color: "#2C3630", margin: "0 0 14px", textAlign: "center", fontFamily: "'Gothic A1', sans-serif" }}>
+              복용 상태를 변경할까요?
+            </h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
+              {([
+                { key: "taking", label: "복용 중" },
+                { key: "completed", label: "복용 완료" },
+                { key: "stopped", label: "복용 중단" },
+              ] as const).map((opt) => {
+                const active = statusDraft === opt.key;
+                return (
+                  <label
+                    key={opt.key}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: "12px 14px",
+                      minHeight: 48,
+                      borderRadius: 10,
+                      border: active ? "1.5px solid #4A6355" : "1px solid rgba(94,125,108,0.2)",
+                      background: active ? "#EDF4F0" : "#fff",
+                      cursor: "pointer",
+                      fontSize: 15,
+                      fontWeight: active ? 600 : 500,
+                      color: "#2C3630",
+                    }}
+                  >
+                    <input
+                      type="radio"
+                      name="dose-status"
+                      checked={active}
+                      onChange={() => setStatusDraft(opt.key)}
+                      style={{ width: 18, height: 18, accentColor: "#4A6355", margin: 0 }}
+                    />
+                    {opt.label}
+                  </label>
+                );
+              })}
+            </div>
+            {statusDraft === "stopped" && (
+              <div
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  background: "#FAECE7",
+                  color: "#993C1D",
+                  fontSize: 14,
+                  lineHeight: 1.5,
+                  marginBottom: 14,
+                }}
+              >
+                중단 이유를 약사님에게 채팅으로 알려주시면 더 나은 가이드를 받을 수 있어요
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                type="button"
+                onClick={() => setStatusModalId(null)}
+                style={{
+                  flex: 1,
+                  padding: "12px 0",
+                  minHeight: 48,
+                  borderRadius: 10,
+                  background: "#F8F9F7",
+                  color: "#3D4A42",
+                  fontSize: 15,
+                  fontWeight: 600,
+                  border: "1px solid rgba(94,125,108,0.2)",
+                  cursor: "pointer",
+                }}
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={saveStatus}
+                style={{
+                  flex: 1,
+                  padding: "12px 0",
+                  minHeight: 48,
+                  borderRadius: 10,
+                  background: "#4A6355",
+                  color: "#fff",
+                  fontSize: 15,
+                  fontWeight: 700,
+                  border: "none",
+                  cursor: "pointer",
+                }}
+              >
+                변경하기
               </button>
             </div>
           </div>

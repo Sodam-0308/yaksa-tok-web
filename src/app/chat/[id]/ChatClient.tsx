@@ -2,6 +2,10 @@
 
 import { useState, useRef, useEffect, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter, useParams } from "next/navigation";
+import {
+  type Template as ChatTemplate,
+  INITIAL_TEMPLATES as TEMPLATE_ITEMS,
+} from "@/data/templatesMock";
 
 interface Message {
   id: string;
@@ -87,18 +91,6 @@ const PHARMACIST_INFO = {
   status: "online" as const,
 };
 
-interface Template {
-  id: number;
-  title: string;
-  content: string;
-}
-
-const TEMPLATES: Template[] = [
-  { id: 1, title: "첫 인사", content: "안녕하세요, 초록숲 약국 김서연 약사입니다. 문답 내용 잘 확인했어요. 궁금한 점 편하게 물어봐 주세요!" },
-  { id: 2, title: "방문 안내", content: "약국에 방문하시면 더 자세한 상담이 가능해요.\n\n📍 초록숲 약국\n⏰ 평일 10시~19시, 토요일 10시~14시\n\n편하신 시간에 오세요!" },
-  { id: 3, title: "복약 가이드", content: "말씀드린 영양제는 아래와 같이 드시면 좋아요.\n\n💊 아침 식후: 비타민B군, 비타민D\n💊 취침 전: 마그네슘\n\n2주 후 경과를 알려주세요." },
-  { id: 4, title: "경과 확인", content: "안녕하세요! 지난번 상담 이후 경과가 궁금해요.\n\n혹시 수면이나 소화 쪽으로 변화가 있으셨나요? 편하게 말씀해 주세요." },
-];
 
 /* 추가 질문 세트 — 약사가 채팅에서 전송 */
 type QSetQuestionType = "객관식" | "주관식" | "다중 선택";
@@ -922,7 +914,7 @@ function ChatContent() {
             </div>
           )}
           {debouncedQuery && searchResults.length === 0 && (
-            <span style={{ fontSize: 12, color: "#7A8A80", whiteSpace: "nowrap" }}>결과 없음</span>
+            <span style={{ fontSize: 13, color: "#3D4A42", whiteSpace: "nowrap" }}>결과 없음</span>
           )}
           <button type="button" onClick={closeSearch} aria-label="검색 닫기"
             style={{ background: "none", border: "none", cursor: "pointer", padding: 4, fontSize: 16, color: "#3D4A42", lineHeight: 1 }}>
@@ -1423,14 +1415,14 @@ function ChatContent() {
           padding: "6px 16px",
           background: "rgba(248,249,247,0.95)",
           borderTop: "1px solid rgba(94,125,108,0.10)",
-          display: "flex", gap: 8, flexWrap: "wrap",
+          display: "flex", gap: 6, flexWrap: "wrap",
         }}>
           <button
             type="button"
             onClick={() => setShowTemplates(true)}
             style={{
               display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "6px 14px", borderRadius: 20,
+              padding: "6px 8px", borderRadius: 20,
               fontSize: 13, fontWeight: 600,
               background: "#EDF4F0", color: "#4A6355",
               border: "1px solid #B3CCBE", cursor: "pointer",
@@ -1443,13 +1435,13 @@ function ChatContent() {
             onClick={() => { setSelectedQSetId(QUESTIONNAIRE_SETS.find((s) => s.isDefault)?.id ?? null); setShowQSetPicker(true); }}
             style={{
               display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "6px 14px", borderRadius: 20,
+              padding: "6px 8px", borderRadius: 20,
               fontSize: 13, fontWeight: 600,
               background: "#EEEDFE", color: "#534AB7",
               border: "1px solid #D6D3F3", cursor: "pointer",
             }}
           >
-            📋 추가 질문
+            추가문답
           </button>
           <button
             type="button"
@@ -1459,7 +1451,7 @@ function ChatContent() {
             }}
             style={{
               display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "6px 14px", borderRadius: 20,
+              padding: "6px 8px", borderRadius: 20,
               fontSize: 13, fontWeight: 600,
               background: "#FBF5F1", color: "#C06B45",
               border: "1px solid #F5E6DC", cursor: "pointer",
@@ -1472,20 +1464,20 @@ function ChatContent() {
             onClick={handleVisitBtnClick}
             style={{
               display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "6px 14px", borderRadius: 20,
+              padding: "6px 8px", borderRadius: 20,
               fontSize: 13, fontWeight: 600,
               background: "#E8F0F5", color: "#5A8BA8",
               border: "1px solid #B3D1E0", cursor: "pointer",
             }}
           >
-            방문 안내
+            방문안내
           </button>
           <button
             type="button"
             onClick={handleReportBtnClick}
             style={{
               display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "6px 14px", borderRadius: 20,
+              padding: "6px 8px", borderRadius: 20,
               fontSize: 13, fontWeight: 600,
               background: "#F5E6DC", color: "#C06B45",
               border: "1px solid #E8D5C8", cursor: "pointer",
@@ -1524,61 +1516,158 @@ function ChatContent() {
 
       {/* Template bottom sheet */}
       {showTemplates && (
-        <div
-          style={{
-            position: "fixed", inset: 0,
-            background: "rgba(0,0,0,0.35)",
-            backdropFilter: "blur(4px)",
-            display: "flex", alignItems: "flex-end", justifyContent: "center",
-            zIndex: 100,
-          }}
-          onClick={() => setShowTemplates(false)}
-        >
+        <>
+          <style>{`
+            @keyframes tmpl-slide-up {
+              from { transform: translateY(100%); }
+              to { transform: translateY(0); }
+            }
+            .tmpl-sheet-overlay {
+              position: fixed; inset: 0;
+              background: rgba(0,0,0,0.3);
+              display: flex; align-items: flex-end; justify-content: center;
+              z-index: 100;
+            }
+            .tmpl-sheet {
+              background: #fff;
+              display: flex; flex-direction: column;
+              width: 100%;
+              max-height: 70vh;
+              border-radius: 20px 20px 0 0;
+              animation: tmpl-slide-up 0.3s ease;
+              overflow: hidden;
+            }
+            @media (min-width: 768px) {
+              .tmpl-sheet-overlay { align-items: center; }
+              .tmpl-sheet {
+                max-width: 480px;
+                max-height: 60vh;
+                border-radius: 16px;
+              }
+            }
+          `}</style>
           <div
-            style={{
-              background: "#fff",
-              borderRadius: 20,
-              padding: "20px 20px 32px",
-              width: "100%", maxWidth: 560,
-              maxHeight: "70dvh", overflowY: "auto",
-              marginBottom: 56,
-            }}
-            onClick={(e) => e.stopPropagation()}
+            className="tmpl-sheet-overlay"
+            onClick={() => setShowTemplates(false)}
           >
-            <div style={{
-              width: 36, height: 4, borderRadius: 2,
-              background: "#D1D5D3", margin: "0 auto 16px",
-            }} />
-            <div style={{ fontSize: 17, fontWeight: 700, color: "#2C3630", marginBottom: 16, fontFamily: "'Gothic A1', sans-serif" }}>
-              답변 템플릿
+            <div
+              className="tmpl-sheet"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-label="답변 템플릿 선택"
+            >
+              {/* 헤더 */}
+              <div style={{ padding: "16px 20px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid rgba(94,125,108,0.1)", flexShrink: 0 }}>
+                <div style={{ fontSize: 18, fontWeight: 600, color: "#2C3630", fontFamily: "'Gothic A1', sans-serif" }}>
+                  답변 템플릿
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowTemplates(false)}
+                  aria-label="닫기"
+                  style={{
+                    width: 40, height: 40, minWidth: 40, minHeight: 40,
+                    borderRadius: 10,
+                    background: "#F8F9F7", color: "#3D4A42",
+                    border: "1px solid rgba(94,125,108,0.14)",
+                    cursor: "pointer",
+                    fontSize: 16, fontWeight: 600,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    padding: 0, lineHeight: 1,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* 템플릿 목록 (카테고리 통합) */}
+              <div style={{ flex: 1, overflowY: "auto", padding: "4px 0 16px" }}>
+                {TEMPLATE_ITEMS.length === 0 ? (
+                  <div style={{ padding: "40px 20px", textAlign: "center" }}>
+                    <div style={{ fontSize: 15, color: "#3D4A42", marginBottom: 16 }}>
+                      아직 템플릿이 없어요
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowTemplates(false);
+                        router.push("/pharmacist/templates");
+                      }}
+                      style={{
+                        minHeight: 48,
+                        padding: "12px 20px",
+                        borderRadius: 10,
+                        border: "1px solid #4A6355",
+                        background: "transparent",
+                        color: "#4A6355",
+                        fontSize: 14,
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                    >
+                      템플릿 관리하기 →
+                    </button>
+                  </div>
+                ) : (
+                  TEMPLATE_ITEMS.map((t: ChatTemplate, idx) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => {
+                        setInput((prev) => (prev.trim() ? `${prev}\n\n${t.content}` : t.content));
+                        setShowTemplates(false);
+                        setTimeout(() => inputRef.current?.focus(), 100);
+                      }}
+                      style={{
+                        display: "block",
+                        width: "100%",
+                        textAlign: "left",
+                        padding: "14px 20px",
+                        minHeight: 56,
+                        background: "transparent",
+                        border: "none",
+                        borderTop: idx === 0 ? "none" : "1px solid rgba(94,125,108,0.1)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                        <span
+                          style={{
+                            fontSize: 12,
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            background: "#EDF4F0",
+                            color: "#4A6355",
+                            fontWeight: 500,
+                            flexShrink: 0,
+                          }}
+                        >
+                          {t.category}
+                        </span>
+                        <span style={{ fontSize: 15, fontWeight: 600, color: "#2C3630" }}>
+                          {t.title}
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          fontSize: 14,
+                          color: "#3D4A42",
+                          lineHeight: 1.5,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden",
+                        }}
+                      >
+                        {t.content}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
             </div>
-            {TEMPLATES.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                onClick={() => {
-                  setInput(t.content);
-                  setShowTemplates(false);
-                  setTimeout(() => inputRef.current?.focus(), 100);
-                }}
-                style={{
-                  display: "block", width: "100%", textAlign: "left",
-                  padding: "14px 16px", borderRadius: 12,
-                  background: "#F8F9F7", marginBottom: 8,
-                  border: "1px solid rgba(94,125,108,0.14)",
-                  cursor: "pointer",
-                }}
-              >
-                <div style={{ fontSize: 15, fontWeight: 600, color: "#2C3630", marginBottom: 4 }}>{t.title}</div>
-                <div style={{
-                  fontSize: 14, color: "#3D4A42", lineHeight: 1.5,
-                  display: "-webkit-box", WebkitLineClamp: 2,
-                  WebkitBoxOrient: "vertical" as const, overflow: "hidden",
-                }}>{t.content}</div>
-              </button>
-            ))}
           </div>
-        </div>
+        </>
       )}
 
       {/* 팔로업 설정 패널 */}
@@ -1826,7 +1915,7 @@ function ChatContent() {
                 padding: "12px 14px", borderRadius: 10, marginBottom: 16,
                 background: "#F4F5F3", border: "1px solid rgba(94,125,108,0.10)",
               }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: "#7A8A80", marginBottom: 6 }}>이전 방문 안내</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#3D4A42", marginBottom: 6 }}>이전 방문 안내</div>
                 <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
                   {formatVisitDate(visitGuide.date)} ({visitGuide.timeSlot}){visitGuide.memo ? ` · ${visitGuide.memo}` : ""}
                 </div>
@@ -1867,7 +1956,7 @@ function ChatContent() {
                 background: "#4A6355", color: "#fff", border: "none", cursor: "pointer",
                 marginBottom: 4,
               }}>이대로 설정</button>
-              <div style={{ fontSize: 11, color: "#7A8A80", marginTop: 4 }}>
+              <div style={{ fontSize: 13, color: "#3D4A42", marginTop: 4 }}>
                 (백엔드 연결 후 실제 AI가 제안합니다)
               </div>
             </div>
@@ -2248,7 +2337,7 @@ function ChatContent() {
               {/* 약사 코멘트 */}
               <div style={{ marginBottom: 16 }}>
                 <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630", marginBottom: 8 }}>
-                  약사 코멘트 <span style={{ fontSize: 13, fontWeight: 500, color: "#7A8A80" }}>(선택)</span>
+                  약사 코멘트 <span style={{ fontSize: 13, fontWeight: 500, color: "#3D4A42" }}>(선택)</span>
                 </div>
                 <textarea
                   value={rptComment}
@@ -2263,7 +2352,7 @@ function ChatContent() {
                     fontFamily: "'Noto Sans KR', sans-serif", boxSizing: "border-box",
                   }}
                 />
-                <div style={{ fontSize: 12, color: "#7A8A80", textAlign: "right", marginTop: 4 }}>
+                <div style={{ fontSize: 12, color: "#3D4A42", textAlign: "right", marginTop: 4 }}>
                   {rptComment.length}/300
                 </div>
               </div>
@@ -2823,7 +2912,7 @@ function ChatContent() {
               background: "#F8F9F7", border: "1px solid rgba(94,125,108,0.14)",
               marginBottom: 16,
             }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#7A8A80", marginBottom: 6 }}>환자 메시지</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "#3D4A42", marginBottom: 6 }}>환자 메시지</div>
               <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
                 {aiDraftPatientMsg}
               </div>

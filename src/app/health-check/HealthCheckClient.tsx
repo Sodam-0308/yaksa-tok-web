@@ -134,9 +134,11 @@ function HealthCheckContent() {
   const router = useRouter();
   const [scores, setScores] = useState(INITIAL_SCORES);
   const [memo, setMemo] = useState("");
+  const [isCompleted, setIsCompleted] = useState(false);
   const [showToast, setShowToast] = useState(false);
   const [showConsentModal, setShowConsentModal] = useState(false);
   const [openHistory, setOpenHistory] = useState<Set<number>>(new Set());
+  const [step1HistoryOpen, setStep1HistoryOpen] = useState(false);
 
   const update = (key: string, val: number) => setScores({ ...scores, [key]: val });
 
@@ -148,13 +150,23 @@ function HealthCheckContent() {
     }, 1800);
   };
 
-  const handleSubmit = () => {
+  const handleStep1Complete = () => {
+    setIsCompleted(true);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const handleFinalSave = () => {
     const hasImproved = ITEMS.some((it) => scores[it.key] - PREV_SCORES[it.key] >= 2);
     if (hasImproved) {
       setShowConsentModal(true);
     } else {
       finishAndRedirect();
     }
+  };
+
+  const handleReedit = () => {
+    setIsCompleted(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const toggleHistory = (i: number) => {
@@ -207,6 +219,9 @@ function HealthCheckContent() {
             </div>
           </div>
 
+          {/* 1단계: 편집 화면 — 점수 + 메모 */}
+          {!isCompleted && (
+            <>
           {/* ── 3. 체크 항목 ── */}
           {ITEMS.map((item) => {
             const val = scores[item.key];
@@ -289,6 +304,123 @@ function HealthCheckContent() {
               }}
             />
             <div style={{ fontSize: 13, color: C.sageMid, textAlign: "right", marginTop: 4 }}>{memo.length}/100</div>
+          </div>
+
+          {/* 지난 기록 (접이식, 체크 전 참고용) */}
+          <div style={card}>
+            <button
+              type="button"
+              onClick={() => setStep1HistoryOpen((v) => !v)}
+              aria-expanded={step1HistoryOpen}
+              style={{
+                width: "100%",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+                padding: 0,
+                minHeight: 48,
+              }}
+            >
+              <span style={{ fontSize: 15, fontWeight: 600, color: C.textDark, fontFamily: "'Gothic A1', sans-serif" }}>
+                지난 기록 보기
+              </span>
+              <svg
+                width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={C.sageMid} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                style={{ transition: "transform 0.2s", transform: step1HistoryOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+            {step1HistoryOpen && (
+              <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+                {HISTORY.length === 0 ? (
+                  <div style={{ fontSize: 14, color: "#3D4A42", textAlign: "center", padding: "12px 0" }}>
+                    아직 기록이 없어요
+                  </div>
+                ) : (
+                  HISTORY.map((h, hi) => (
+                    <div key={hi} style={{ padding: "12px 14px", borderRadius: 10, background: C.sageBg, border: `1px solid ${C.border}` }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", background: hi === 0 ? C.sageDeep : C.sageLight, flexShrink: 0 }} />
+                        <span style={{ fontSize: 14, fontWeight: 600, color: C.textDark }}>{h.date}</span>
+                        {hi === HISTORY.length - 1 && (
+                          <span style={{ fontSize: 12, fontWeight: 600, color: C.sageDeep, padding: "2px 8px", borderRadius: 6, background: C.sagePale }}>첫 체크</span>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {ITEMS.map((item) => (
+                          <div key={item.key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <span style={{ fontSize: 14, color: C.textMid, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 22, height: 22, borderRadius: "50%", background: item.iconBg, flexShrink: 0 }}>{item.icon}</span>
+                              {item.label}
+                            </span>
+                            <span style={{ fontSize: 14, fontWeight: 700, color: C.sageDeep }}>{h.scores[item.key]}/10</span>
+                          </div>
+                        ))}
+                      </div>
+                      {h.memo && (
+                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}`, fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
+                          &ldquo;{h.memo}&rdquo;
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+            </>
+          )}
+
+          {/* 2단계: 완료 후 읽기 전용 요약 + 비교 + 지난 기록 */}
+          {isCompleted && (
+            <>
+          {/* 오늘의 점수 요약 (읽기 전용) */}
+          <div style={card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, fontFamily: "'Gothic A1', sans-serif" }}>
+                오늘의 체크 완료
+              </div>
+              <button
+                type="button"
+                onClick={handleReedit}
+                style={{
+                  padding: "6px 12px",
+                  minHeight: 36,
+                  borderRadius: 8,
+                  background: "transparent",
+                  color: C.sageDeep,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  border: `1px solid ${C.sageLight}`,
+                  cursor: "pointer",
+                }}
+              >
+                다시 수정하기
+              </button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {ITEMS.map((item) => (
+                <div key={item.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, borderRadius: "50%", background: item.iconBg, flexShrink: 0 }}>{item.icon}</span>
+                    <span style={{ fontSize: 15, fontWeight: 600, color: C.textDark }}>{item.label}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <ScoreHearts score={scores[item.key]} size={18} />
+                    <span style={{ fontSize: 17, fontWeight: 800, color: C.sageDeep, minWidth: 28, textAlign: "right" }}>{scores[item.key]}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {memo && (
+              <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.border}`, fontSize: 14, color: C.textMid, lineHeight: 1.6 }}>
+                &ldquo;{memo}&rdquo;
+              </div>
+            )}
           </div>
 
           {/* ── 5. 이전 기록 비교 요약 ── */}
@@ -434,6 +566,8 @@ function HealthCheckContent() {
               );
             })}
           </div>
+            </>
+          )}
         </div>
 
         {/* ── 6. 하단 버튼 ── */}
@@ -441,10 +575,11 @@ function HealthCheckContent() {
           <div className="hc-bottom-inner">
             <button
               type="button"
-              onClick={handleSubmit}
+              onClick={isCompleted ? handleFinalSave : handleStep1Complete}
               style={{
                 width: "100%",
                 padding: "15px 0",
+                minHeight: 52,
                 borderRadius: 14,
                 fontSize: 16,
                 fontWeight: 700,
@@ -454,7 +589,7 @@ function HealthCheckContent() {
                 cursor: "pointer",
               }}
             >
-              체크 완료
+              {isCompleted ? "저장하고 나가기" : "체크 완료"}
             </button>
           </div>
         </div>

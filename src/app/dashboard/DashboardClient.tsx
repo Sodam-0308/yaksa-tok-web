@@ -2024,7 +2024,7 @@ function DashboardContent() {
         {/* 환자 직접 등록 버튼 */}
         <button
           type="button"
-          onClick={() => router.push("/patient/new")}
+          onClick={() => router.push("/chart/new")}
           style={{
             display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
             width: "100%", padding: "12px 0", borderRadius: 12,
@@ -2457,12 +2457,12 @@ function DashboardContent() {
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, tableLayout: "fixed" }}>
               <thead>
                 <tr style={{ background: "var(--sage-pale, #EDF4F0)" }}>
-                  <th style={{ padding: "10px 12px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>이름</th>
-                  <th style={{ width: 60, padding: "10px 8px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>나이</th>
-                  <th className="dash-list-gender-col" style={{ width: 50, padding: "10px 8px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>성별</th>
-                  <th style={{ width: 100, padding: "10px 8px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>상태</th>
-                  <th style={{ width: 80, padding: "10px 8px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>방문</th>
-                  <th style={{ width: 80, padding: "10px 8px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>액션</th>
+                  <th style={{ minWidth: 70, padding: "10px 12px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>이름</th>
+                  <th style={{ width: 45, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>나이</th>
+                  <th className="dash-list-gender-col" style={{ width: 35, padding: "10px 4px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>성별</th>
+                  <th style={{ width: 80, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>상태</th>
+                  <th className="dash-list-visit-col" style={{ width: 80, minWidth: 65, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>방문</th>
+                  <th className="dash-list-action-col" style={{ width: 70, minWidth: 70, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>액션</th>
                 </tr>
               </thead>
               <tbody>
@@ -2473,10 +2473,8 @@ function DashboardContent() {
                   const isOver = rTag === "over";
                   const listAge = CURRENT_YEAR - c.birthYear;
                   const visitLabel = c.nextVisitDate
-                    ? `🗓️ ${c.nextVisitDate.slice(5).replace(".", "/")}`
-                    : c.visitDate
-                      ? c.visitDate.slice(5).replace(".", "/")
-                      : "방문 전";
+                    ? `예약 ${c.nextVisitDate.slice(5).replace(".", "/")}`
+                    : "방문전";
                   const visitTitle = c.nextVisitDate
                     ? `방문 예정 ${c.nextVisitDate.slice(5).replace(".", "/")}`
                     : c.visitDate
@@ -2499,33 +2497,35 @@ function DashboardContent() {
                     >
                       <td
                         style={{
+                          minWidth: 70,
                           padding: "12px", fontWeight: 700,
                           color: "#2C3630",
                           whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                         }}
                       >
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                          <span>{c.patientName}{rTag === "regular" ? " 💚" : ""}</span>
+                        <span style={{ display: "inline-flex", alignItems: "center", minWidth: 0 }}>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{c.patientName}</span>
+                          {rTag === "regular" && <span aria-hidden="true" style={{ marginLeft: 4, flexShrink: 0 }}>💚</span>}
                           {c.unreadCount > 0 && (
                             <span
                               className="dash-unread-badge"
-                              style={{ flexShrink: 0, ...getUnreadBadgeStyle(rowHours) }}
+                              style={{ flexShrink: 0, marginLeft: 6, ...getUnreadBadgeStyle(rowHours) }}
                             >
                               {c.unreadCount}
                             </span>
                           )}
                         </span>
                       </td>
-                      <td style={{ padding: "12px 8px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>{listAge}세</td>
-                      <td className="dash-list-gender-col" style={{ padding: "12px 8px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>{c.patientGender}</td>
-                      <td style={{ padding: "12px 8px", whiteSpace: "nowrap", overflow: "hidden" }}>
+                      <td style={{ padding: "12px 6px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{listAge}세</td>
+                      <td className="dash-list-gender-col" style={{ padding: "12px 4px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{c.patientGender}</td>
+                      <td style={{ padding: "12px 6px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                         <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
                           {c.isRejected ? (
                             <span
                               title="거절됨"
                               style={{
                                 display: "inline-flex", alignItems: "center", justifyContent: "center",
-                                padding: "3px 10px", borderRadius: 8,
+                                padding: "3px 8px", borderRadius: 8,
                                 fontSize: 14, background: "#FFE5E5",
                               }}
                             >❌</span>
@@ -2534,7 +2534,7 @@ function DashboardContent() {
                               title={stCfg.label}
                               style={{
                                 display: "inline-flex", alignItems: "center", justifyContent: "center",
-                                padding: "3px 10px", borderRadius: 8,
+                                padding: "3px 8px", borderRadius: 8,
                                 fontSize: 14, background: stCfg.bg,
                               }}
                             >{stCfg.emoji}</span>
@@ -2546,7 +2546,7 @@ function DashboardContent() {
                               title={`이전 거절 이력 ${c.previousRejections!.length}건`}
                               style={{
                                 display: "inline-flex", alignItems: "center", justifyContent: "center",
-                                padding: "3px 8px", borderRadius: 8,
+                                padding: "3px 6px", borderRadius: 8,
                                 fontSize: 13, fontWeight: 600,
                                 background: "#FFF8E1", color: "#B06D00",
                               }}
@@ -2554,14 +2554,14 @@ function DashboardContent() {
                           )}
                         </span>
                       </td>
-                      <td title={visitTitle} style={{ padding: "12px 8px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis" }}>
+                      <td className="dash-list-visit-col" title={visitTitle} style={{ padding: "12px 6px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", fontSize: 14, overflow: "hidden", textOverflow: "ellipsis" }}>
                         {visitLabel}
                       </td>
-                      <td style={{ padding: "12px 8px", whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                      <td className="dash-list-action-col" style={{ padding: "12px 6px", whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
                         {c.isRejected ? (
                           <span style={{ fontSize: 12, color: "var(--text-mid, #3D4A42)" }}>-</span>
                         ) : isReqRow ? (
-                          <span style={{ display: "inline-flex", gap: 4 }}>
+                          <span style={{ display: "inline-flex", gap: 4, flexShrink: 0 }}>
                             <button
                               type="button"
                               title="수락"
@@ -2569,6 +2569,7 @@ function DashboardContent() {
                               onClick={(e) => { e.stopPropagation(); handleAccept(c.id); }}
                               style={{
                                 ...actionBtnStyle,
+                                flexShrink: 0,
                                 background: "var(--sage-deep, #4A6355)", color: "#fff",
                                 border: "none",
                               }}
@@ -2580,6 +2581,7 @@ function DashboardContent() {
                               onClick={(e) => { e.stopPropagation(); openRejectModal(c.id); }}
                               style={{
                                 ...actionBtnStyle,
+                                flexShrink: 0,
                                 background: "#fff", color: "#D32F2F",
                                 border: "1.5px solid #D32F2F",
                               }}
@@ -2604,7 +2606,7 @@ function DashboardContent() {
                 })}
               </tbody>
             </table>
-            {/* 모바일에서 성별 컬럼 숨기기 */}
+            {/* 모바일 컬럼 조정 */}
             <style>{`
               @media (max-width: 600px) {
                 .dash-list-gender-col { display: none !important; }

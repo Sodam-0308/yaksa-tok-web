@@ -429,10 +429,10 @@ function Content() {
                 </div>
               </div>
 
-              {/* ── 4. 맞춤 추가 질문 (세트 기반) ── */}
+              {/* ── 4. 맞춤 추가 문답 (세트 기반) ── */}
               <div style={card}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6, gap: 8, flexWrap: "wrap" }}>
-                  <div style={secTitle}>맞춤 추가 질문</div>
+                  <div style={secTitle}>맞춤 추가 문답</div>
                   {questionSets.length > 0 && (
                     <button
                       type="button"
@@ -449,7 +449,7 @@ function Content() {
                   )}
                 </div>
                 <div style={{ ...secDesc, marginBottom: 14 }}>
-                  자주 묻는 질문을 세트로 만들어 환자에게 보낼 수 있어요. ★ 기본 세트는 매칭 수락 후 자동 전송돼요.
+                  자주 묻는 문답을 세트로 만들어 환자에게 보낼 수 있어요. ★ 기본 세트는 매칭 수락 후 자동 전송돼요.
                 </div>
 
                 {questionSets.length === 0 ? (
@@ -463,7 +463,7 @@ function Content() {
                       아직 만든 문답 세트가 없어요
                     </div>
                     <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 14 }}>
-                      자주 묻는 질문을 세트로 만들어 환자에게 보낼 수 있어요
+                      자주 묻는 문답을 세트로 만들어 환자에게 보낼 수 있어요
                     </div>
                     <button
                       type="button"
@@ -499,7 +499,7 @@ function Content() {
                           )}
                         </div>
                         <div style={{ fontSize: 14, color: C.textMid, marginBottom: 12 }}>
-                          질문 {s.questionCount}개
+                          문답 {s.questionCount}개
                         </div>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                           <button
@@ -545,7 +545,7 @@ function Content() {
                 )}
               </div>
 
-              {/* ── 답변 템플릿 (맞춤 추가 질문 아래, 좌측 열) ── */}
+              {/* ── 답변 템플릿 (맞춤 추가 문답 아래, 좌측 열) ── */}
               <div style={card}>
                 <div style={secTitle}>답변 템플릿</div>
                 <div style={{ ...secDesc, marginBottom: 12 }}>

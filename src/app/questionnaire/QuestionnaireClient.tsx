@@ -408,7 +408,7 @@ function QuestionnaireContent() {
               <strong style={{ color: "var(--terra)" }}>잠시만 기다려주세요.</strong>
             </p>
             <Link
-              href={`/match?symptom=${encodeURIComponent(((answers.symptoms as string[]) || []).join(","))}`}
+              href={`/questionnaire-result?symptom=${encodeURIComponent(((answers.symptoms as string[]) || []).join(","))}`}
               className="complete-btn"
             >
               약사 매칭 확인하기 →
@@ -429,6 +429,24 @@ function QuestionnaireContent() {
 
   return (
     <div className="questionnaire-page">
+      <style>{`
+        @media (max-width: 480px) {
+          .questionnaire-page nav { padding-top: 8px !important; padding-bottom: 8px !important; }
+          .questionnaire-page .q-container {
+            padding-top: 20px !important;
+            padding-bottom: 120px !important;
+          }
+          .questionnaire-page .q-card { padding: 16px !important; }
+          .questionnaire-page .q-choices { gap: 8px !important; }
+          .questionnaire-page .q-bottom-bar {
+            position: sticky !important; bottom: 0 !important;
+            background: #fff !important;
+            padding: 12px 16px !important;
+            box-shadow: 0 -2px 8px rgba(0,0,0,0.06) !important;
+            z-index: 40;
+          }
+        }
+      `}</style>
       <nav>
         <button className="nav-back" onClick={goPrev} aria-label="뒤로가기">
           ←

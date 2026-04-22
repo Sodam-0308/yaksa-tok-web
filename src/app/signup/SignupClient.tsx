@@ -313,6 +313,18 @@ function SignupContent() {
                   </p>
                 </div>
 
+                <div
+                  style={{
+                    fontSize: 15,
+                    fontWeight: 500,
+                    color: "#C06B45",
+                    textAlign: "center",
+                    marginBottom: 12,
+                  }}
+                >
+                  10초만에 가입 완료!
+                </div>
+
                 <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                   {/* 카카오 */}
                   <button

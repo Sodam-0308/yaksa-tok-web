@@ -302,7 +302,7 @@ const MOCK_VISITS: VisitRecord[] = [
 
 const MOCK_HEALTH_CHECKS: HealthCheck[] = [
   { date: "2026-03-15", energy: 3, sleep: 2, digestion: 4, mood: 3, symptomDiscomfort: 7 },
-  { date: "2026-04-10", energy: 5, sleep: 4, digestion: 6, mood: 4, symptomDiscomfort: 4 },
+  { date: "2026-04-10", energy: 5, sleep: 4, digestion: 6, mood: 5, symptomDiscomfort: 4 },
 ];
 
 /* ── 추가 질문 답변 (환자가 제출한 개별 문답 답변) ── */
@@ -778,27 +778,29 @@ function ChartContent() {
   };
 
   const handleChatToggle = () => {
-    if (typeof window !== "undefined" && window.innerWidth >= 1200) {
-      setShowGuidePanel(false);
-      setShowChatPanel((v) => !v);
-    } else {
-      router.push("/chat/c1?role=pharmacist");
-    }
+    setShowGuidePanel(false);
+    setShowChatPanel((v) => !v);
   };
   const handleGuideToggle = () => {
     setShowChatPanel(false);
     setShowGuidePanel((v) => !v);
   };
 
-  /* 복용 가이드 패널 열림 시 body 스크롤 잠금 */
+  /* 사이드 패널 — 오버레이 모드(< 780px)일 때만 body 스크롤 잠금 */
   useEffect(() => {
-    if (!showGuidePanel) return;
+    if (!showGuidePanel && !showChatPanel) return;
+    const mq = window.matchMedia("(min-width: 780px)");
     const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const apply = () => {
+      document.body.style.overflow = mq.matches ? prev : "hidden";
+    };
+    apply();
+    mq.addEventListener("change", apply);
     return () => {
+      mq.removeEventListener("change", apply);
       document.body.style.overflow = prev;
     };
-  }, [showGuidePanel]);
+  }, [showGuidePanel, showChatPanel]);
 
   /* ══════════════════════════════════════════
      Render
@@ -833,52 +835,90 @@ function ChartContent() {
         }
         .chart-bottom-inner { max-width: 560px; margin: 0 auto; display: flex; gap: 10px; }
         @media (min-width: 1200px) {
-          .chart-container { max-width: 960px; padding: 28px 24px; }
+          .chart-container {
+            max-width: 960px; padding: 28px 24px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            grid-template-areas:
+              "basic    basic"
+              "memo     memo"
+              "problems visits"
+              "qanswers consults"
+              "health   health";
+            gap: 20px;
+            align-items: start;
+          }
+          .chart-container > * { margin-bottom: 0 !important; min-width: 0; }
+          .cs-basic    { grid-area: basic; }
+          .cs-memo     { grid-area: memo; }
+          .cs-problems { grid-area: problems; }
+          .cs-qanswers { grid-area: qanswers; }
+          .cs-visits   { grid-area: visits; }
+          .cs-consults { grid-area: consults; }
+          .cs-health   { grid-area: health; }
+
           .chart-bottom-bar { bottom: 0; }
           .chart-bottom-inner { max-width: 960px; }
           .chart-grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
           .chart-grid-2col > * { min-width: 0; }
         }
-        .chart-chat-panel { display: none; }
-        @media (min-width: 1200px) {
-          .chart-chat-panel {
-            display: flex; flex-direction: column; position: fixed;
-            top: 60px; right: 0; width: 400px; height: calc(100vh - 60px);
-            border-left: 1px solid ${COLOR.border}; background: ${COLOR.white};
-            z-index: 100; overflow: hidden; box-shadow: -4px 0 24px rgba(0,0,0,0.10);
-          }
-        }
-        @media (min-width: 1600px) { .chart-chat-panel { width: 500px; } }
-
-        .chart-guide-backdrop {
+        /* 백드롭 (오버레이 모드 공용) */
+        .chart-guide-backdrop, .chart-chat-backdrop {
           position: fixed; inset: 0; z-index: 999;
           background: rgba(0,0,0,0.3);
         }
-        .chart-guide-panel {
+
+        /* 사이드 패널 공통 */
+        .chart-guide-panel, .chart-chat-panel {
           display: flex; flex-direction: column; font-style: normal;
-          position: fixed; top: 0; right: 0; bottom: 0; left: 0;
+          position: fixed; top: 0; right: 0; height: 100vh;
+          width: 380px; max-width: 100%;
           background: ${COLOR.white}; z-index: 1000; overflow: hidden;
+          border-left: 1px solid ${COLOR.border};
+          box-shadow: -4px 0 24px rgba(0,0,0,0.10);
         }
-        @media (min-width: 1200px) {
-          .chart-guide-panel {
-            left: auto; width: 460px;
-            border-left: 1px solid ${COLOR.border};
-            box-shadow: -4px 0 24px rgba(0,0,0,0.10);
+
+        /* 780px+ 차트와 패널이 나란히 배치 (오버레이 모드 해제) */
+        @media (min-width: 780px) {
+          .chart-page { transition: padding-right 0.3s ease; }
+          .chart-bottom-bar { transition: right 0.3s ease; }
+          .chart-with-panel, .chart-with-chat-panel { padding-right: 380px; }
+          .chart-with-panel .chart-bottom-bar,
+          .chart-with-chat-panel .chart-bottom-bar { right: 380px; }
+          .chart-with-panel .chart-guide-backdrop,
+          .chart-with-chat-panel .chart-chat-backdrop { display: none; }
+          .chart-with-panel .chart-guide-panel,
+          .chart-with-chat-panel .chart-chat-panel {
+            z-index: 100;
+            box-shadow: none;
           }
         }
-        @media (min-width: 1600px) { .chart-guide-panel { width: 500px; } }
+        @media (min-width: 1200px) {
+          .chart-with-panel, .chart-with-chat-panel { padding-right: 400px; }
+          .chart-with-panel .chart-bottom-bar,
+          .chart-with-chat-panel .chart-bottom-bar { right: 400px; }
+          .chart-with-panel .chart-guide-panel,
+          .chart-with-chat-panel .chart-chat-panel { width: 400px; }
+        }
+        @media (min-width: 1600px) {
+          .chart-with-panel, .chart-with-chat-panel { padding-right: 500px; }
+          .chart-with-panel .chart-bottom-bar,
+          .chart-with-chat-panel .chart-bottom-bar { right: 500px; }
+          .chart-with-panel .chart-guide-panel,
+          .chart-with-chat-panel .chart-chat-panel { width: 500px; }
+        }
 
         ${isEmbedded ? `
           html, body { margin: 0 !important; padding: 0 !important; overflow-x: hidden !important; }
           .chart-page { padding-bottom: 0 !important; }
           .chart-page nav { display: none !important; }
           .chart-bottom-bar { display: none !important; }
-          .chart-chat-panel, .chart-guide-panel, .chart-guide-backdrop { display: none !important; }
+          .chart-chat-panel, .chart-guide-panel, .chart-guide-backdrop, .chart-chat-backdrop { display: none !important; }
           .chart-grid-2col { display: flex !important; flex-direction: column !important; }
         ` : ""}
       `}</style>
 
-      <div className="chart-page">
+      <div className={`chart-page${showGuidePanel ? " chart-with-panel" : ""}${showChatPanel ? " chart-with-chat-panel" : ""}`}>
         <nav>
           <button className="nav-back" onClick={() => router.push("/dashboard")} aria-label="뒤로가기">←</button>
           <div style={{ flex: 1, textAlign: "center", fontFamily: "'Gothic A1', sans-serif", fontSize: 16, fontWeight: 700, color: COLOR.textDark, marginRight: 36 }}>
@@ -889,6 +929,7 @@ function ChartContent() {
         <div className="chart-container">
           {/* ── 1. 기본 정보 ── */}
           <div
+            className="cs-basic"
             style={{
               background: `linear-gradient(135deg, ${COLOR.sagePale} 0%, ${COLOR.white} 100%)`,
               borderRadius: 16, boxShadow: "0 2px 16px rgba(74,99,85,0.10)",
@@ -984,7 +1025,7 @@ function ChartContent() {
           </div>
 
           {/* ── 2. 약사 메모 ── */}
-          <div style={{
+          <div className="cs-memo" style={{
             background: COLOR.sagePale, borderRadius: 12, padding: 16, marginBottom: 16,
             border: `1px solid ${COLOR.sageLight}`,
           }}>
@@ -1017,7 +1058,7 @@ function ChartContent() {
           </div>
 
           {/* ── 3. 현재 증상 (Problem List) ── */}
-          <div style={card}>
+          <div className="cs-problems" style={card}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
               <div style={sectionTitle}>현재 증상 ({currentProblems.length})</div>
               <button type="button" onClick={() => setShowAddSymptomModal(true)}
@@ -1136,7 +1177,7 @@ function ChartContent() {
           </div>
 
           {/* ── 4. 방문 기록 ── */}
-          <div style={card}>
+          <div className="cs-visits" style={card}>
             <div style={sectionTitle}>방문 기록 ({sortedVisits.length})</div>
             {sortedVisits.length === 0 ? (
               <div style={{ padding: 32, textAlign: "center", fontSize: 14, color: "#3D4A42", background: COLOR.sageBg, borderRadius: 12 }}>
@@ -1383,7 +1424,7 @@ function ChartContent() {
           </div>
 
           {/* ── 5. 문답 기록 ── */}
-          <div style={card}>
+          <div className="cs-consults" style={card}>
             <div style={sectionTitle}>📋 문답 기록</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {sortedConsultations.map((c, idx) => {
@@ -1488,7 +1529,7 @@ function ChartContent() {
           </div>
 
           {/* ── 6. 추가 질문 답변 ── */}
-          <div style={card}>
+          <div className="cs-qanswers" style={card}>
             <div style={sectionTitle}>📋 추가 질문 답변</div>
 
             {showAdditionalAnswerEmpty || sortedAdditionalAnswers.length === 0 ? (
@@ -1592,7 +1633,7 @@ function ChartContent() {
           </div>
 
           {/* ── 7. 환자 건강지표 (공용 컴포넌트 — 마이페이지와 100% 동일 렌더) ── */}
-          <div style={card}>
+          <div className="cs-health" style={card}>
             <div style={sectionTitle}>환자 건강지표</div>
             <HealthIndicatorComparison
               emptyState={!latestCheck}
@@ -1628,33 +1669,59 @@ function ChartContent() {
           <div className="chart-bottom-inner">
             <button type="button" onClick={handleChatToggle}
               style={{ flex: 1, padding: "12px 0", borderRadius: 10, fontSize: 14, fontWeight: 700, background: showChatPanel ? COLOR.sageDeep : COLOR.sagePale, color: showChatPanel ? COLOR.white : COLOR.sageDeep, border: showChatPanel ? "none" : `1.5px solid ${COLOR.sageLight}`, cursor: "pointer" }}>
-              💬 채팅창 열기
+              💬 {showChatPanel ? "채팅창 닫기" : "채팅창 열기"}
             </button>
             <button type="button" onClick={handleGuideToggle}
               style={{ flex: 1, padding: "12px 0", borderRadius: 10, fontSize: 14, fontWeight: 700, background: showGuidePanel ? COLOR.terra : COLOR.terraPale, color: showGuidePanel ? COLOR.white : COLOR.terra, border: showGuidePanel ? "none" : `1.5px solid ${COLOR.terraLight}`, cursor: "pointer" }}>
-              📋 복용 가이드 열기
+              📋 {showGuidePanel ? "복용 가이드 닫기" : "복용 가이드 열기"}
             </button>
           </div>
         </div>
 
         {/* ── 채팅 사이드 패널 (약사 채팅 페이지를 iframe으로 임베드 — 모든 기능 포함) ── */}
         {showChatPanel && (
-          <div className="chart-chat-panel">
-            <div style={{ padding: "10px 14px", borderBottom: `1px solid ${COLOR.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: COLOR.textDark }}>💬 {patient.name} 채팅</div>
-              <button type="button" onClick={() => setShowChatPanel(false)} aria-label="닫기"
-                style={{ width: 28, height: 28, borderRadius: 6, background: COLOR.sagePale, border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={COLOR.textMid} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-              </button>
-            </div>
-            <iframe
-              src={`/chat/c1?role=pharmacist&embedded=true`}
-              title="약사 채팅"
-              style={{ flex: 1, width: "100%", border: "none", background: COLOR.white }}
+          <>
+            <div
+              className="chart-chat-backdrop"
+              onClick={() => setShowChatPanel(false)}
+              aria-hidden="true"
             />
-          </div>
+            <div className="chart-chat-panel">
+              <div style={{ padding: "12px 16px", borderBottom: `1px solid ${COLOR.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, background: COLOR.sageBg }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                  <span style={{ fontSize: 16, fontWeight: 700, color: COLOR.sageDeep, fontFamily: "'Gothic A1', sans-serif" }}>
+                    채팅
+                  </span>
+                  <span style={{ fontSize: 14, color: COLOR.textMid, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {patient.name}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowChatPanel(false)}
+                  aria-label="닫기"
+                  style={{
+                    width: 40, height: 40, minWidth: 40, minHeight: 40,
+                    background: COLOR.white,
+                    border: `1px solid ${COLOR.border}`,
+                    borderRadius: 10,
+                    cursor: "pointer",
+                    color: COLOR.textDark,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    padding: 0, lineHeight: 1, fontSize: 18, fontWeight: 600,
+                    flexShrink: 0,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+              <iframe
+                src={`/chat/c1?role=pharmacist&embedded=true`}
+                title="약사 채팅"
+                style={{ flex: 1, width: "100%", border: "none", background: COLOR.white }}
+              />
+            </div>
+          </>
         )}
 
         {/* ── 복용 가이드 사이드 패널 ── */}

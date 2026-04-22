@@ -580,7 +580,7 @@ function FeedNewContent() {
             </div>
           )}
 
-          <div style={{ fontSize: 13, color: "#7A8A80", marginTop: 8 }}>
+          <div style={{ fontSize: 13, color: "#3D4A42", marginTop: 8 }}>
             {photos.length}/{MAX_PHOTOS}장
           </div>
         </section>

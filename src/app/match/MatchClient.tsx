@@ -396,7 +396,7 @@ function MatchContent() {
               <div className="map-placeholder">
                 <div className="map-icon">🗺️</div>
                 <div>카카오맵 연동 후 표시됩니다</div>
-                <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                <div style={{ fontSize: "13px", color: "#3D4A42" }}>
                   지도에서 약사 위치를 확인할 수 있어요
                 </div>
               </div>
