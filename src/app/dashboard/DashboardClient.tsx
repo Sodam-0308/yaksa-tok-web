@@ -37,10 +37,92 @@ interface PatientConsult {
   isRejected?: boolean;
   rejectedReason?: string;
   rejectedAt?: string;
+  /** 환자 마지막 메시지 시각 (ISO). 약사 답장 긴급도 계산용. */
+  lastPatientMessageAt?: string;
+  /** 약사가 환자 마지막 메시지를 읽었는지 여부. false면 미답변. */
+  isReadByPharmacist?: boolean;
+  /** AI 문답 답변 (라벨-값). requested 환자 펼침 시 전문 표시. */
+  questionnaire?: Record<string, string>;
+  /** 이전 거절 이력 (재요청 환자 경고용) */
+  previousRejections?: { date: string; reason: string; symptoms: string[] }[];
 }
 
 const CURRENT_YEAR = 2026;
 const TODAY_STR = "2026.04.18";
+/** 24시간 이상 미답변 여부. 환자 마지막 메시지 시간과 약사 읽음 상태 기준. */
+const URGENT_THRESHOLD_HOURS = 24;
+const NOW_ISO = "2026-04-21T10:00:00+09:00"; // Mock "현재" 시각
+
+function hoursSince(iso: string, nowIso = NOW_ISO): number {
+  const then = new Date(iso).getTime();
+  const now = new Date(nowIso).getTime();
+  if (Number.isNaN(then) || Number.isNaN(now)) return 0;
+  return (now - then) / 3_600_000;
+}
+
+function needsUrgentReply(c: PatientConsult): boolean {
+  if (!c.lastPatientMessageAt) return false;
+  if (c.isReadByPharmacist) return false;
+  if (c.isRejected) return false;
+  // 🔥 답장 필요는 이미 수락된(상담 중) 환자에게만 적용.
+  // 상담 요청 대기(requested)나 비활성(inactive)은 대상 아님.
+  if (c.patientStatus !== "managing") return false;
+  return hoursSince(c.lastPatientMessageAt) >= URGENT_THRESHOLD_HOURS;
+}
+
+/** 상담 요청(requested) 대기 24시간 경과 여부 — 수락 기다리는 상태 */
+function needsAcceptUrgent(c: PatientConsult): boolean {
+  if (c.patientStatus !== "requested") return false;
+  if (c.isRejected) return false;
+  // lastPatientMessageAt 있으면 우선, 없으면 createdAt(YYYY.MM.DD)을 timestamp로 변환
+  const iso = c.lastPatientMessageAt ?? `${c.createdAt.replace(/\./g, "-")}T00:00:00+09:00`;
+  return hoursSince(iso) >= URGENT_THRESHOLD_HOURS;
+}
+
+/** 마지막 환자 메시지로부터 경과 시간(시간 단위). 뱃지 색상 단계 계산용. */
+function hoursOfLastPatientMsg(c: PatientConsult): number {
+  if (c.lastPatientMessageAt) return Math.max(0, hoursSince(c.lastPatientMessageAt));
+  const label = c.lastMessageAt ?? "";
+  const hm = label.match(/(\d+)\s*시간/);
+  if (hm) return parseInt(hm[1], 10);
+  if (label === "어제") return 24;
+  const dm = label.match(/(\d+)\s*일/);
+  if (dm) return parseInt(dm[1], 10) * 24;
+  const wm = label.match(/(\d+)\s*주/);
+  if (wm) return parseInt(wm[1], 10) * 24 * 7;
+  return 0;
+}
+
+/** 경과 시간별 뱃지 배경·글씨 색상. 24h+는 pulse 애니메이션 적용. */
+function getUnreadBadgeStyle(hours: number): React.CSSProperties {
+  if (hours < 6) return { background: "#FFD4A8", color: "#8B4513" };
+  if (hours < 12) return { background: "#FF9A4D", color: "#fff" };
+  if (hours < 24) return { background: "#F06820", color: "#fff" };
+  return { background: "#E02020", color: "#fff", animation: "dashUnreadPulse 1s ease-in-out infinite" };
+}
+
+/**
+ * 마지막 대화 시각을 정렬용 timestamp(ms)로 변환.
+ * lastPatientMessageAt(ISO) 우선, 없으면 lastMessageAt 상대 표현 파싱.
+ * 큰 값 = 최신.
+ */
+function sortableLastMsgTs(c: PatientConsult): number {
+  const now = new Date(NOW_ISO).getTime();
+  if (c.lastPatientMessageAt) {
+    const t = new Date(c.lastPatientMessageAt).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  const label = c.lastMessageAt ?? "";
+  let hoursAgo = 9999;
+  const hm = label.match(/(\d+)\s*시간/);
+  const dm = label.match(/(\d+)\s*일/);
+  const wm = label.match(/(\d+)\s*주/);
+  if (hm) hoursAgo = parseInt(hm[1], 10);
+  else if (label === "어제") hoursAgo = 24;
+  else if (dm) hoursAgo = parseInt(dm[1], 10) * 24;
+  else if (wm) hoursAgo = parseInt(wm[1], 10) * 24 * 7;
+  return now - hoursAgo * 3_600_000;
+}
 
 interface ChatMsg {
   id: string;
@@ -273,6 +355,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "수면장애", category: "sleep" },
     ],
     aiSummary: "6개월 이상 오후 피로감 심화, 입면 장애 동반. 기분 저하와 집중력 저하도 호소.",
+    questionnaire: {
+      증상: "만성피로, 수면장애",
+      기간: "6개월 이상",
+      직업: "사무직",
+      수면: "5시간 (입면 어려움)",
+      음주: "주 1회",
+      카페인: "하루 3잔 이상",
+      흡연: "비흡연",
+      운동: "주 1~2회 요가",
+      간식: "하루 1번",
+      예산: "월 5~7만원",
+    },
     freeText: "아침에 일어나기가 너무 힘들고 오후 3시쯤 되면 정말 아무것도 할 수가 없어요. 커피를 3잔 이상 마시는데도 효과가 없습니다. 밤에 잠들려면 2시간은 걸려요.",
     unreadCount: 2,
     lastMessageAt: "2시간 전",
@@ -292,12 +386,24 @@ const MOCK_CONSULTS: PatientConsult[] = [
     patientName: "박○○",
     patientGender: "남",
     birthYear: 1985,
-    patientStatus: "requested",
+    patientStatus: "managing",
     consultType: "local",
     symptoms: [
       { label: "소화장애", category: "digestion" },
     ],
     aiSummary: "식후 더부룩함, 가스 과다. 브리스톨 척도 1~2형. 배변 주기 불규칙.",
+    questionnaire: {
+      증상: "소화장애",
+      기간: "3개월",
+      직업: "회사원",
+      수면: "6시간",
+      음주: "주 2회",
+      카페인: "하루 2잔",
+      흡연: "비흡연",
+      운동: "주 1회 등산",
+      간식: "가끔",
+      예산: "월 8만원",
+    },
     freeText: "식사 후 30분이면 배가 빵빵해지고 가스가 많이 찹니다. 변비도 있어서 2~3일에 한 번 정도 화장실에 갑니다.",
     unreadCount: 5,
     lastMessageAt: "어제",
@@ -313,6 +419,8 @@ const MOCK_CONSULTS: PatientConsult[] = [
     hasAppAccount: true,
     supplementStatus: "not_taking",
     consultationCount: 2,
+    lastPatientMessageAt: "2026-04-19T14:20:00+09:00",
+    isReadByPharmacist: false,
     hasPurchase: false,
     hasVisit: false,
   },
@@ -328,6 +436,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "면역력 저하", category: "immune" },
     ],
     aiSummary: "무릎·손가락 관절 불편감 2년. 감기 잦음. 아침 관절 강직 호소.",
+    questionnaire: {
+      증상: "관절통, 면역력 저하",
+      기간: "2년 이상",
+      직업: "가정주부",
+      수면: "6~7시간",
+      음주: "안 함",
+      카페인: "하루 1잔",
+      흡연: "비흡연",
+      운동: "주 3회 산책",
+      간식: "하루 1번 이하",
+      예산: "월 12만원",
+    },
     freeText: "무릎이 시리고 아침에 손가락이 뻣뻣합니다. 감기도 자주 걸리고 낫는 데 오래 걸려요. 병원에서는 큰 이상 없다고 합니다.",
     unreadCount: 0,
     lastMessageAt: "3일 전",
@@ -358,7 +478,19 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "소화장애", category: "digestion" },
     ],
     aiSummary: "턱 라인 트러블 반복 8개월. 장 건강 연관 가능성. 식후 불편감 동반.",
-    freeText: "턱 쪽에 큰 트러블이 반복적으로 올라옵니다. 피부과에서 약도 먹어봤는데 끊으면 다시 나요. 장이 안 좋은 것과 관련 있을 수 있다고 해서 상담 신청합니다.",
+    questionnaire: {
+      증상: "여드름, 소화장애",
+      기간: "8개월",
+      직업: "대학원생",
+      수면: "7시간",
+      음주: "주 1회",
+      카페인: "하루 3잔",
+      흡연: "비흡연",
+      운동: "주 2~3회 헬스",
+      간식: "하루 2번 이상",
+      예산: "월 5만원 이내",
+    },
+    freeText: "턱 쪽에 큰 트러블이 반복적으로 올라옵니다. 피부과에서 약도 먹어봤는데 끊으면 다시 나요. 장이 안 좋은 것과 관련 있을 수 있다고 해서 상담 신청합니다. 아침에 일어나면 속이 더부룩하고 점심 먹으면 소화가 잘 안 되는 느낌이 자주 있어요.",
     unreadCount: 1,
     lastMessageAt: "5시간 전",
     createdAt: "2026.04.03",
@@ -383,6 +515,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "불면", category: "sleep" },
     ],
     aiSummary: "새벽 3시 반복 각성 패턴. 입면은 양호하나 수면 유지 어려움 호소.",
+    questionnaire: {
+      증상: "불면",
+      기간: "4개월",
+      직업: "디자이너",
+      수면: "4~5시간 (새벽 각성)",
+      음주: "주 1회",
+      카페인: "하루 3잔",
+      흡연: "비흡연",
+      운동: "거의 안 함",
+      간식: "하루 1번",
+      예산: "월 6만원",
+    },
     freeText: "새벽 3시에 꼭 깹니다. 다시 잠들기 너무 힘들어요.",
     unreadCount: 0,
     lastMessageAt: "1주 전",
@@ -414,7 +558,19 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "면역력 저하", category: "immune" },
     ],
     aiSummary: "만성 피로감 1년+, 잦은 감기. 식욕 저하와 체중 감소 동반.",
-    freeText: "항상 몸이 무겁고 기운이 없습니다. 감기도 달고 살고요. 영양제를 여러 개 먹고 있는데 뭐가 맞는 건지 모르겠어요.",
+    questionnaire: {
+      증상: "만성피로, 면역력 저하",
+      기간: "1년 이상",
+      직업: "영업직",
+      수면: "5~6시간",
+      음주: "주 3회",
+      카페인: "하루 4잔",
+      흡연: "비흡연",
+      운동: "거의 안 함",
+      간식: "하루 1번",
+      예산: "월 10~15만원",
+    },
+    freeText: "항상 몸이 무겁고 기운이 없습니다. 감기도 달고 살고요. 영양제를 여러 개 먹고 있는데 뭐가 맞는 건지 모르겠어요. 출장이 잦아 식사 시간이 일정치 않고, 저녁에는 거의 외식으로 해결합니다.",
     unreadCount: 0,
     lastMessageAt: "1일 전",
     createdAt: "2026.04.02",
@@ -440,6 +596,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "만성피로", category: "fatigue" },
     ],
     aiSummary: "위장 기능 저하 + 피로감 복합. 식후 졸음과 더부룩함 반복.",
+    questionnaire: {
+      증상: "소화장애, 만성피로",
+      기간: "5개월",
+      직업: "교사",
+      수면: "6시간",
+      음주: "월 1~2회",
+      카페인: "하루 2잔",
+      흡연: "비흡연",
+      운동: "주 2회 필라테스",
+      간식: "하루 2번",
+      예산: "월 8~10만원",
+    },
     freeText: "밥 먹고 나면 항상 속이 더부룩하고 오후에 너무 피곤해요. 소화제를 달고 삽니다.",
     unreadCount: 3,
     lastMessageAt: "3시간 전",
@@ -468,6 +636,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "면역력 저하", category: "immune" },
     ],
     aiSummary: "환절기 감기 반복, 만성 비염. 코막힘과 후비루 증상 지속.",
+    questionnaire: {
+      증상: "면역력 저하, 비염",
+      기간: "1년 이상",
+      직업: "IT 개발자",
+      수면: "7시간",
+      음주: "주 2회",
+      카페인: "하루 3잔",
+      흡연: "비흡연",
+      운동: "거의 안 함",
+      간식: "하루 1번",
+      예산: "월 10만원",
+    },
     freeText: "환절기만 되면 감기를 달고 살아요. 코도 항상 막히고 비염약을 계속 먹고 있습니다.",
     unreadCount: 0,
     lastMessageAt: "2일 전",
@@ -487,16 +667,28 @@ const MOCK_CONSULTS: PatientConsult[] = [
     patientName: "조○○",
     patientGender: "여",
     birthYear: 2003,
-    patientStatus: "requested",
+    patientStatus: "managing",
     nextVisitDate: "2026.04.18",
     consultType: "local",
     symptoms: [
       { label: "탈모", category: "skin" },
     ],
     aiSummary: "미만성 탈모 6개월. 두피 전반 모발 가늘어짐, 빠지는 양 증가 호소.",
+    questionnaire: {
+      증상: "탈모",
+      기간: "6개월",
+      직업: "대학생",
+      수면: "6~7시간",
+      음주: "가끔",
+      카페인: "하루 2잔",
+      흡연: "비흡연",
+      운동: "주 1회 걷기",
+      간식: "하루 2번",
+      예산: "월 3~5만원",
+    },
     freeText: "머리카락이 점점 가늘어지고 빠지는 양이 많아졌어요. 병원에서 특별한 이상은 없다고 했는데 걱정됩니다.",
     unreadCount: 1,
-    lastMessageAt: "4시간 전",
+    lastMessageAt: "어제",
     createdAt: "2026.04.07",
     prevConsultCount: 0,
     visitDate: undefined,
@@ -505,6 +697,8 @@ const MOCK_CONSULTS: PatientConsult[] = [
     hasAppAccount: true,
     supplementStatus: "not_taking",
     consultationCount: 1,
+    lastPatientMessageAt: "2026-04-20T08:30:00+09:00",
+    isReadByPharmacist: false,
     hasPurchase: false,
     hasVisit: false,
   },
@@ -520,6 +714,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "만성피로", category: "fatigue" },
     ],
     aiSummary: "수면 유지 장애 + 오전 피로. 새벽 반복 각성, 주간 졸림 심함.",
+    questionnaire: {
+      증상: "수면장애, 만성피로",
+      기간: "3개월",
+      직업: "회사원",
+      수면: "5시간 (새벽 각성 2~3회)",
+      음주: "주 3회",
+      카페인: "하루 4잔",
+      흡연: "비흡연",
+      운동: "주 1회",
+      간식: "하루 1번",
+      예산: "월 7만원",
+    },
     freeText: "새벽에 2~3번씩 깨고 아침에 개운하지 않아요. 낮에 집중이 안 되고 항상 졸립니다.",
     unreadCount: 0,
     lastMessageAt: "4일 전",
@@ -545,7 +751,7 @@ const MOCK_CONSULTS: PatientConsult[] = [
     birthYear: 1963,
     patientStatus: "inactive",
     isRejected: true,
-    rejectedReason: "슬롯 꽉 참",
+    rejectedReason: "상담 여유 없음",
     rejectedAt: "2026.04.12",
     consultType: "local",
     symptoms: [
@@ -553,6 +759,18 @@ const MOCK_CONSULTS: PatientConsult[] = [
       { label: "���화장애", category: "digestion" },
     ],
     aiSummary: "무릎 관절 불편감 + 속 쓰림. 계단 보행 곤란, 위장 부담감 호소.",
+    questionnaire: {
+      증상: "관절통, 소화장애",
+      기간: "1년 이상",
+      직업: "자영업",
+      수면: "6시간",
+      음주: "안 함",
+      카페인: "하루 1잔",
+      흡연: "비흡연",
+      운동: "거의 안 함",
+      간식: "하루 1번",
+      예산: "월 10만원",
+    },
     freeText: "무릎이 아파서 계단 오르기가 힘들고 속도 자주 쓰려요. 약을 많�� 먹어서 위장에 부담이 가는 것 같아요.",
     unreadCount: 2,
     lastMessageAt: "6시간 전",
@@ -566,6 +784,88 @@ const MOCK_CONSULTS: PatientConsult[] = [
     consultationCount: 5,
     hasPurchase: false,
     hasVisit: false,
+  },
+  {
+    id: "c-12",
+    patientName: "장○○",
+    patientGender: "여",
+    birthYear: 1988,
+    patientStatus: "requested",
+    consultType: "local",
+    symptoms: [
+      { label: "소화장애", category: "digestion" },
+      { label: "만성피로", category: "fatigue" },
+    ],
+    aiSummary: "재요청 상담. 증상 교체 — 이전엔 관절통·소화장애, 이번엔 소화장애·피로.",
+    questionnaire: {
+      증상: "소화장애, 만성피로",
+      기간: "2개월",
+      직업: "회계사",
+      수면: "6시간",
+      음주: "주 1회",
+      카페인: "하루 2잔",
+      흡연: "비흡연",
+      운동: "거의 안 함",
+      간식: "하루 1번",
+      예산: "월 8만원",
+    },
+    freeText: "한 달 전쯤부터 다시 속이 불편하고 오후만 되면 많이 피곤해요. 전에 상담 신청드렸다가 거절되셨는데 이번엔 증상이 좀 달라서 다시 요청드립니다.",
+    unreadCount: 1,
+    lastMessageAt: "3시간 전",
+    createdAt: "2026.04.21",
+    prevConsultCount: 0,
+    visitDate: undefined,
+    purchasedMeds: [],
+    registrationSource: "app",
+    hasAppAccount: true,
+    supplementStatus: "not_taking",
+    consultationCount: 2,
+    hasPurchase: false,
+    hasVisit: false,
+    previousRejections: [
+      {
+        date: "2026.03.20",
+        reason: "전문 분야 아님",
+        symptoms: ["관절통", "소화장애"],
+      },
+    ],
+  },
+  {
+    id: "c-13",
+    patientName: "오○○",
+    patientGender: "여",
+    birthYear: 1995,
+    patientStatus: "managing",
+    consultType: "local",
+    symptoms: [
+      { label: "여드름", category: "skin" },
+    ],
+    aiSummary: "방문 후 제품 결정 미뤄짐. 생활 습관 먼저 점검하고 구매는 다음 기회로.",
+    questionnaire: {
+      증상: "여드름",
+      기간: "3개월",
+      직업: "프리랜서",
+      수면: "7시간",
+      음주: "월 1회",
+      카페인: "하루 2잔",
+      흡연: "비흡연",
+      운동: "주 1회 요가",
+      간식: "하루 2번",
+      예산: "월 5만원",
+    },
+    freeText: "상담만 받고 제품 구매는 다음에 하기로 했어요. 약사님 말씀대로 식습관부터 바꿔보고 있습니다.",
+    unreadCount: 0,
+    lastMessageAt: "2일 전",
+    createdAt: "2026.04.05",
+    prevConsultCount: 0,
+    visitDate: "2026.04.08",
+    purchasedMeds: [],
+    registrationSource: "app",
+    hasAppAccount: true,
+    supplementStatus: "not_taking",
+    consultationCount: 2,
+    hasPurchase: false,
+    hasVisit: true,
   },
 ];
 
@@ -598,33 +898,30 @@ function PatientCard({
   onOpenChat: (id: string) => void;
   chatOpen: boolean;
   onAccept: (id: string) => void;
-  onReject: (id: string, reason: string) => void;
+  onReject: (id: string) => void;
 }) {
   const router = useRouter();
   const [memo, setMemo] = useState(data.memo ?? "");
   const [showMemo, setShowMemo] = useState(false);
-  const [showRejectModal, setShowRejectModal] = useState(false);
-  const [rejectReason, setRejectReason] = useState<"전문 분야 아님" | "슬롯 꽉 참" | "기타">("전문 분야 아님");
-  const [rejectCustom, setRejectCustom] = useState("");
   const statusCfg = PATIENT_STATUS_CONFIG[data.patientStatus];
   const showStatusBadge = data.patientStatus !== "inactive" && !data.isRejected;
   const relationTag = getRelationTag(data);
   const isOverConsult = relationTag === "over";
   const age = CURRENT_YEAR - data.birthYear;
   const isRequested = data.patientStatus === "requested" && !data.isRejected;
+  const isUrgent = needsUrgentReply(data);         // managing + 24h (답장 필요)
+  const isAcceptUrgent = needsAcceptUrgent(data);  // requested + 24h (수락 필요)
+  const [freeTextExpanded, setFreeTextExpanded] = useState(false);
+  const [rejectionHistoryExpanded, setRejectionHistoryExpanded] = useState(false);
+  const hasPrevRejections = (data.previousRejections?.length ?? 0) > 0;
 
   const badgeIsApp = data.hasAppAccount;
-
-  const confirmReject = () => {
-    const reason = rejectReason === "기타" ? (rejectCustom.trim() || "기타") : rejectReason;
-    onReject(data.id, reason);
-    setShowRejectModal(false);
-  };
 
   return (
     <article style={{
       padding: 16, background: isOverConsult ? "#FAFAFA" : "#fff",
-      border: "1px solid var(--border, rgba(94,125,108,0.14))", borderRadius: 12,
+      border: "1px solid var(--border, rgba(94,125,108,0.14))",
+      borderRadius: 12,
     }}>
       {/* 카드 클릭 영역 */}
       <div onClick={onToggle} style={{ cursor: "pointer" }}>
@@ -632,7 +929,7 @@ function PatientCard({
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           {/* 왼쪽 */}
           <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap", flex: 1, minWidth: 0, overflow: "hidden" }}>
-            <span style={{ fontSize: 17, fontWeight: 600, lineHeight: 1.5, color: isOverConsult ? "#8A9590" : "var(--text-dark, #2C3630)", whiteSpace: "nowrap" }}>{data.patientName}</span>
+            <span style={{ fontSize: 17, fontWeight: 700, lineHeight: 1.5, color: "#2C3630", whiteSpace: "nowrap" }}>{data.patientName}</span>
             {relationTag === "regular" && (
               <span style={{ fontSize: 16, lineHeight: 1.5, flexShrink: 0 }}>💚</span>
             )}
@@ -664,46 +961,80 @@ function PatientCard({
           <div style={{ display: "inline-flex", alignItems: "center", gap: 8, flexShrink: 0, marginLeft: 12 }}>
             <span style={{ fontSize: 13, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", lineHeight: 1.5 }}>마지막 대화: {data.lastMessageAt}</span>
             {data.unreadCount > 0 && (
-              <span className="dash-unread-badge" style={{ flexShrink: 0 }}>{data.unreadCount}</span>
+              <span
+                className="dash-unread-badge"
+                style={{ flexShrink: 0, ...getUnreadBadgeStyle(hoursOfLastPatientMsg(data)) }}
+              >
+                {data.unreadCount}
+              </span>
             )}
           </div>
         </div>
+        {/* ⚠️ 거절 이력 경고 배너 (접힘/펼침 공통, 이름 줄 아래) */}
+        {hasPrevRejections && (
+          <div
+            style={{
+              background: "#FFF8E1", color: "#B06D00",
+              fontSize: 14, fontWeight: 600,
+              padding: "8px 14px", borderRadius: 10,
+              marginBottom: 10,
+              display: "flex", alignItems: "center", gap: 6,
+            }}
+          >
+            <span>⚠️ 이 환자는 이전 거절 이력이 {data.previousRejections!.length}건 있어요</span>
+          </div>
+        )}
         {/* ── 하단 줄: 좌(복용+태그) / 우(방문일) ── */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          {/* 왼쪽 */}
+          {/* 왼쪽 — 복용 중인 환자에게만 복용 뱃지 표시. 미복용/완료는 숨김 */}
           <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap", flex: 1, minWidth: 0, overflow: "hidden" }}>
-            <span style={{
-              display: "inline-block", padding: "4px 10px", borderRadius: 12, fontSize: 13, fontWeight: 500, lineHeight: "18px",
-              background: data.supplementStatus === "taking" ? "#EAF3DE" : "#F0F0F0",
-              color: data.supplementStatus === "taking" ? "#3B6D11" : "#666666",
-              whiteSpace: "nowrap", flexShrink: 0,
-            }}>
-              {data.supplementStatus === "taking" ? "복용 중" : data.supplementStatus === "completed" ? "✓ 복용 완료" : "미복용"}
-            </span>
-            <span style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", flexShrink: 0 }}>|</span>
+            {data.supplementStatus === "taking" && (
+              <>
+                <span style={{
+                  display: "inline-block", padding: "4px 10px", borderRadius: 12, fontSize: 13, fontWeight: 500, lineHeight: "18px",
+                  background: "#EAF3DE", color: "#3B6D11",
+                  whiteSpace: "nowrap", flexShrink: 0,
+                }}>
+                  복용 중
+                </span>
+                <span style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", flexShrink: 0 }}>|</span>
+              </>
+            )}
             {data.symptoms.map((s) => (
               <span key={s.label} className={`dash-tag ${SYMPTOM_TAG_CLASS[s.category]}`} style={{ fontSize: 14, fontWeight: 500, color: "var(--text-dark, #2C3630)", padding: "4px 10px", whiteSpace: "nowrap", flexShrink: 0 }}>
                 {s.label}
               </span>
             ))}
           </div>
-          {/* 오른쪽 */}
-          <div style={{ flexShrink: 0, marginLeft: 12 }}>
+          {/* 오른쪽 — 거절 / 방문 예정+"방문 전" / 최근 방문+"구매 영양제: 없음" */}
+          <div style={{ flexShrink: 0, marginLeft: 12, textAlign: "right" }}>
             {data.isRejected ? (
               <span style={{ fontSize: 13, color: "#D32F2F", fontWeight: 600, whiteSpace: "nowrap" }}>
                 거절: {data.rejectedAt?.slice(5).replace(".", "/")}
               </span>
             ) : data.nextVisitDate ? (
-              <span style={{ fontSize: 14, color: "var(--sage-deep, #4A6355)", fontWeight: 600, whiteSpace: "nowrap" }}>
-                🗓️ 방문 예정: {data.nextVisitDate.slice(5).replace(".", "/")}
-              </span>
+              <>
+                <div style={{ fontSize: 14, color: "var(--sage-deep, #4A6355)", fontWeight: 600, whiteSpace: "nowrap" }}>
+                  🗓️ 방문 예정: {data.nextVisitDate.slice(5).replace(".", "/")}
+                </div>
+                {!data.visitDate && (
+                  <div style={{ fontSize: 13, color: "#3D4A42", whiteSpace: "nowrap", marginTop: 2 }}>
+                    방문 전
+                  </div>
+                )}
+              </>
             ) : data.visitDate ? (
-              <span style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>
-                최근 방문: {data.visitDate.slice(5).replace(".", "/")}
-              </span>
-            ) : (
-              <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-dark, #2C3630)", whiteSpace: "nowrap" }}>방문 전</span>
-            )}
+              <>
+                <div style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>
+                  최근 방문: {data.visitDate.slice(5).replace(".", "/")}
+                </div>
+                {(!data.purchasedMeds || data.purchasedMeds.length === 0) && (
+                  <div style={{ fontSize: 13, color: "#3D4A42", whiteSpace: "nowrap", marginTop: 2 }}>
+                    구매 영양제: 없음
+                  </div>
+                )}
+              </>
+            ) : null}
           </div>
         </div>
       </div>
@@ -711,78 +1042,159 @@ function PatientCard({
       {/* 접기/펼치기 상세 */}
       {expanded && (
         <div className="dash-detail">
+          {/* 🔥 경고 — managing은 답변 지연, requested는 수락 지연 */}
+          {(isUrgent || isAcceptUrgent) && !data.isRejected && (
+            <div
+              role="alert"
+              style={{
+                background: "#FFF0E6",
+                color: "#E05A1A",
+                fontSize: 14, fontWeight: 600,
+                padding: "10px 16px",
+                borderRadius: 10,
+                marginTop: 12,
+                marginBottom: 12,
+                display: "flex", alignItems: "center", gap: 8,
+              }}
+            >
+              <span style={{ fontSize: 16, lineHeight: 1 }}>🔥</span>
+              <span>
+                {isAcceptUrgent
+                  ? "환자가 24시간 이상 수락을 기다리고 있어요"
+                  : "환자가 24시간 이상 답변을 기다리고 있어요"}
+              </span>
+            </div>
+          )}
           {/* 첫 상담 날짜 */}
           <div className="dash-detail-section">
             <div className="dash-detail-title">첫 상담</div>
             <div style={{ fontSize: 14, color: "var(--text-mid)" }}>{data.createdAt}</div>
           </div>
 
-          {/* AI 요약 */}
-          <div className="dash-summary-card">
-            <div className="dash-summary-label">AI 요약</div>
-            <div className="dash-summary-text">{data.aiSummary}</div>
-          </div>
-
-          {/* 자유 서술 */}
-          <div className="dash-detail-section">
-            <div className="dash-detail-title">자유 서술</div>
-            <div className="dash-detail-text">{data.freeText}</div>
-          </div>
-
-          {/* 구매한 약 */}
-          {data.purchasedMeds && data.purchasedMeds.length > 0 && (
+          {/* 이전 거절 이력 (재요청 환자) */}
+          {hasPrevRejections && (
             <div className="dash-detail-section">
-              <div className="dash-detail-title">구매한 영양제</div>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {data.purchasedMeds.map((med) => (
-                  <span key={med} style={{
-                    display: "inline-block", padding: "3px 10px", borderRadius: 8,
-                    fontSize: 13, fontWeight: 600, color: "var(--sage-deep)",
-                    background: "var(--sage-pale)", border: "1px solid var(--sage-light)",
-                  }}>{med}</span>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setRejectionHistoryExpanded((v) => !v); }}
+                style={{
+                  width: "100%", textAlign: "left",
+                  padding: "10px 14px", borderRadius: 10,
+                  background: "#FFFDF5", border: "1px solid #F5E6AE",
+                  cursor: "pointer", fontSize: 14, fontWeight: 600,
+                  color: "#B06D00",
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                <span>이전 거절 이력 ({data.previousRejections!.length}건)</span>
+                <span style={{ fontSize: 13 }}>{rejectionHistoryExpanded ? "접기 ▲" : "이전 이력 보기 ▼"}</span>
+              </button>
+              {rejectionHistoryExpanded && (
+                <div style={{
+                  marginTop: 8,
+                  background: "#FFFDF5", borderRadius: 10, padding: 14,
+                }}>
+                  {data.previousRejections!.map((r, i, arr) => (
+                    <div
+                      key={i}
+                      style={{
+                        paddingBottom: i === arr.length - 1 ? 0 : 10,
+                        marginBottom: i === arr.length - 1 ? 0 : 10,
+                        borderBottom: i === arr.length - 1 ? "none" : "1px solid rgba(94,125,108,0.08)",
+                      }}
+                    >
+                      <div style={{ fontSize: 14, fontWeight: 700, color: "#2C3630", marginBottom: 4 }}>
+                        {r.date}
+                      </div>
+                      <div style={{ fontSize: 14, color: "#3D4A42", marginBottom: 6 }}>
+                        사유: <span style={{ fontWeight: 600, color: "#B06D00" }}>{r.reason}</span>
+                      </div>
+                      <div style={{ fontSize: 13, color: "#3D4A42", marginBottom: 4 }}>당시 증상</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        {r.symptoms.map((s) => (
+                          <span key={s} style={{
+                            display: "inline-block",
+                            padding: "3px 10px", borderRadius: 100,
+                            fontSize: 13, fontWeight: 600,
+                            background: "#F8F9F7", color: "#3D4A42",
+                            border: "1px solid rgba(94,125,108,0.14)",
+                          }}>
+                            {s}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 문답 전문 — 모든 상태의 환자에게 동일하게 표시 */}
+          {data.questionnaire && Object.keys(data.questionnaire).length > 0 && (
+            <div className="dash-detail-section">
+              <div className="dash-detail-title">문답 답변</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {Object.entries(data.questionnaire).map(([k, v]) => (
+                  <div key={k} style={{ display: "flex", alignItems: "baseline", gap: 8, fontSize: 14, lineHeight: 1.6 }}>
+                    <span style={{ color: "#3D4A42", minWidth: 60, flexShrink: 0 }}>{k}</span>
+                    <span style={{ color: "#3D4A42" }}>—</span>
+                    <span style={{ color: "#2C3630", fontWeight: 500 }}>{v}</span>
+                  </div>
                 ))}
               </div>
             </div>
           )}
 
-          {/* 방문일 */}
+          {/* 자유 서술 (펼침 가능) */}
+          <div className="dash-detail-section">
+            <div className="dash-detail-title">자유 서술</div>
+            <div
+              style={{
+                fontSize: 14, color: "#2C3630",
+                ...(freeTextExpanded
+                  ? { wordBreak: "break-word" as const }
+                  : {
+                      overflow: "hidden",
+                      display: "-webkit-box",
+                      WebkitLineClamp: 2,
+                      WebkitBoxOrient: "vertical" as const,
+                      wordBreak: "break-word" as const,
+                    }),
+              }}
+            >
+              {data.freeText}
+            </div>
+            {(data.freeText.length > 60 || data.freeText.includes("\n")) && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setFreeTextExpanded((v) => !v); }}
+                style={{
+                  marginTop: 4, padding: "2px 0",
+                  fontSize: 14, fontWeight: 600,
+                  color: "#5E7D6C",
+                  background: "none", border: "none",
+                  cursor: "pointer", fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                {freeTextExpanded ? "접기" : "더 보기"}
+              </button>
+            )}
+          </div>
+
+          {/* 최근 방문 (날짜 + 구매 영양제 통합) */}
           {data.visitDate && (
             <div className="dash-detail-section">
-              <div className="dash-detail-title">최근 방문일</div>
-              <div style={{ fontSize: 14, color: "var(--text-mid)" }}>{data.visitDate}</div>
-            </div>
-          )}
-
-          {/* 몸 상태 변화 */}
-          {data.healthScores && data.healthScores.length > 0 && (
-            <div className="dash-detail-section">
-              <div className="dash-detail-title">몸 상태 변화</div>
-              <div className="dash-scores">
-                {data.healthScores.map((s) => {
-                  const improved = s.after > s.before;
-                  return (
-                    <div key={s.label} className="dash-score-row">
-                      <span className="dash-score-label">{s.label}</span>
-                      <span className="dash-score-before">{s.before}</span>
-                      <div className="dash-score-bar">
-                        <div className="dash-score-fill" style={{ width: `${s.after * 10}%` }} />
-                      </div>
-                      <span className="dash-score-after">{s.after}</span>
-                      <span className={`dash-score-diff ${improved ? "up" : "down"}`}>
-                        {improved ? `↑${s.after - s.before}` : `↓${s.before - s.after}`}
-                      </span>
-                    </div>
-                  );
-                })}
+              <div className="dash-detail-title">최근 방문</div>
+              <div style={{ fontSize: 14, color: "var(--text-dark)", fontWeight: 600, marginBottom: 6 }}>
+                {data.visitDate}
               </div>
-            </div>
-          )}
-
-          {/* 이전 상담 */}
-          {data.prevConsultCount > 0 && (
-            <div className="dash-detail-section">
-              <div className="dash-prev-link">
-                이전 상담 {data.prevConsultCount}건 →
+              <div style={{ fontSize: 14, color: "var(--text-mid)", lineHeight: 1.5 }}>
+                구매 영양제:{" "}
+                {data.purchasedMeds && data.purchasedMeds.length > 0
+                  ? data.purchasedMeds.join(", ")
+                  : "없음"}
               </div>
             </div>
           )}
@@ -822,7 +1234,7 @@ function PatientCard({
             <div style={{ display: "flex", gap: 12, marginTop: 14, padding: "0 20px" }}>
               <button
                 type="button"
-                onClick={(e) => { e.stopPropagation(); setShowRejectModal(true); }}
+                onClick={(e) => { e.stopPropagation(); onReject(data.id); }}
                 style={{
                   flex: 1, padding: "12px 0", borderRadius: 10,
                   fontSize: 14, fontWeight: 700,
@@ -849,7 +1261,8 @@ function PatientCard({
                 style={{
                   flex: 1, padding: "12px 0", borderRadius: 10,
                   fontSize: 14, fontWeight: 700,
-                  background: "var(--sage-deep, #4A6355)", color: "#fff",
+                  background: isUrgent ? "#C06B45" : "var(--sage-deep, #4A6355)",
+                  color: "#fff",
                   border: "none", cursor: "pointer",
                 }}
               >채팅창 열기</button>
@@ -865,89 +1278,6 @@ function PatientCard({
               >차트 보기</button>
             </div>
           )}
-        </div>
-      )}
-
-      {/* 거절 확인 모달 */}
-      {showRejectModal && (
-        <div
-          onClick={(e) => { e.stopPropagation(); setShowRejectModal(false); }}
-          style={{
-            position: "fixed", inset: 0, zIndex: 200,
-            background: "rgba(0,0,0,0.45)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              background: "#fff", borderRadius: 14, padding: 22,
-              maxWidth: 340, width: "92%",
-              boxShadow: "0 8px 32px rgba(0,0,0,0.15)",
-            }}
-          >
-            <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text-dark, #2C3630)", marginBottom: 6 }}>정말 거절하시겠어요?</div>
-            <div style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", marginBottom: 14, lineHeight: 1.5 }}>
-              거절 사유를 선택해 주세요 (선택 사항)
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
-              {(["전문 분야 아님", "슬롯 꽉 참", "기타"] as const).map((r) => (
-                <label key={r} style={{
-                  display: "flex", alignItems: "center", gap: 8,
-                  padding: "8px 12px", borderRadius: 8,
-                  background: rejectReason === r ? "var(--sage-pale, #EDF4F0)" : "#F8F9F7",
-                  border: rejectReason === r ? "1.5px solid var(--sage-deep, #4A6355)" : "1px solid var(--border, rgba(94,125,108,0.14))",
-                  cursor: "pointer", fontSize: 14, color: "var(--text-dark, #2C3630)",
-                }}>
-                  <input
-                    type="radio"
-                    name={`reject-reason-${data.id}`}
-                    checked={rejectReason === r}
-                    onChange={() => setRejectReason(r)}
-                    style={{ margin: 0 }}
-                  />
-                  {r}
-                </label>
-              ))}
-            </div>
-            {rejectReason === "기타" && (
-              <input
-                type="text"
-                value={rejectCustom}
-                onChange={(e) => setRejectCustom(e.target.value)}
-                placeholder="사유를 입력해 주세요"
-                style={{
-                  width: "100%", padding: "8px 10px", borderRadius: 8,
-                  border: "1.5px solid var(--sage-light, #B3CCBE)",
-                  fontSize: 14, color: "var(--text-dark)", outline: "none",
-                  marginBottom: 12, fontFamily: "'Noto Sans KR', sans-serif",
-                }}
-              />
-            )}
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                type="button"
-                onClick={() => setShowRejectModal(false)}
-                style={{
-                  flex: 1, padding: "10px 0", borderRadius: 8,
-                  fontSize: 14, fontWeight: 600,
-                  background: "#F8F9F7", color: "var(--text-mid, #3D4A42)",
-                  border: "1px solid var(--border, rgba(94,125,108,0.14))",
-                  cursor: "pointer",
-                }}
-              >취소</button>
-              <button
-                type="button"
-                onClick={confirmReject}
-                style={{
-                  flex: 1, padding: "10px 0", borderRadius: 8,
-                  fontSize: 14, fontWeight: 700,
-                  background: "#D32F2F", color: "#fff",
-                  border: "none", cursor: "pointer",
-                }}
-              >거절하기</button>
-            </div>
-          </div>
         </div>
       )}
 
@@ -1510,6 +1840,26 @@ function DashboardContent() {
     showToast("거절 처리되었습니다");
   };
 
+  /* 공용 거절 사유 선택 모달 (카드뷰/리스트뷰 공통) */
+  const [rejectTargetId, setRejectTargetId] = useState<string | null>(null);
+  const [rejectModalReason, setRejectModalReason] = useState<"전문 분야 아님" | "상담 여유 없음" | "기타">("전문 분야 아님");
+  const [rejectModalCustom, setRejectModalCustom] = useState("");
+  const openRejectModal = (id: string) => {
+    setRejectTargetId(id);
+    setRejectModalReason("전문 분야 아님");
+    setRejectModalCustom("");
+  };
+  const closeRejectModal = () => {
+    setRejectTargetId(null);
+    setRejectModalCustom("");
+  };
+  const confirmRejectModal = () => {
+    if (!rejectTargetId) return;
+    const reason = rejectModalReason === "기타" ? (rejectModalCustom.trim() || "기타") : rejectModalReason;
+    handleReject(rejectTargetId, reason);
+    closeRejectModal();
+  };
+
   /* 채팅 사이드 패널 */
   const [chatPanelId, setChatPanelId] = useState<string | null>(null);
   const chatPanelPatient = chatPanelId ? consults.find((c) => c.id === chatPanelId) : null;
@@ -1538,7 +1888,8 @@ function DashboardContent() {
 
   const handleOpenChat = (id: string) => {
     if (typeof window !== "undefined" && window.innerWidth >= 1200) {
-      setChatPanelId(id);
+      // 이미 같은 환자 채팅이 열려있으면 닫기(토글), 다른 환자면 전환
+      setChatPanelId((prev) => (prev === id ? null : id));
     } else {
       router.push(`/chat/${id}?role=pharmacist`);
     }
@@ -1614,19 +1965,30 @@ function DashboardContent() {
     result = result.filter((c) => getRelationTag(c) === "regular");
   }
 
-  // 정렬: 관계 태그 우선순위 → 기존 정렬
+  // 정렬 우선순위 (단골 영향 없음):
+  //  1) 🔥 답장 필요 (24시간 미답변)
+  //  2) 읽지 않은 새 메시지 (unreadCount > 0)
+  //  3) 마지막 대화 시간순 (최신이 위)
   result = [...result].sort((a, b) => {
-    const tagA = getRelationSortPriority(getRelationTag(a));
-    const tagB = getRelationSortPriority(getRelationTag(b));
-    if (tagA !== tagB) return tagA - tagB;
+    const urgentA = (needsUrgentReply(a) || needsAcceptUrgent(a)) ? 0 : 1;
+    const urgentB = (needsUrgentReply(b) || needsAcceptUrgent(b)) ? 0 : 1;
+    if (urgentA !== urgentB) return urgentA - urgentB;
+
+    const unreadA = a.unreadCount > 0 ? 0 : 1;
+    const unreadB = b.unreadCount > 0 ? 0 : 1;
+    if (unreadA !== unreadB) return unreadA - unreadB;
+
     if (sortBy === "unread") return b.unreadCount - a.unreadCount;
-    return 0; // 기존 순서 유지 (최신순은 mock 데이터 순서 그대로)
+
+    // 마지막 대화 시각 desc (최신이 위)
+    return sortableLastMsgTs(b) - sortableLastMsgTs(a);
   });
 
   // 통계
   const totalRequested = consults.filter((c) => c.patientStatus === "requested" && !c.isRejected).length;
   const totalVisitToday = consults.filter((c) => c.nextVisitDate === TODAY_STR).length;
   const totalManaging = consults.filter((c) => c.patientStatus === "managing").length;
+  const totalUrgent = consults.filter((c) => needsUrgentReply(c) || needsAcceptUrgent(c)).length;
 
   const DATE_RANGE_OPTIONS: { key: DateRangeKey; label: string }[] = [
     { key: "all", label: "전체" },
@@ -1638,6 +2000,12 @@ function DashboardContent() {
 
   return (
     <div className="dash-page" style={{ paddingBottom: 80 }}>
+      <style>{`
+        @keyframes dashUnreadPulse {
+          0%, 100% { background-color: #E02020; }
+          50% { background-color: #A01010; }
+        }
+      `}</style>
       <nav>
         <button className="nav-back" onClick={() => router.back()} aria-label="뒤로가기">
           ←
@@ -1675,7 +2043,20 @@ function DashboardContent() {
         {/* 요약 카드 */}
         <div className="dash-stats-row">
           <div className="dash-stat-card">
-            <div className="dash-stat-num" style={{ color: "#B06D00" }}>🔔 {totalRequested}</div>
+            <div style={{ display: "inline-flex", alignItems: "baseline", gap: 8, justifyContent: "center" }}>
+              <span className="dash-stat-num" style={{ color: "#B06D00" }}>🔔 {totalRequested}</span>
+              {totalUrgent > 0 && (
+                <span
+                  title="24시간 이상 미답변 환자"
+                  style={{
+                    fontSize: 13, fontWeight: 700,
+                    color: "#E05A1A", background: "#FFF0E6",
+                    padding: "2px 8px", borderRadius: 8,
+                    whiteSpace: "nowrap",
+                  }}
+                >🔥 {totalUrgent}</span>
+              )}
+            </div>
             <div className="dash-stat-label" style={{ fontSize: 13 }}>새 상담 요청</div>
           </div>
           <div className="dash-stat-card">
@@ -2065,7 +2446,7 @@ function DashboardContent() {
                   onOpenChat={handleOpenChat}
                   chatOpen={chatPanelId !== null}
                   onAccept={handleAccept}
-                  onReject={handleReject}
+                  onReject={openRejectModal}
                 />
               </div>
             ))}
@@ -2102,6 +2483,7 @@ function DashboardContent() {
                       ? `최근 방문 ${c.visitDate.slice(5).replace(".", "/")}`
                       : "방문 이력 없음";
                   const isReqRow = c.patientStatus === "requested" && !c.isRejected;
+                  const rowHours = hoursOfLastPatientMsg(c);
                   const actionBtnStyle: React.CSSProperties = {
                     width: 28, height: 24, padding: 0, borderRadius: 6,
                     display: "inline-flex", alignItems: "center", justifyContent: "center",
@@ -2115,33 +2497,62 @@ function DashboardContent() {
                       onMouseEnter={(e) => { e.currentTarget.style.background = "var(--sage-pale, #EDF4F0)"; }}
                       onMouseLeave={(e) => { e.currentTarget.style.background = isOver ? "#FAFAFA" : "transparent"; }}
                     >
-                      <td style={{ padding: "12px", fontWeight: 600, color: isOver ? "#8A9590" : "var(--text-dark, #2C3630)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {c.patientName}{rTag === "regular" ? " 💚" : ""}
+                      <td
+                        style={{
+                          padding: "12px", fontWeight: 700,
+                          color: "#2C3630",
+                          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                        }}
+                      >
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                          <span>{c.patientName}{rTag === "regular" ? " 💚" : ""}</span>
+                          {c.unreadCount > 0 && (
+                            <span
+                              className="dash-unread-badge"
+                              style={{ flexShrink: 0, ...getUnreadBadgeStyle(rowHours) }}
+                            >
+                              {c.unreadCount}
+                            </span>
+                          )}
+                        </span>
                       </td>
                       <td style={{ padding: "12px 8px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>{listAge}세</td>
                       <td className="dash-list-gender-col" style={{ padding: "12px 8px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>{c.patientGender}</td>
                       <td style={{ padding: "12px 8px", whiteSpace: "nowrap", overflow: "hidden" }}>
-                        {c.isRejected ? (
-                          <span
-                            title="거절됨"
-                            style={{
-                              display: "inline-flex", alignItems: "center", justifyContent: "center",
-                              padding: "3px 10px", borderRadius: 8,
-                              fontSize: 14, background: "#FFE5E5",
-                            }}
-                          >❌</span>
-                        ) : showSt ? (
-                          <span
-                            title={stCfg.label}
-                            style={{
-                              display: "inline-flex", alignItems: "center", justifyContent: "center",
-                              padding: "3px 10px", borderRadius: 8,
-                              fontSize: 14, background: stCfg.bg,
-                            }}
-                          >{stCfg.emoji}</span>
-                        ) : (
-                          <span style={{ fontSize: 13, color: "var(--text-mid, #3D4A42)" }}>-</span>
-                        )}
+                        <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                          {c.isRejected ? (
+                            <span
+                              title="거절됨"
+                              style={{
+                                display: "inline-flex", alignItems: "center", justifyContent: "center",
+                                padding: "3px 10px", borderRadius: 8,
+                                fontSize: 14, background: "#FFE5E5",
+                              }}
+                            >❌</span>
+                          ) : showSt ? (
+                            <span
+                              title={stCfg.label}
+                              style={{
+                                display: "inline-flex", alignItems: "center", justifyContent: "center",
+                                padding: "3px 10px", borderRadius: 8,
+                                fontSize: 14, background: stCfg.bg,
+                              }}
+                            >{stCfg.emoji}</span>
+                          ) : (
+                            <span style={{ fontSize: 13, color: "var(--text-mid, #3D4A42)" }}>-</span>
+                          )}
+                          {(c.previousRejections?.length ?? 0) > 0 && (
+                            <span
+                              title={`이전 거절 이력 ${c.previousRejections!.length}건`}
+                              style={{
+                                display: "inline-flex", alignItems: "center", justifyContent: "center",
+                                padding: "3px 8px", borderRadius: 8,
+                                fontSize: 13, fontWeight: 600,
+                                background: "#FFF8E1", color: "#B06D00",
+                              }}
+                            >⚠️</span>
+                          )}
+                        </span>
                       </td>
                       <td title={visitTitle} style={{ padding: "12px 8px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis" }}>
                         {visitLabel}
@@ -2166,7 +2577,7 @@ function DashboardContent() {
                               type="button"
                               title="거절"
                               aria-label="거절"
-                              onClick={(e) => { e.stopPropagation(); handleReject(c.id, "기타"); }}
+                              onClick={(e) => { e.stopPropagation(); openRejectModal(c.id); }}
                               style={{
                                 ...actionBtnStyle,
                                 background: "#fff", color: "#D32F2F",
@@ -2214,6 +2625,90 @@ function DashboardContent() {
       )}
 
       {/* 토스트 */}
+      {/* 공용 거절 사유 선택 모달 (카드뷰/리스트뷰 공통) */}
+      {rejectTargetId && (
+        <div
+          onClick={closeRejectModal}
+          style={{
+            position: "fixed", inset: 0, zIndex: 200,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff", borderRadius: 14, padding: 22,
+              maxWidth: 340, width: "92%",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.15)",
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text-dark, #2C3630)", marginBottom: 6 }}>정말 거절하시겠어요?</div>
+            <div style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", marginBottom: 14, lineHeight: 1.5 }}>
+              거절 사유를 선택해 주세요 (선택 사항)
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+              {(["전문 분야 아님", "상담 여유 없음", "기타"] as const).map((r) => (
+                <label key={r} style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  padding: "8px 12px", borderRadius: 8,
+                  background: rejectModalReason === r ? "var(--sage-pale, #EDF4F0)" : "#F8F9F7",
+                  border: rejectModalReason === r ? "1.5px solid var(--sage-deep, #4A6355)" : "1px solid var(--border, rgba(94,125,108,0.14))",
+                  cursor: "pointer", fontSize: 14, color: "var(--text-dark, #2C3630)",
+                }}>
+                  <input
+                    type="radio"
+                    name="reject-reason-shared"
+                    checked={rejectModalReason === r}
+                    onChange={() => setRejectModalReason(r)}
+                    style={{ margin: 0 }}
+                  />
+                  {r}
+                </label>
+              ))}
+            </div>
+            {rejectModalReason === "기타" && (
+              <input
+                type="text"
+                value={rejectModalCustom}
+                onChange={(e) => setRejectModalCustom(e.target.value)}
+                placeholder="사유를 입력해 주세요"
+                style={{
+                  width: "100%", padding: "8px 10px", borderRadius: 8,
+                  border: "1.5px solid var(--sage-light, #B3CCBE)",
+                  fontSize: 14, color: "var(--text-dark)", outline: "none",
+                  marginBottom: 12, fontFamily: "'Noto Sans KR', sans-serif",
+                  boxSizing: "border-box",
+                }}
+              />
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={closeRejectModal}
+                style={{
+                  flex: 1, padding: "10px 0", borderRadius: 8,
+                  fontSize: 14, fontWeight: 600,
+                  background: "#F8F9F7", color: "var(--text-mid, #3D4A42)",
+                  border: "1px solid var(--border, rgba(94,125,108,0.14))",
+                  cursor: "pointer",
+                }}
+              >취소</button>
+              <button
+                type="button"
+                onClick={confirmRejectModal}
+                style={{
+                  flex: 1, padding: "10px 0", borderRadius: 8,
+                  fontSize: 14, fontWeight: 700,
+                  background: "#D32F2F", color: "#fff",
+                  border: "none", cursor: "pointer",
+                }}
+              >거절하기</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast && (
         <div
           role="status"

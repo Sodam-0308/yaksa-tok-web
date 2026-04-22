@@ -23,20 +23,6 @@ const ALL_SPECIALTIES = [
 
 const INITIAL_EXPERT = new Set(["만성피로", "불면", "소화장애"]);
 
-interface CustomQuestion {
-  id: number;
-  text: string;
-  type: "주관식" | "객관식";
-  choices?: string[];
-  enabled: boolean;
-}
-
-const INITIAL_QUESTIONS: CustomQuestion[] = [
-  { id: 1, text: "현재 복용 중인 영양제가 있나요?", type: "주관식", enabled: true },
-  { id: 2, text: "하루 평균 카페인 섭취량은?", type: "객관식", choices: ["안 마심", "1~2잔", "3잔 이상"], enabled: true },
-  { id: 3, text: "식사는 주로 어떻게 하시나요?", type: "객관식", choices: ["직접 요리", "외식 위주", "배달 위주", "불규칙"], enabled: true },
-];
-
 const DAYS = ["월", "화", "수", "목", "금", "토", "일"] as const;
 
 interface TimeRange { start: string; end: string }
@@ -65,6 +51,20 @@ const INITIAL_TEMPLATES: Template[] = [
 ];
 
 const STATS = { total: 28, completed: 23, avgTime: "2시간 30분", improved: 12, badge: "개선 확인", nextBadge: "종합 건강관리까지 개선 확인 3개 분야 필요" };
+
+/* ── 개별 문답 세트 ── */
+interface QuestionSetSummary {
+  id: string;
+  name: string;
+  questionCount: number;
+  isDefault: boolean;
+}
+
+const INITIAL_QUESTION_SETS: QuestionSetSummary[] = [
+  { id: "set-1", name: "소화 문제용", questionCount: 5, isDefault: true },
+  { id: "set-2", name: "수면 문제용", questionCount: 3, isDefault: false },
+  { id: "set-3", name: "피로·무기력용", questionCount: 4, isDefault: false },
+];
 
 /* ══════════════════════════════════════════
    컬러
@@ -144,22 +144,6 @@ function Content() {
   const allSelected = available.size === ALL_SPECIALTIES.length;
   const toggleAll = () => setAvailable(allSelected ? new Set() : new Set(ALL_SPECIALTIES));
 
-  /* ── 맞춤 질문 ── */
-  const [qGlobal, setQGlobal] = useState(true);
-  const [questions, setQuestions] = useState<CustomQuestion[]>(INITIAL_QUESTIONS);
-  const [showQModal, setShowQModal] = useState(false);
-  const [qText, setQText] = useState("");
-  const [qType, setQType] = useState<"주관식" | "객관식">("주관식");
-  const [qChoices, setQChoices] = useState<string[]>(["", ""]);
-
-  const toggleQEnabled = (id: number) => setQuestions(questions.map((q) => q.id === id ? { ...q, enabled: !q.enabled } : q));
-  const removeQ = (id: number) => setQuestions(questions.filter((q) => q.id !== id));
-  const addQ = () => {
-    if (!qText.trim() || questions.length >= 5) return;
-    setQuestions([...questions, { id: Date.now(), text: qText.trim(), type: qType, ...(qType === "객관식" ? { choices: qChoices.filter((c) => c.trim()) } : {}), enabled: true }]);
-    setQText(""); setQType("주관식"); setQChoices(["", ""]); setShowQModal(false);
-  };
-
   /* ── 스케줄 ── */
   const [schedule, setSchedule] = useState(INITIAL_SCHEDULE);
   const [blocked, setBlocked] = useState<BlockedDate[]>(INITIAL_BLOCKED);
@@ -190,22 +174,36 @@ function Content() {
   };
   const removeBlocked = (id: number) => setBlocked(blocked.filter((b) => b.id !== id));
 
-  /* ── 템플릿 ── */
-  const [templates, setTemplates] = useState<Template[]>(INITIAL_TEMPLATES);
-  const [showTModal, setShowTModal] = useState(false);
-  const [tTitle, setTTitle] = useState("");
-  const [tContent, setTContent] = useState("");
-  const addT = () => {
-    if (!tTitle.trim() || !tContent.trim()) return;
-    setTemplates([...templates, { id: Date.now(), title: tTitle.trim(), content: tContent.trim() }]);
-    setTTitle(""); setTContent(""); setShowTModal(false);
-  };
+  /* ── 템플릿 (개수만 표시, 관리 페이지로 이동) ── */
+  const [templates] = useState<Template[]>(INITIAL_TEMPLATES);
 
   /* ── 설정 ── */
   const [remoteOn, setRemoteOn] = useState(false);
   const [notiOn, setNotiOn] = useState(true);
   const [showLogout, setShowLogout] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
+
+  /* ── 개별 문답 세트 ── */
+  const [questionSets, setQuestionSets] = useState<QuestionSetSummary[]>(INITIAL_QUESTION_SETS);
+  const [deleteSetId, setDeleteSetId] = useState<string | null>(null);
+
+  const duplicateSet = (id: string) => {
+    const src = questionSets.find((s) => s.id === id);
+    if (!src) return;
+    const newSet: QuestionSetSummary = {
+      id: `set-${Date.now()}`,
+      name: `복사본 - ${src.name}`,
+      questionCount: src.questionCount,
+      isDefault: false,
+    };
+    setQuestionSets((prev) => [...prev, newSet]);
+  };
+
+  const confirmDeleteSet = () => {
+    if (!deleteSetId) return;
+    setQuestionSets((prev) => prev.filter((s) => s.id !== deleteSetId));
+    setDeleteSetId(null);
+  };
 
   /* ── 날짜 포맷 ── */
   const fmtDate = (d: string) => d.replace(/-/g, ".");
@@ -364,6 +362,40 @@ function Content() {
             </div>
           </div>
 
+          {/* ── 내 실적 (약국 사진 아래, 전문 분야 위) ── */}
+          <div style={card}>
+            <div style={secTitle}>내 실적</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+              <StatBox label="총 상담" value={`${STATS.total}건`} />
+              <StatBox label="완료" value={`${STATS.completed}건`} />
+              <StatBox label="평균 답변 시간" value={STATS.avgTime} />
+              <StatBox label="개선 확인" value={`${STATS.improved}건`} accent />
+            </div>
+            <div style={{ padding: "14px 16px", borderRadius: 12, background: `linear-gradient(135deg, ${C.terraPale} 0%, ${C.white} 100%)`, border: `1px solid ${C.terraLight}`, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 20 }}>&#11088;</span>
+                <span style={{ fontSize: 15, fontWeight: 700, color: C.terraDark }}>현재 뱃지: {STATS.badge}</span>
+              </div>
+              <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.5 }}>다음 목표: {STATS.nextBadge}</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <button
+                type="button"
+                onClick={() => router.push("/pharmacist/performance")}
+                style={{
+                  background: "none", border: "none",
+                  padding: "4px 0",
+                  fontSize: 14, fontWeight: 600,
+                  color: C.sageMid,
+                  cursor: "pointer",
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                상세 보기 →
+              </button>
+            </div>
+          </div>
+
           {/* ═══ 2열 그리드 ═══ */}
           <div className="pm-g">
             {/* ── 좌측 ── */}
@@ -397,52 +429,156 @@ function Content() {
                 </div>
               </div>
 
-              {/* ── 4. 맞춤 추가 질문 ── */}
+              {/* ── 4. 맞춤 추가 질문 (세트 기반) ── */}
               <div style={card}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6, gap: 8, flexWrap: "wrap" }}>
                   <div style={secTitle}>맞춤 추가 질문</div>
-                  <Toggle checked={qGlobal} onChange={() => setQGlobal(!qGlobal)} />
+                  {questionSets.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => router.push("/pharmacist/questionnaire/new")}
+                      style={{
+                        padding: "8px 14px", borderRadius: 10,
+                        fontSize: 14, fontWeight: 700,
+                        background: C.sageDeep, color: C.white,
+                        border: "none", cursor: "pointer",
+                      }}
+                    >
+                      + 새 세트 만들기
+                    </button>
+                  )}
                 </div>
-                <div style={{ fontSize: 14, color: C.textMid, marginBottom: 14 }}>매칭 수락 시 환자에게 추가 질문 보내기</div>
+                <div style={{ ...secDesc, marginBottom: 14 }}>
+                  자주 묻는 질문을 세트로 만들어 환자에게 보낼 수 있어요. ★ 기본 세트는 매칭 수락 후 자동 전송돼요.
+                </div>
 
-                {qGlobal && (
-                  showEmptyState ? (
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "32px 20px", textAlign: "center" }}>
-                      <div style={{ fontSize: 48, marginBottom: 12, lineHeight: 1 }}>❓</div>
-                      <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>아직 추가 질문이 없어요</div>
-                      <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 16 }}>환자에게 미리 물어볼 질문을 설정해보세요</div>
-                      <button type="button" onClick={() => setShowQModal(true)} style={{ padding: "11px 24px", borderRadius: 12, fontSize: 14, fontWeight: 700, background: C.sageDeep, color: C.white, border: "none", cursor: "pointer" }}>+ 질문 추가</button>
+                {questionSets.length === 0 ? (
+                  <div style={{
+                    padding: "28px 20px", borderRadius: 12,
+                    background: C.sageBg, border: `1px dashed ${C.sageLight}`,
+                    textAlign: "center",
+                  }}>
+                    <div style={{ fontSize: 32, marginBottom: 8 }}>📝</div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, marginBottom: 4 }}>
+                      아직 만든 문답 세트가 없어요
                     </div>
-                  ) : (
-                  <>
-                    <div style={{ ...secDesc, marginBottom: 12 }}>최대 5개까지 설정할 수 있어요.</div>
-                    {questions.map((q) => (
-                      <div key={q.id} style={{ padding: "14px 16px", borderRadius: 12, background: q.enabled ? C.sageBg : "#f3f3f2", marginBottom: 10, border: `1px solid ${C.border}`, opacity: q.enabled ? 1 : 0.6, transition: "opacity 0.15s" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 15, color: C.textDark, fontWeight: 500, lineHeight: 1.5, marginBottom: 6 }}>{q.text}</div>
-                            <span style={{ display: "inline-block", padding: "2px 8px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: q.type === "주관식" ? C.terraPale : C.sagePale, color: q.type === "주관식" ? C.terraDark : C.sageDeep }}>{q.type}</span>
-                            {q.choices && (
-                              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-                                {q.choices.map((ch, ci) => <span key={ci} style={{ fontSize: 13, color: C.textMid, padding: "3px 10px", borderRadius: 6, background: C.white, border: `1px solid ${C.border}` }}>{ch}</span>)}
-                              </div>
-                            )}
-                          </div>
-                          <Toggle checked={q.enabled} onChange={() => toggleQEnabled(q.id)} size="small" />
+                    <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 14 }}>
+                      자주 묻는 질문을 세트로 만들어 환자에게 보낼 수 있어요
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => router.push("/pharmacist/questionnaire/new")}
+                      style={{
+                        padding: "10px 18px", borderRadius: 10,
+                        fontSize: 14, fontWeight: 700,
+                        background: C.sageDeep, color: C.white,
+                        border: "none", cursor: "pointer",
+                      }}
+                    >
+                      + 새 세트 만들기
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {questionSets.map((s) => (
+                      <div key={s.id} style={{
+                        background: C.white, border: `1px solid ${C.border}`,
+                        borderRadius: 16, padding: 16,
+                      }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                          <span style={{ fontSize: 16, fontWeight: 600, color: C.textDark }}>{s.name}</span>
+                          {s.isDefault && (
+                            <span style={{
+                              padding: "2px 8px", borderRadius: 8,
+                              fontSize: 13, fontWeight: 700,
+                              background: "#FFF8E1", color: "#F59E0B",
+                              display: "inline-flex", alignItems: "center", gap: 3,
+                            }}>
+                              ★ 기본 세트
+                            </span>
+                          )}
                         </div>
-                        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-                          <button type="button" onClick={() => removeQ(q.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.sageMid, padding: "4px 8px" }}>삭제</button>
+                        <div style={{ fontSize: 14, color: C.textMid, marginBottom: 12 }}>
+                          질문 {s.questionCount}개
+                        </div>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            onClick={() => router.push(`/pharmacist/questionnaire/${s.id}`)}
+                            style={{
+                              padding: "6px 14px", borderRadius: 8,
+                              fontSize: 14, fontWeight: 600,
+                              background: C.sagePale, color: C.sageMid,
+                              border: `1px solid ${C.sageLight}`, cursor: "pointer",
+                            }}
+                          >
+                            수정
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => duplicateSet(s.id)}
+                            style={{
+                              padding: "6px 14px", borderRadius: 8,
+                              fontSize: 14, fontWeight: 600,
+                              background: C.white, color: C.sageMid,
+                              border: `1px solid ${C.border}`, cursor: "pointer",
+                            }}
+                          >
+                            복제
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteSetId(s.id)}
+                            style={{
+                              padding: "6px 14px", borderRadius: 8,
+                              fontSize: 14, fontWeight: 600,
+                              background: C.white, color: C.error,
+                              border: `1px solid ${C.border}`, cursor: "pointer",
+                            }}
+                          >
+                            삭제
+                          </button>
                         </div>
                       </div>
                     ))}
-                    {questions.length < 5 ? (
-                      <button type="button" onClick={() => setShowQModal(true)} style={{ width: "100%", padding: "12px 0", borderRadius: 12, border: `1.5px dashed ${C.sageLight}`, background: "none", cursor: "pointer", fontSize: 14, fontWeight: 600, color: C.sageMid }}>+ 질문 추가</button>
-                    ) : (
-                      <div style={{ fontSize: 13, color: C.terra, textAlign: "center", padding: 8 }}>질문은 최대 5개까지 등록할 수 있어요</div>
-                    )}
-                  </>
-                  )
+                  </div>
                 )}
+              </div>
+
+              {/* ── 답변 템플릿 (맞춤 추가 질문 아래, 좌측 열) ── */}
+              <div style={card}>
+                <div style={secTitle}>답변 템플릿</div>
+                <div style={{ ...secDesc, marginBottom: 12 }}>
+                  자주 쓰는 답변을 미리 저장해두세요.
+                </div>
+                <div style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  gap: 10, flexWrap: "wrap",
+                  padding: "12px 14px",
+                  background: C.sageBg,
+                  border: `1px solid ${C.border}`,
+                  borderRadius: 12,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 18 }}>💬</span>
+                    <span style={{ fontSize: 15, fontWeight: 700, color: C.textDark }}>
+                      {templates.length}개 저장됨
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => router.push("/pharmacist/templates")}
+                    style={{
+                      padding: "7px 14px", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600,
+                      background: C.sagePale, color: C.sageDeep,
+                      border: `1px solid ${C.sageLight}`, cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                  >
+                    템플릿 관리 →
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -520,55 +656,9 @@ function Content() {
                 </div>
               </div>
 
-              {/* ── 6. 답변 템플릿 ── */}
-              <div style={card}>
-                <div style={secTitle}>답변 템플릿</div>
-                <div style={secDesc}>자주 쓰는 답변을 미리 저장해두세요. 채팅에서 빠르게 불러올 수 있습니다.</div>
-                {showEmptyState ? (
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "32px 20px", textAlign: "center" }}>
-                    <div style={{ fontSize: 48, marginBottom: 12, lineHeight: 1 }}>💬</div>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>아직 저장된 템플릿이 없어요</div>
-                    <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 16 }}>자주 쓰는 답변을 저장하면 상담이 빨라져요</div>
-                    <button type="button" onClick={() => setShowTModal(true)} style={{ padding: "11px 24px", borderRadius: 12, fontSize: 14, fontWeight: 700, background: C.sageDeep, color: C.white, border: "none", cursor: "pointer" }}>+ 템플릿 추가</button>
-                  </div>
-                ) : (
-                  <>
-                    {templates.map((t) => (
-                      <div key={t.id} style={{ padding: "14px 16px", borderRadius: 12, background: C.sageBg, marginBottom: 10, border: `1px solid ${C.border}` }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 15, fontWeight: 600, color: C.textDark, marginBottom: 4 }}>{t.title}</div>
-                            <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.5, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const, overflow: "hidden" }}>{t.content}</div>
-                          </div>
-                          <button type="button" onClick={() => setTemplates(templates.filter((x) => x.id !== t.id))} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: C.sageMid, padding: 4, flexShrink: 0 }}>&times;</button>
-                        </div>
-                      </div>
-                    ))}
-                    <button type="button" onClick={() => setShowTModal(true)} style={{ width: "100%", padding: "12px 0", borderRadius: 12, border: `1.5px dashed ${C.sageLight}`, background: "none", cursor: "pointer", fontSize: 14, fontWeight: 600, color: C.sageMid }}>+ 템플릿 추가</button>
-                  </>
-                )}
-              </div>
             </div>
           </div>
           {/* ═══ 그리드 끝 ═══ */}
-
-          {/* ── 7. 내 실적 ── */}
-          <div style={card}>
-            <div style={secTitle}>내 실적</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
-              <StatBox label="총 상담" value={`${STATS.total}건`} />
-              <StatBox label="완료" value={`${STATS.completed}건`} />
-              <StatBox label="평균 답변 시간" value={STATS.avgTime} />
-              <StatBox label="개선 확인" value={`${STATS.improved}건`} accent />
-            </div>
-            <div style={{ padding: "14px 16px", borderRadius: 12, background: `linear-gradient(135deg, ${C.terraPale} 0%, ${C.white} 100%)`, border: `1px solid ${C.terraLight}`, marginBottom: 10 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <span style={{ fontSize: 20 }}>&#11088;</span>
-                <span style={{ fontSize: 15, fontWeight: 700, color: C.terraDark }}>현재 뱃지: {STATS.badge}</span>
-              </div>
-              <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.5 }}>다음 목표: {STATS.nextBadge}</div>
-            </div>
-          </div>
 
           {/* ── 8. 설정 ── */}
           <div style={card}>
@@ -588,57 +678,8 @@ function Content() {
         </div>
       </div>
 
-      {/* ═══ 모달: 질문 추가 ═══ */}
-      {showQModal && (
-        <div style={overlay} onClick={() => setShowQModal(false)}>
-          <div style={modal} onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontSize: 17, fontWeight: 700, color: C.textDark, marginBottom: 16, fontFamily: "'Gothic A1', sans-serif" }}>추가 질문 등록</div>
-            <Field label="질문 내용" value={qText} onChange={setQText} placeholder="예: 평소 운동은 얼마나 하시나요?" />
-            <div style={{ height: 14 }} />
-            <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 6 }}>질문 형태</label>
-            <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-              {(["주관식", "객관식"] as const).map((t) => (
-                <button key={t} type="button" onClick={() => setQType(t)} style={{ ...chipBase, flex: 1, textAlign: "center", ...(qType === t ? { background: C.sageDeep, color: C.white, border: `1px solid ${C.sageDeep}` } : {}) }}>{t}</button>
-              ))}
-            </div>
-            {qType === "객관식" && (
-              <div style={{ marginBottom: 14 }}>
-                <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 6 }}>선택지 (최소 2개)</label>
-                {qChoices.map((ch, i) => (
-                  <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
-                    <input style={{ ...inp, flex: 1 }} placeholder={`선택지 ${i + 1}`} value={ch} onChange={(e) => { const arr = [...qChoices]; arr[i] = e.target.value; setQChoices(arr); }} />
-                    {qChoices.length > 2 && <button type="button" onClick={() => setQChoices(qChoices.filter((_, idx) => idx !== i))} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: C.sageMid }}>&times;</button>}
-                  </div>
-                ))}
-                <button type="button" onClick={() => setQChoices([...qChoices, ""])} style={{ fontSize: 14, fontWeight: 600, color: C.sageMid, background: "none", border: "none", cursor: "pointer", padding: "4px 0" }}>+ 선택지 추가</button>
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 10 }}>
-              <button type="button" style={btnS} onClick={() => setShowQModal(false)}>취소</button>
-              <button type="button" style={{ ...btnP, opacity: qText.trim().length === 0 ? 0.5 : 1 }} onClick={addQ}>등록</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ═══ 모달: 템플릿 추가 ═══ */}
-      {showTModal && (
-        <div style={overlay} onClick={() => setShowTModal(false)}>
-          <div style={modal} onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontSize: 17, fontWeight: 700, color: C.textDark, marginBottom: 16, fontFamily: "'Gothic A1', sans-serif" }}>템플릿 추가</div>
-            <Field label="제목" value={tTitle} onChange={setTTitle} placeholder="예: 영양제 안내" />
-            <div style={{ height: 14 }} />
-            <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 4 }}>내용</label>
-            <textarea style={{ ...inp, resize: "vertical", lineHeight: 1.6, minHeight: 100 }} placeholder="템플릿 내용을 입력하세요..." value={tContent} onChange={(e) => setTContent(e.target.value)} rows={4} />
-            <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-              <button type="button" style={btnS} onClick={() => setShowTModal(false)}>취소</button>
-              <button type="button" style={{ ...btnP, opacity: (!tTitle.trim() || !tContent.trim()) ? 0.5 : 1 }} onClick={addT}>등록</button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* ═══ 확인 모달 ═══ */}
+      {deleteSetId && <ConfirmModal title="이 세트를 삭제하시겠습니까?" desc="삭제된 세트는 복구할 수 없어요." onCancel={() => setDeleteSetId(null)} onConfirm={confirmDeleteSet} confirmLabel="삭제" danger />}
       {showLogout && <ConfirmModal title="로그아웃 하시겠습니까?" desc="다시 로그인하면 이용할 수 있어요." onCancel={() => setShowLogout(false)} onConfirm={() => { setShowLogout(false); router.push("/"); }} confirmLabel="로그아웃" />}
       {showWithdraw && <ConfirmModal title="정말 탈퇴하시겠습니까?" desc="탈퇴 시 모든 상담 기록과 데이터가 영구 삭제되며 복구할 수 없습니다." onCancel={() => setShowWithdraw(false)} onConfirm={() => { setShowWithdraw(false); router.push("/"); }} confirmLabel="탈퇴하기" danger />}
     </>

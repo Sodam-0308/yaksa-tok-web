@@ -70,6 +70,14 @@ const DEMO_MESSAGES: Message[] = [
     isRead: true,
     sessionId: "s1",
   },
+  {
+    id: "qset-demo-1",
+    sender: "pharmacist",
+    content: "[추가질문] set-3",
+    time: "오전 10:25",
+    isRead: true,
+    sessionId: "s1",
+  },
 ];
 
 const PHARMACIST_INFO = {
@@ -90,6 +98,50 @@ const TEMPLATES: Template[] = [
   { id: 2, title: "방문 안내", content: "약국에 방문하시면 더 자세한 상담이 가능해요.\n\n📍 초록숲 약국\n⏰ 평일 10시~19시, 토요일 10시~14시\n\n편하신 시간에 오세요!" },
   { id: 3, title: "복약 가이드", content: "말씀드린 영양제는 아래와 같이 드시면 좋아요.\n\n💊 아침 식후: 비타민B군, 비타민D\n💊 취침 전: 마그네슘\n\n2주 후 경과를 알려주세요." },
   { id: 4, title: "경과 확인", content: "안녕하세요! 지난번 상담 이후 경과가 궁금해요.\n\n혹시 수면이나 소화 쪽으로 변화가 있으셨나요? 편하게 말씀해 주세요." },
+];
+
+/* 추가 질문 세트 — 약사가 채팅에서 전송 */
+type QSetQuestionType = "객관식" | "주관식" | "다중 선택";
+interface QSetQuestion {
+  text: string;
+  type: QSetQuestionType;
+  choices?: string[];
+}
+interface QuestionnaireSet {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  questions: QSetQuestion[];
+}
+
+const QUESTIONNAIRE_SETS: QuestionnaireSet[] = [
+  {
+    id: "set-1", name: "소화 문제용", isDefault: true,
+    questions: [
+      { text: "식후 더부룩함이 얼마나 자주 있나요?", type: "객관식", choices: ["거의 없음", "가끔", "자주", "매일"] },
+      { text: "배변 주기는 어떻게 되나요?", type: "객관식", choices: ["매일", "2~3일에 한 번", "일주일에 2~3회", "일주일에 한 번 이하"] },
+      { text: "소화에 도움이 되는 음식이 있다면 자유롭게 적어주세요.", type: "주관식" },
+      { text: "평소 불편한 증상을 모두 선택해주세요.", type: "다중 선택", choices: ["속쓰림", "더부룩함", "가스 참", "메스꺼움", "복통"] },
+      { text: "하루 수분 섭취량은 어느 정도인가요?", type: "객관식", choices: ["500mL 이하", "500mL~1L", "1L~2L", "2L 이상"] },
+    ],
+  },
+  {
+    id: "set-2", name: "수면 문제용", isDefault: false,
+    questions: [
+      { text: "잠드는 데까지 걸리는 시간은?", type: "객관식", choices: ["10분 이내", "10~30분", "30분~1시간", "1시간 이상"] },
+      { text: "자다가 깨는 횟수는?", type: "객관식", choices: ["없음", "1회", "2~3회", "4회 이상"] },
+      { text: "수면 관련 더 말씀하고 싶은 내용이 있다면 적어주세요.", type: "주관식" },
+    ],
+  },
+  {
+    id: "set-3", name: "피로·무기력용", isDefault: false,
+    questions: [
+      { text: "오전과 오후 중 언제 더 피곤함을 느끼나요?", type: "객관식", choices: ["오전", "오후", "하루종일", "특별히 없음"] },
+      { text: "피로와 함께 오는 증상을 모두 선택해주세요.", type: "다중 선택", choices: ["두통", "소화불량", "집중력 저하", "근육통", "없음"] },
+      { text: "최근 운동 빈도는?", type: "객관식", choices: ["안 함", "주 1~2회", "주 3~4회", "매일"] },
+      { text: "평소 스트레스 요인이 있다면 적어주세요.", type: "주관식" },
+    ],
+  },
 ];
 
 /* ══════════════════════════════════════════
@@ -162,13 +214,26 @@ const VISIT_TIME_SLOTS = ["오전", "오후", "종일", "직접 입력"];
 /* ── 상담 차수 ── */
 interface ConsultSession {
   id: string;
-  startDate: string; // "MM.DD" 형태
+  startDate: string;       // "MM.DD" 형태
+  aiSummary: string;       // AI 문답 요약
+  symptomTags: string[];   // 증상 태그
 }
 
 const CONSULT_SESSIONS: ConsultSession[] = [
-  { id: "s1", startDate: "03.15" },
-  { id: "s2", startDate: "04.11" },
+  {
+    id: "s1", startDate: "03.15",
+    aiSummary: "만성피로 + 소화불량 복합. 6개월 이상 지속, 오후 졸음·식후 더부룩함 호소.",
+    symptomTags: ["만성피로", "소화불량"],
+  },
+  {
+    id: "s2", startDate: "04.11",
+    aiSummary: "수면장애 재발. 입면 어려움, 새벽 각성. 카페인 섭취 증가와 연관 가능성.",
+    symptomTags: ["수면장애", "스트레스"],
+  },
 ];
+
+/** 가장 최근 차수 id (가장 뒤의 항목) */
+const LATEST_SESSION_ID = CONSULT_SESSIONS[CONSULT_SESSIONS.length - 1].id;
 
 const SESSION2_SYSTEM_MSG: Message = {
   id: "session2-start",
@@ -178,6 +243,34 @@ const SESSION2_SYSTEM_MSG: Message = {
   isRead: true,
   sessionId: "s2",
 };
+
+/** 2차 상담 추가 메시지 (Mock) */
+const SESSION2_EXTRA_MSGS: Message[] = [
+  {
+    id: "s2-1",
+    sender: "patient",
+    content: "약사님 안녕하세요, 지난달에 한 번 상담받았었는데 요즘 다시 잠이 잘 안 와서 AI 문답 다시 제출했어요.",
+    time: "오전 9:15",
+    isRead: true,
+    sessionId: "s2",
+  },
+  {
+    id: "s2-2",
+    sender: "pharmacist",
+    content: "네 알겠습니다. 증상 확인했어요. 카페인 섭취량이 좀 늘어난 것 같은데 최근 생활 패턴 어떠세요?",
+    time: "오전 9:40",
+    isRead: true,
+    sessionId: "s2",
+  },
+  {
+    id: "s2-3",
+    sender: "patient",
+    content: "요즘 업무가 많아서 오후에 커피 한 잔 더 마시게 됐어요. 그게 영향인 것 같기도 하고...",
+    time: "오전 10:02",
+    isRead: false,
+    sessionId: "s2",
+  },
+];
 
 function formatVisitDate(iso: string): string {
   const [y, m, d] = iso.split("-").map(Number);
@@ -221,14 +314,16 @@ function ChatContent() {
   const role = searchParams.get("role") === "pharmacist" ? "pharmacist" : "patient";
   const isEmbedded = searchParams.get("embedded") === "true";
 
-  const [messages, setMessages] = useState<Message[]>([...DEMO_MESSAGES, SESSION2_SYSTEM_MSG]);
+  const [messages, setMessages] = useState<Message[]>([...DEMO_MESSAGES, SESSION2_SYSTEM_MSG, ...SESSION2_EXTRA_MSGS]);
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   /* ── 상담 차수 ── */
-  const [activeSession, setActiveSession] = useState("s1");
+  const [activeSession, setActiveSession] = useState(LATEST_SESSION_ID);
+  const isLatestSession = activeSession === LATEST_SESSION_ID;
+  const activeSessionData = CONSULT_SESSIONS.find((s) => s.id === activeSession);
   const sessionTabRef = useRef<HTMLDivElement>(null);
 
   /* ── 팔로업 (차수별) ── */
@@ -274,6 +369,123 @@ function ChatContent() {
   /* ── 환자 차트 사이드 패널 ── */
   const [showChartPanel, setShowChartPanel] = useState(false);
 
+  /* ── 추가 질문 세트 전송 ── */
+  const [showQSetPicker, setShowQSetPicker] = useState(false);
+  const [selectedQSetId, setSelectedQSetId] = useState<string | null>(null);
+  const [expandedQSetMsgs, setExpandedQSetMsgs] = useState<Set<string>>(new Set());
+
+  /* ── 환자 답변 상태 ── */
+  // 답변 완료된 원본 질문 메시지 id
+  const [answeredQSetMsgIds, setAnsweredQSetMsgIds] = useState<Set<string>>(new Set());
+  // 메시지 id → 답변 배열 (질문 index 순)
+  const [qSetAnswers, setQSetAnswers] = useState<Record<string, string[]>>({});
+  // 답변 폼 상태
+  const [answeringMsg, setAnsweringMsg] = useState<{ msgId: string; setId: string } | null>(null);
+  const [answerDraft, setAnswerDraft] = useState<string[]>([]);
+
+  const handleQSendClick = () => {
+    const set = QUESTIONNAIRE_SETS.find((s) => s.id === selectedQSetId);
+    if (!set) return;
+    const now = new Date();
+    const h = now.getHours(); const m = now.getMinutes();
+    const ampm = h < 12 ? "오전" : "오후";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    const timeStr = `${ampm} ${h12}:${String(m).padStart(2, "0")}`;
+    setMessages((prev) => [...prev, {
+      id: `qset-${Date.now()}`,
+      sender: "pharmacist",
+      content: `[추가질문] ${set.id}`,
+      time: timeStr,
+      isRead: false,
+      sessionId: activeSession,
+    }]);
+    setShowQSetPicker(false);
+    setSelectedQSetId(null);
+  };
+
+  const toggleQSetPreview = (msgId: string) => {
+    setExpandedQSetMsgs((prev) => {
+      const next = new Set(prev);
+      next.has(msgId) ? next.delete(msgId) : next.add(msgId);
+      return next;
+    });
+  };
+
+  const openAnswerForm = (msgId: string, setId: string) => {
+    const set = QUESTIONNAIRE_SETS.find((s) => s.id === setId);
+    if (!set) return;
+    let initial = set.questions.map(() => "");
+    if (typeof window !== "undefined") {
+      try {
+        const stored = window.sessionStorage.getItem(`questionnaire-answers-${msgId}`);
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (Array.isArray(parsed) && parsed.length === set.questions.length) {
+            initial = parsed.map((v) => (typeof v === "string" ? v : ""));
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    setAnsweringMsg({ msgId, setId });
+    setAnswerDraft(initial);
+  };
+
+  const closeAnswerForm = () => {
+    setAnsweringMsg(null);
+    setAnswerDraft([]);
+  };
+
+  // 답변 중간 저장 — answerDraft 변경 시 sessionStorage에 자동 저장
+  useEffect(() => {
+    if (!answeringMsg) return;
+    if (typeof window === "undefined") return;
+    try {
+      window.sessionStorage.setItem(
+        `questionnaire-answers-${answeringMsg.msgId}`,
+        JSON.stringify(answerDraft)
+      );
+    } catch { /* ignore */ }
+  }, [answeringMsg, answerDraft]);
+
+  const updateAnswerDraft = (idx: number, value: string) => {
+    setAnswerDraft((prev) => prev.map((v, i) => (i === idx ? value : v)));
+  };
+
+  const toggleMultiAnswer = (idx: number, choice: string) => {
+    setAnswerDraft((prev) => prev.map((v, i) => {
+      if (i !== idx) return v;
+      const cur = v ? v.split(",").filter(Boolean) : [];
+      const has = cur.includes(choice);
+      const next = has ? cur.filter((c) => c !== choice) : [...cur, choice];
+      return next.join(",");
+    }));
+  };
+
+  const submitAnswer = () => {
+    if (!answeringMsg) return;
+    const { msgId, setId } = answeringMsg;
+    setAnsweredQSetMsgIds((prev) => { const next = new Set(prev); next.add(msgId); return next; });
+    setQSetAnswers((prev) => ({ ...prev, [msgId]: [...answerDraft] }));
+    if (typeof window !== "undefined") {
+      try { window.sessionStorage.removeItem(`questionnaire-answers-${msgId}`); } catch { /* ignore */ }
+    }
+
+    const now = new Date();
+    const h = now.getHours(); const m = now.getMinutes();
+    const ampm = h < 12 ? "오전" : "오후";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    const timeStr = `${ampm} ${h12}:${String(m).padStart(2, "0")}`;
+    setMessages((prev) => [...prev, {
+      id: `qans-${Date.now()}`,
+      sender: "patient",
+      content: `[추가질문답변] ${setId}::${msgId}`,
+      time: timeStr,
+      isRead: false,
+      sessionId: activeSession,
+    }]);
+    closeAnswerForm();
+  };
+
   /* ── 방문전 리포트 패널 ── */
   const [showReportPanel, setShowReportPanel] = useState(false);
   const [rptNutritionEnabled, setRptNutritionEnabled] = useState(true);
@@ -287,6 +499,10 @@ function ChatContent() {
   const [rptComment, setRptComment] = useState("");
   const [rptShowConfirm, setRptShowConfirm] = useState(false);
   const [rptSent, setRptSent] = useState(false);
+  /** 전송 직후 3.5초간만 상단 뱃지 노출 (버튼 disabled 상태는 rptSent로 유지) */
+  const [rptBadgeVisible, setRptBadgeVisible] = useState(false);
+  /** 하단 자동 포함 안내 문구 (편집 가능) */
+  const [rptAutoText, setRptAutoText] = useState("약국 방문 시 체질에 맞는 제품과 용량을 안내해드릴게요.");
 
   const rptToggleNutrition = (id: string) =>
     setRptNutrition((prev) => prev.map((n) => n.id === id ? { ...n, checked: !n.checked } : n));
@@ -309,6 +525,8 @@ function ChatContent() {
   const handleRptSend = () => {
     setRptShowConfirm(false);
     setRptSent(true);
+    setRptBadgeVisible(true);
+    setTimeout(() => setRptBadgeVisible(false), 3500);
   };
 
   const getNowTimeStr = () => {
@@ -742,9 +960,42 @@ function ChatContent() {
           )}
         </div>
       )}
-      {role === "pharmacist" && (
-        <div className="chat-status-banner pharmacist-banner">
-          환자의 AI 문답 요약을 확인하고 상담을 시작하세요
+      {/* 차수별 AI 문답 요약 카드 (활성 차수) */}
+      {activeSessionData && (
+        <div style={{
+          margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
+          padding: "12px 14px",
+          background: isLatestSession ? "#EDF4F0" : "#F4F5F3",
+          border: `1px solid ${isLatestSession ? "#B3CCBE" : "rgba(94,125,108,0.18)"}`,
+          borderRadius: 12,
+          flexShrink: 0,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 100, background: isLatestSession ? "#4A6355" : "#D1D5D3", color: "#fff" }}>
+              {isLatestSession ? "현재 차수" : "지난 차수"}
+            </span>
+            <span style={{ fontSize: 13, fontWeight: 600, color: "#4A6355" }}>
+              {activeSessionData.startDate}~ 상담
+            </span>
+            {activeSessionData.symptomTags.map((t) => (
+              <span key={t} style={{
+                fontSize: 12, fontWeight: 600,
+                padding: "2px 8px", borderRadius: 100,
+                background: "#fff", color: "#4A6355",
+                border: "1px solid rgba(94,125,108,0.14)",
+              }}>
+                {t}
+              </span>
+            ))}
+          </div>
+          <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.55, fontWeight: 500 }}>
+            📋 {activeSessionData.aiSummary}
+          </div>
+          {!isLatestSession && (
+            <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 6, fontWeight: 600 }}>
+              지난 상담 기록입니다. 메시지 전송은 현재 차수에서만 가능합니다.
+            </div>
+          )}
         </div>
       )}
 
@@ -830,6 +1081,173 @@ function ChatContent() {
         {messages.filter((m) => m.sessionId === activeSession && !(m.pharmacistOnly && role !== "pharmacist")).map((msg) => {
           const isSystem = msg.content.startsWith("[시스템]");
           const isVisitCard = msg.content.startsWith("[방문안내]");
+          const isQSetCard = msg.content.startsWith("[추가질문]") && !msg.content.startsWith("[추가질문답변]");
+          const isQAnsCard = msg.content.startsWith("[추가질문답변]");
+
+          if (isQSetCard) {
+            const setId = msg.content.replace("[추가질문] ", "").trim();
+            const set = QUESTIONNAIRE_SETS.find((s) => s.id === setId);
+            if (!set) return null;
+            const count = set.questions.length;
+            const isExpanded = expandedQSetMsgs.has(msg.id);
+            const isMe = msg.sender === role;
+            const isAnswered = answeredQSetMsgIds.has(msg.id);
+            const showAnswerBtn = role === "patient" && !isAnswered;
+            const showAnswered = role === "patient" && isAnswered;
+            return (
+              <div key={msg.id} style={{
+                display: "flex", flexDirection: "column",
+                alignItems: isMe ? "flex-end" : "flex-start",
+                padding: "6px 16px", gap: 4,
+              }}>
+                <div style={{
+                  width: "100%", maxWidth: 360, borderRadius: 16,
+                  border: "1.5px solid #B3CCBE",
+                  background: "#EDF4F0", overflow: "hidden",
+                }}>
+                  <div style={{ padding: "14px 16px", display: "flex", alignItems: "flex-start", gap: 10 }}>
+                    <span style={{ fontSize: 22, lineHeight: 1 }}>📋</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630", marginBottom: 4 }}>
+                        {role === "pharmacist" ? "추가 질문을 보냈습니다" : "추가 질문에 답변해주세요"}
+                      </div>
+                      <div style={{ fontSize: 13, color: "#4A6355", fontWeight: 600 }}>
+                        {role === "pharmacist" ? `${set.name} · 질문 ${count}개` : `질문 ${count}개`}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => toggleQSetPreview(msg.id)}
+                    style={{
+                      width: "100%",
+                      padding: "8px 14px",
+                      background: "#fff",
+                      border: "none", borderTop: "1px solid #B3CCBE",
+                      cursor: "pointer",
+                      fontSize: 13, fontWeight: 600,
+                      color: "#4A6355",
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
+                    }}
+                  >
+                    {isExpanded ? "접기 ▲" : "질문 보기 ▼"}
+                  </button>
+                  {isExpanded && (
+                    <div style={{ background: "#fff", padding: "4px 14px 12px 14px", borderBottom: showAnswerBtn || showAnswered ? "1px solid #B3CCBE" : undefined }}>
+                      <ol style={{ margin: 0, paddingLeft: 22, display: "flex", flexDirection: "column", gap: 6 }}>
+                        {set.questions.map((q, i) => (
+                          <li key={i} style={{ fontSize: 13, color: "#2C3630", lineHeight: 1.55 }}>{q.text}</li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+                  {showAnswerBtn && (
+                    <button
+                      type="button"
+                      onClick={() => openAnswerForm(msg.id, setId)}
+                      style={{
+                        width: "100%",
+                        padding: "12px 14px",
+                        background: "#4A6355",
+                        color: "#fff",
+                        border: "none",
+                        cursor: "pointer",
+                        fontSize: 15, fontWeight: 700,
+                      }}
+                    >
+                      답변하기
+                    </button>
+                  )}
+                  {showAnswered && (
+                    <div style={{
+                      width: "100%",
+                      padding: "12px 14px",
+                      background: "#fff",
+                      borderTop: "1px solid #B3CCBE",
+                      color: "#4A6355",
+                      fontSize: 14, fontWeight: 700,
+                      textAlign: "center",
+                    }}>
+                      ✓ 답변 완료
+                    </div>
+                  )}
+                </div>
+                <span style={{ fontSize: 11, color: "#7A8A80", paddingRight: isMe ? 4 : 0, paddingLeft: isMe ? 0 : 4 }}>{msg.time}</span>
+              </div>
+            );
+          }
+
+          if (isQAnsCard) {
+            const body = msg.content.replace("[추가질문답변] ", "").trim();
+            const [setId, originalMsgId] = body.split("::");
+            const set = QUESTIONNAIRE_SETS.find((s) => s.id === setId);
+            if (!set) return null;
+            const answers = qSetAnswers[originalMsgId] ?? [];
+            const isExpanded = expandedQSetMsgs.has(msg.id);
+            const isMe = msg.sender === role;
+            const answeredCount = answers.filter((a) => a && a.trim().length > 0).length;
+            return (
+              <div key={msg.id} style={{
+                display: "flex", flexDirection: "column",
+                alignItems: isMe ? "flex-end" : "flex-start",
+                padding: "6px 16px", gap: 4,
+              }}>
+                <div style={{
+                  width: "100%", maxWidth: 360, borderRadius: 16,
+                  border: "1.5px solid #F5E6DC",
+                  background: "#FBF5F1", overflow: "hidden",
+                }}>
+                  <div style={{ padding: "14px 16px", display: "flex", alignItems: "flex-start", gap: 10 }}>
+                    <span style={{ fontSize: 22, lineHeight: 1 }}>📋</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630", marginBottom: 4 }}>
+                        추가 질문에 답변했습니다
+                      </div>
+                      <div style={{ fontSize: 13, color: "#C06B45", fontWeight: 600 }}>
+                        {set.name} · {answeredCount}/{set.questions.length}개 답변
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => toggleQSetPreview(msg.id)}
+                    style={{
+                      width: "100%",
+                      padding: "8px 14px",
+                      background: "#fff",
+                      border: "none", borderTop: "1px solid #F5E6DC",
+                      cursor: "pointer",
+                      fontSize: 13, fontWeight: 600,
+                      color: "#C06B45",
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
+                    }}
+                  >
+                    {isExpanded ? "접기 ▲" : "답변 보기 ▼"}
+                  </button>
+                  {isExpanded && (
+                    <div style={{ background: "#fff", padding: "8px 14px 12px 14px" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                        {set.questions.map((q, i) => {
+                          const ans = answers[i] ?? "";
+                          return (
+                            <div key={i}>
+                              <div style={{ fontSize: 13, color: "#3D4A42", marginBottom: 3 }}>
+                                Q{i + 1}. {q.text}
+                              </div>
+                              <div style={{ fontSize: 13, fontWeight: 600, color: "#2C3630", lineHeight: 1.55, paddingLeft: 8, borderLeft: "3px solid #F5E6DC" }}>
+                                {ans && ans.trim() ? ans : "(답변 없음)"}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <span style={{ fontSize: 11, color: "#7A8A80", paddingRight: isMe ? 4 : 0, paddingLeft: isMe ? 0 : 4 }}>{msg.time}</span>
+              </div>
+            );
+          }
 
           if (isSystem) {
             return (
@@ -999,8 +1417,8 @@ function ChatContent() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Template + Followup buttons (pharmacist only) */}
-      {role === "pharmacist" && (
+      {/* Template + Followup buttons (pharmacist only, 최신 차수만) */}
+      {role === "pharmacist" && isLatestSession && (
         <div style={{
           padding: "6px 16px",
           background: "rgba(248,249,247,0.95)",
@@ -1019,6 +1437,19 @@ function ChatContent() {
             }}
           >
             템플릿
+          </button>
+          <button
+            type="button"
+            onClick={() => { setSelectedQSetId(QUESTIONNAIRE_SETS.find((s) => s.isDefault)?.id ?? null); setShowQSetPicker(true); }}
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 4,
+              padding: "6px 14px", borderRadius: 20,
+              fontSize: 13, fontWeight: 600,
+              background: "#EEEDFE", color: "#534AB7",
+              border: "1px solid #D6D3F3", cursor: "pointer",
+            }}
+          >
+            📋 추가 질문
           </button>
           <button
             type="button"
@@ -1065,21 +1496,23 @@ function ChatContent() {
         </div>
       )}
 
-      {/* Input */}
+      {/* Input — 최신 차수에서만 입력 가능 */}
       <div className="chat-input-bar">
         <textarea
           ref={inputRef}
           className="chat-input"
-          placeholder="메시지를 입력하세요..."
-          value={input}
+          placeholder={isLatestSession ? "메시지를 입력하세요..." : "이전 차수는 읽기 전용입니다"}
+          value={isLatestSession ? input : ""}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           rows={1}
+          disabled={!isLatestSession}
+          style={!isLatestSession ? { background: "#F4F5F3", cursor: "not-allowed" } : undefined}
         />
         <button
           className="chat-send-btn"
           onClick={sendMessage}
-          disabled={!input.trim()}
+          disabled={!isLatestSession || !input.trim()}
           aria-label="전송"
         >
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1590,14 +2023,14 @@ function ChatContent() {
                 <span style={{ fontWeight: 700, fontSize: 16, color: "#4A6355", fontFamily: "'Gothic A1', sans-serif" }}>
                   방문전 리포트
                 </span>
-                {rptSent && (
+                {rptBadgeVisible && (
                   <span style={{
-                    padding: "2px 8px", borderRadius: 100, fontSize: 12, fontWeight: 700,
+                    padding: "2px 10px", borderRadius: 100, fontSize: 12, fontWeight: 700,
                     background: "#4A6355", color: "#fff",
-                  }}>전송됨</span>
+                  }}>✓ 전송 완료</span>
                 )}
               </div>
-              <button type="button" onClick={() => { setShowReportPanel(false); setRptSent(false); setRptShowConfirm(false); }} aria-label="닫기"
+              <button type="button" onClick={() => { setShowReportPanel(false); setRptSent(false); setRptBadgeVisible(false); setRptShowConfirm(false); }} aria-label="닫기"
                 style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#3D4A42", padding: 8, lineHeight: 1 }}>
                 ✕
               </button>
@@ -1835,17 +2268,30 @@ function ChatContent() {
                 </div>
               </div>
 
-              {/* 자동 포함 안내 */}
-              <div style={{
-                display: "flex", gap: 10, padding: "12px 14px", borderRadius: 12,
-                background: "#F8F9F7", border: "1px solid rgba(94,125,108,0.14)", marginBottom: 16,
-              }}>
-                <span style={{ fontSize: 18, lineHeight: 1 }}>📋</span>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: "#4A6355", marginBottom: 2 }}>하단에 자동 포함:</div>
-                  <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
-                    약국 방문 시 체질에 맞는 제품과 용량을 안내해드릴게요.
-                  </div>
+              {/* 자동 포함 안내 — 편집 가능 */}
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                  <span style={{ fontSize: 15, lineHeight: 1 }}>📋</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#4A6355" }}>자동 포함 안내 문구</span>
+                </div>
+                <textarea
+                  value={rptAutoText}
+                  onChange={(e) => { if (e.target.value.length <= 100) setRptAutoText(e.target.value); }}
+                  rows={2}
+                  style={{
+                    width: "100%", padding: 10,
+                    border: "1px solid rgba(94,125,108,0.14)",
+                    borderRadius: 10,
+                    fontSize: 14, color: "#3D4A42",
+                    minHeight: 50, outline: "none",
+                    resize: "vertical",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                    lineHeight: 1.55,
+                    boxSizing: "border-box",
+                  }}
+                />
+                <div style={{ fontSize: 12, color: "#3D4A42", textAlign: "right", marginTop: 4 }}>
+                  {rptAutoText.length}/100
                 </div>
               </div>
 
@@ -2034,6 +2480,287 @@ function ChatContent() {
             </div>
           </aside>
         </>
+      )}
+
+      {/* 추가 질문 답변 오버레이 (환자 전용) */}
+      {answeringMsg && (() => {
+        const set = QUESTIONNAIRE_SETS.find((s) => s.id === answeringMsg.setId);
+        if (!set) return null;
+        const allAnswered = set.questions.every((q, i) => {
+          const a = answerDraft[i] ?? "";
+          return a.trim().length > 0;
+        });
+        return (
+          <div style={{
+            position: "fixed", inset: 0, zIndex: 210,
+            background: "#fff",
+            display: "flex", flexDirection: "column",
+            fontFamily: "'Noto Sans KR', sans-serif",
+          }}>
+            {/* 헤더 */}
+            <div style={{
+              display: "flex", alignItems: "center", gap: 8,
+              padding: "12px 16px",
+              borderBottom: "1px solid rgba(94,125,108,0.14)",
+              background: "#F8F9F7",
+              flexShrink: 0,
+            }}>
+              <button
+                type="button"
+                onClick={closeAnswerForm}
+                aria-label="닫기"
+                style={{
+                  background: "none", border: "none", cursor: "pointer",
+                  fontSize: 20, color: "#2C3630", padding: 6, lineHeight: 1,
+                }}
+              >✕</button>
+              <div style={{ flex: 1, fontSize: 16, fontWeight: 700, color: "#2C3630", fontFamily: "'Gothic A1', sans-serif" }}>
+                추가 질문 답변
+              </div>
+              <div style={{ fontSize: 13, color: "#4A6355", fontWeight: 600 }}>
+                {set.questions.filter((_, i) => (answerDraft[i] ?? "").trim().length > 0).length}/{set.questions.length}
+              </div>
+            </div>
+
+            {/* 질문 목록 */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "20px 16px 120px" }}>
+              <div style={{ maxWidth: 560, margin: "0 auto" }}>
+                <div style={{
+                  padding: "12px 14px", background: "#EDF4F0", borderRadius: 10,
+                  border: "1px solid #B3CCBE", marginBottom: 20,
+                  fontSize: 14, color: "#4A6355", fontWeight: 600,
+                }}>
+                  {set.name} · 질문 {set.questions.length}개
+                </div>
+
+                {set.questions.map((q, i) => {
+                  const ans = answerDraft[i] ?? "";
+                  const multiAnsSet = new Set(ans ? ans.split(",").filter(Boolean) : []);
+                  return (
+                    <div key={i} style={{ marginBottom: 24 }}>
+                      {/* 질문 헤더 */}
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
+                        <span style={{
+                          width: 28, height: 28, borderRadius: "50%",
+                          background: "#4A6355", color: "#fff",
+                          fontSize: 14, fontWeight: 700,
+                          display: "inline-flex", alignItems: "center", justifyContent: "center",
+                          flexShrink: 0,
+                        }}>{i + 1}</span>
+                        <div style={{ flex: 1, fontSize: 16, fontWeight: 600, color: "#2C3630", lineHeight: 1.55, paddingTop: 3 }}>
+                          {q.text}
+                        </div>
+                      </div>
+
+                      {/* 답변 입력 */}
+                      {q.type === "주관식" && (
+                        <textarea
+                          value={ans}
+                          onChange={(e) => updateAnswerDraft(i, e.target.value)}
+                          placeholder="답변을 입력해주세요"
+                          rows={3}
+                          style={{
+                            width: "100%", padding: 12,
+                            borderRadius: 12,
+                            border: "1px solid rgba(94,125,108,0.14)",
+                            fontSize: 15, color: "#2C3630",
+                            background: "#fff", outline: "none",
+                            resize: "vertical", minHeight: 80,
+                            fontFamily: "'Noto Sans KR', sans-serif",
+                            lineHeight: 1.6, boxSizing: "border-box",
+                          }}
+                        />
+                      )}
+
+                      {q.type === "객관식" && q.choices && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                          {q.choices.map((choice) => {
+                            const selected = ans === choice;
+                            return (
+                              <button
+                                key={choice}
+                                type="button"
+                                onClick={() => updateAnswerDraft(i, choice)}
+                                style={{
+                                  width: "100%", padding: "12px 16px",
+                                  borderRadius: 12,
+                                  border: `1px solid ${selected ? "#4A6355" : "rgba(94,125,108,0.14)"}`,
+                                  background: selected ? "#EDF4F0" : "#fff",
+                                  color: "#2C3630",
+                                  fontSize: 15, fontWeight: selected ? 700 : 500,
+                                  cursor: "pointer", textAlign: "left",
+                                  transition: "all 0.15s",
+                                  fontFamily: "'Noto Sans KR', sans-serif",
+                                }}
+                              >{choice}</button>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {q.type === "다중 선택" && q.choices && (
+                        <>
+                          <div style={{ fontSize: 12, color: "#5E7D6C", marginBottom: 6 }}>여러 개 선택할 수 있어요</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                            {q.choices.map((choice) => {
+                              const selected = multiAnsSet.has(choice);
+                              return (
+                                <button
+                                  key={choice}
+                                  type="button"
+                                  onClick={() => toggleMultiAnswer(i, choice)}
+                                  style={{
+                                    width: "100%", padding: "12px 16px",
+                                    borderRadius: 12,
+                                    border: `1px solid ${selected ? "#4A6355" : "rgba(94,125,108,0.14)"}`,
+                                    background: selected ? "#EDF4F0" : "#fff",
+                                    color: "#2C3630",
+                                    fontSize: 15, fontWeight: selected ? 700 : 500,
+                                    cursor: "pointer", textAlign: "left",
+                                    transition: "all 0.15s",
+                                    fontFamily: "'Noto Sans KR', sans-serif",
+                                    display: "flex", alignItems: "center", gap: 10,
+                                  }}
+                                >
+                                  <span style={{
+                                    width: 18, height: 18, borderRadius: 4,
+                                    border: `1.5px solid ${selected ? "#4A6355" : "#B3CCBE"}`,
+                                    background: selected ? "#4A6355" : "#fff",
+                                    display: "inline-flex", alignItems: "center", justifyContent: "center",
+                                    color: "#fff", fontSize: 12, fontWeight: 700,
+                                    flexShrink: 0,
+                                  }}>{selected ? "✓" : ""}</span>
+                                  {choice}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 하단 제출 바 */}
+            <div style={{
+              position: "fixed", bottom: 0, left: 0, right: 0,
+              padding: "14px 16px",
+              background: "rgba(255,255,255,0.96)",
+              backdropFilter: "blur(12px)",
+              WebkitBackdropFilter: "blur(12px)",
+              borderTop: "1px solid rgba(94,125,108,0.14)",
+              zIndex: 1,
+            }}>
+              <div style={{ maxWidth: 560, margin: "0 auto" }}>
+                <button
+                  type="button"
+                  onClick={submitAnswer}
+                  disabled={!allAnswered}
+                  style={{
+                    width: "100%", padding: "14px 0", borderRadius: 12,
+                    fontSize: 15, fontWeight: 700,
+                    background: allAnswered ? "#4A6355" : "#B3CCBE",
+                    color: "#fff", border: "none",
+                    cursor: allAnswered ? "pointer" : "default",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  제출하기
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* 추가 질문 세트 선택 모달 (약사 전용) */}
+      {showQSetPicker && role === "pharmacist" && (
+        <div
+          onClick={() => { setShowQSetPicker(false); setSelectedQSetId(null); }}
+          style={{
+            position: "fixed", inset: 0, zIndex: 200,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff", borderRadius: 16,
+              padding: "22px 20px 20px",
+              maxWidth: 420, width: "100%", maxHeight: "85vh", overflowY: "auto",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.15)",
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}
+          >
+            <div style={{ fontSize: 17, fontWeight: 700, color: "#2C3630", marginBottom: 14, fontFamily: "'Gothic A1', sans-serif" }}>
+              어떤 질문 세트를 보낼까요?
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+              {QUESTIONNAIRE_SETS.map((s) => {
+                const isSelected = selectedQSetId === s.id;
+                return (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onClick={() => setSelectedQSetId(s.id)}
+                    style={{
+                      textAlign: "left", width: "100%",
+                      padding: 16, borderRadius: 12,
+                      border: isSelected ? "1.5px solid #4A6355" : "1px solid rgba(94,125,108,0.14)",
+                      background: isSelected ? "#F8F9F7" : "#fff",
+                      cursor: "pointer", transition: "all 0.15s",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 16, fontWeight: 600, color: "#2C3630" }}>{s.name}</span>
+                      {s.isDefault && (
+                        <span style={{
+                          padding: "2px 8px", borderRadius: 8,
+                          fontSize: 13, fontWeight: 700,
+                          background: "#FFF8E1", color: "#F59E0B",
+                        }}>
+                          ★ 기본
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 14, color: "#3D4A42" }}>질문 {s.questions.length}개</div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => { setShowQSetPicker(false); setSelectedQSetId(null); }}
+                style={{
+                  flex: 1, padding: "12px 0", borderRadius: 10,
+                  fontSize: 14, fontWeight: 600,
+                  background: "#fff", color: "#3D4A42",
+                  border: "1px solid rgba(94,125,108,0.14)",
+                  cursor: "pointer",
+                }}
+              >취소</button>
+              <button
+                type="button"
+                onClick={handleQSendClick}
+                disabled={!selectedQSetId}
+                style={{
+                  flex: 1, padding: "12px 0", borderRadius: 10,
+                  fontSize: 14, fontWeight: 700,
+                  background: selectedQSetId ? "#4A6355" : "#B3CCBE",
+                  color: "#fff", border: "none",
+                  cursor: selectedQSetId ? "pointer" : "default",
+                }}
+              >전송</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* AI 답변 초안 모달 (약사 전용) */}

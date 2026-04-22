@@ -38,7 +38,7 @@ const SYMPTOM_OPTIONS: SymptomOption[] = [
 const DURATION_OPTIONS = ["1개월 미만", "1~3개월", "3~6개월", "6개월~1년", "1년 이상"] as const;
 const IMPROVE_DURATION = ["2주 이내", "2~4주", "1~2개월", "2~3개월", "3개월 이상"] as const;
 
-const SCORE_LABELS = ["에너지 수준", "수면 질", "증상 불편도"];
+const SCORE_LABELS = ["에너지/활력", "수면의 질", "소화 상태", "기분/정서", "증상 불편도"];
 
 /* ══════════════════════════════════════════
    메인 컴포넌트
@@ -61,11 +61,16 @@ function FeedNewContent() {
 
   /* 개선 전 */
   const [beforeDesc, setBeforeDesc] = useState("");
-  const [beforeScores, setBeforeScores] = useState([5, 5, 5]);
+  const [beforeScores, setBeforeScores] = useState([5, 5, 5, 5, 5]);
+  /** 항목별 측정 ON/OFF (index: SCORE_LABELS 순) */
+  const [scoreEnabled, setScoreEnabled] = useState<boolean[]>([false, false, false, false, false]);
+  const toggleScoreEnabled = (i: number) => {
+    setScoreEnabled((prev) => prev.map((v, idx) => (idx === i ? !v : v)));
+  };
 
   /* 개선 결과 */
   const [afterDesc, setAfterDesc] = useState("");
-  const [afterScores, setAfterScores] = useState([5, 5, 5]);
+  const [afterScores, setAfterScores] = useState([5, 5, 5, 5, 5]);
 
   /* 개선 기간 */
   const [improveDuration, setImproveDuration] = useState("");
@@ -131,7 +136,7 @@ function FeedNewContent() {
     setTimeout(() => {
       setShowToast(false);
       router.push("/feed");
-    }, 2000);
+    }, 1500);
   };
 
   /* 선택된 증상 variant 목록 */
@@ -139,6 +144,16 @@ function FeedNewContent() {
 
   return (
     <div className="fn-page">
+      <style>{`
+        .fn-preview-card,
+        .fn-preview-card:hover {
+          transform: none !important;
+          box-shadow: none !important;
+          border-color: var(--border) !important;
+          transition: none !important;
+          cursor: default !important;
+        }
+      `}</style>
       {/* 네비게이션 */}
       <nav>
         <button className="nav-back" onClick={() => router.back()} aria-label="뒤로가기">
@@ -255,20 +270,62 @@ function FeedNewContent() {
 
           <div className="fn-score-group">
             <div className="fn-score-group-title">개선 전 점수 (선택)</div>
-            {SCORE_LABELS.map((label, i) => (
-              <div key={label} className="fn-slider-row">
-                <span className="fn-slider-label">{label}</span>
-                <input
-                  type="range"
-                  min={1}
-                  max={10}
-                  value={beforeScores[i]}
-                  onChange={(e) => updateScore(setBeforeScores, i, +e.target.value)}
-                  className="fn-slider"
-                />
-                <span className="fn-slider-value">{beforeScores[i]}</span>
-              </div>
-            ))}
+            <div style={{ fontSize: 13, color: "#3D4A42", marginBottom: 12, lineHeight: 1.5 }}>
+              기록할 항목만 켜주세요. 1~10 슬라이더로 점수를 입력합니다.
+            </div>
+            {SCORE_LABELS.map((label, i) => {
+              const enabled = scoreEnabled[i];
+              return (
+                <div
+                  key={label}
+                  style={{
+                    padding: "10px 12px", borderRadius: 10,
+                    background: enabled ? "#F8F9F7" : "#fff",
+                    border: `1px solid ${enabled ? "rgba(94,125,108,0.18)" : "rgba(94,125,108,0.14)"}`,
+                    marginBottom: 10,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: enabled ? 8 : 0, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 14, fontWeight: 600, color: "#2C3630", flex: 1, minWidth: 0 }}>{label}</span>
+                    {!enabled && (
+                      <span style={{ fontSize: 13, color: "#3D4A42" }}>측정 안 함</span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => toggleScoreEnabled(i)}
+                      aria-checked={enabled}
+                      role="switch"
+                      style={{
+                        position: "relative", width: 40, height: 22, borderRadius: 11,
+                        background: enabled ? "#4A6355" : "#D1D5D3",
+                        border: "none", cursor: "pointer", flexShrink: 0,
+                        transition: "background 0.2s",
+                      }}
+                    >
+                      <span style={{
+                        position: "absolute", top: 2, left: enabled ? 20 : 2,
+                        width: 18, height: 18, borderRadius: "50%",
+                        background: "#fff", transition: "left 0.2s",
+                        boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
+                      }} />
+                    </button>
+                  </div>
+                  {enabled && (
+                    <div className="fn-slider-row" style={{ marginBottom: 0 }}>
+                      <input
+                        type="range"
+                        min={1}
+                        max={10}
+                        value={beforeScores[i]}
+                        onChange={(e) => updateScore(setBeforeScores, i, +e.target.value)}
+                        className="fn-slider"
+                      />
+                      <span className="fn-slider-value">{beforeScores[i]}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </section>
 
@@ -288,46 +345,56 @@ function FeedNewContent() {
 
           <div className="fn-score-group">
             <div className="fn-score-group-title">개선 후 점수 (선택)</div>
-            {SCORE_LABELS.map((label, i) => {
-              const diff = afterScores[i] - beforeScores[i];
-              return (
-                <div key={label} className="fn-slider-row">
-                  <span className="fn-slider-label">{label}</span>
-                  <input
-                    type="range"
-                    min={1}
-                    max={10}
-                    value={afterScores[i]}
-                    onChange={(e) => updateScore(setAfterScores, i, +e.target.value)}
-                    className="fn-slider"
-                  />
-                  <span className="fn-slider-value">{afterScores[i]}</span>
-                  {diff !== 0 && (
-                    <span className={`fn-slider-diff${diff > 0 ? " up" : " down"}`}>
-                      {diff > 0 ? `+${diff}` : diff}
-                    </span>
-                  )}
-                </div>
-              );
-            })}
+            {scoreEnabled.some(Boolean) ? (
+              <>
+                {SCORE_LABELS.map((label, i) => {
+                  if (!scoreEnabled[i]) return null;
+                  const diff = afterScores[i] - beforeScores[i];
+                  return (
+                    <div key={label} className="fn-slider-row">
+                      <span className="fn-slider-label">{label}</span>
+                      <input
+                        type="range"
+                        min={1}
+                        max={10}
+                        value={afterScores[i]}
+                        onChange={(e) => updateScore(setAfterScores, i, +e.target.value)}
+                        className="fn-slider"
+                      />
+                      <span className="fn-slider-value">{afterScores[i]}</span>
+                      {diff !== 0 && (
+                        <span className={`fn-slider-diff${diff > 0 ? " up" : " down"}`}>
+                          {diff > 0 ? `+${diff}` : diff}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
 
-            {/* 점수 비교 요약 */}
-            <div className="fn-score-compare">
-              {SCORE_LABELS.map((label, i) => {
-                const diff = afterScores[i] - beforeScores[i];
-                return (
-                  <div key={label} className="fn-compare-row">
-                    <span className="fn-compare-label">{label}</span>
-                    <span className="fn-compare-values">
-                      {beforeScores[i]} → {afterScores[i]}
-                    </span>
-                    <span className={`fn-compare-diff${diff > 0 ? " up" : diff < 0 ? " down" : ""}`}>
-                      {diff > 0 ? `+${diff} ↑` : diff < 0 ? `${diff} ↓` : "—"}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+                {/* 점수 비교 요약 */}
+                <div className="fn-score-compare">
+                  {SCORE_LABELS.map((label, i) => {
+                    if (!scoreEnabled[i]) return null;
+                    const diff = afterScores[i] - beforeScores[i];
+                    return (
+                      <div key={label} className="fn-compare-row">
+                        <span className="fn-compare-label">{label}</span>
+                        <span className="fn-compare-values">
+                          {beforeScores[i]} → {afterScores[i]}
+                        </span>
+                        <span className={`fn-compare-diff${diff > 0 ? " up" : diff < 0 ? " down" : ""}`}>
+                          {diff > 0 ? `+${diff} ↑` : diff < 0 ? `${diff} ↓` : "—"}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 13, color: "#3D4A42", padding: "10px 0" }}>
+                개선 전 점수에서 항목을 켜면 여기에 함께 나타납니다.
+              </div>
+            )}
           </div>
         </section>
 
@@ -551,7 +618,7 @@ function FeedNewContent() {
           <div className="fn-modal" onClick={(e) => e.stopPropagation()}>
             <div className="fn-modal-scroll">
               {/* 피드 카드 미리보기 */}
-              <article className="feed-card" style={{ margin: 0, boxShadow: "none" }}>
+              <article className="feed-card fn-preview-card" style={{ margin: 0, boxShadow: "none", cursor: "default" }}>
                 {/* 약사 정보 */}
                 <div className="feed-card-header">
                   <div className="feed-card-avatar" style={{ background: "var(--color-sage-pale)", color: "var(--color-sage-deep)", fontSize: 18, display: "flex", alignItems: "center", justifyContent: "center", width: 44, height: 44, borderRadius: "50%", fontWeight: 700, flexShrink: 0 }}>
@@ -593,53 +660,35 @@ function FeedNewContent() {
                     {afterDesc ? (afterDesc.length > 80 ? afterDesc.slice(0, 80) + "…" : afterDesc) : "(개선 결과가 여기에 표시됩니다)"}
                   </p>
 
-                  {/* 전후 점수 변화 */}
-                  <div className="feed-scores">
-                    <div className="feed-scores-title">전후 변화</div>
-                    {SCORE_LABELS.map((label, i) => {
-                      const diff = afterScores[i] - beforeScores[i];
-                      return (
-                        <div key={label} className="feed-score-row">
-                          <span className="feed-score-label">{label}</span>
-                          <span className="feed-score-before">{beforeScores[i]}</span>
-                          <div className="feed-score-bar">
-                            <div className="feed-score-fill-bg" style={{ width: `${beforeScores[i] * 10}%` }} />
-                            <div className="feed-score-fill" style={{ width: `${afterScores[i] * 10}%` }} />
+                  {/* 전후 점수 변화 — 측정 ON 항목만 표시 */}
+                  {scoreEnabled.some(Boolean) && (
+                    <div className="feed-scores">
+                      <div className="feed-scores-title">전후 변화</div>
+                      {SCORE_LABELS.map((label, i) => {
+                        if (!scoreEnabled[i]) return null;
+                        const diff = afterScores[i] - beforeScores[i];
+                        return (
+                          <div key={label} className="feed-score-row">
+                            <span className="feed-score-label">{label}</span>
+                            <span className="feed-score-before">{beforeScores[i]}</span>
+                            <div className="feed-score-bar">
+                              <div className="feed-score-fill-bg" style={{ width: `${beforeScores[i] * 10}%` }} />
+                              <div className="feed-score-fill" style={{ width: `${afterScores[i] * 10}%` }} />
+                            </div>
+                            <span className="feed-score-after">{afterScores[i]}</span>
+                            <span className={`feed-score-diff ${diff > 0 ? "up" : "down"}`}>
+                              {diff > 0 ? `↑${diff}` : diff < 0 ? `↓${Math.abs(diff)}` : "—"}
+                            </span>
                           </div>
-                          <span className="feed-score-after">{afterScores[i]}</span>
-                          <span className={`feed-score-diff ${diff > 0 ? "up" : "down"}`}>
-                            {diff > 0 ? `↑${diff}` : diff < 0 ? `↓${Math.abs(diff)}` : "—"}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  )}
 
                   {/* 개선 기간 */}
                   <div className="feed-card-duration">
                     {improveDuration ? `${improveDuration} 관리` : "—"}
                   </div>
-
-                  {/* 상담받기 버튼 */}
-                  <button
-                    type="button"
-                    style={{
-                      width: "100%",
-                      padding: "14px 0",
-                      marginTop: 16,
-                      background: "var(--color-terra)",
-                      color: "#fff",
-                      fontSize: 16,
-                      fontWeight: 700,
-                      border: "none",
-                      borderRadius: 12,
-                      cursor: "pointer",
-                      letterSpacing: "0.02em",
-                    }}
-                    onClick={(e) => e.preventDefault()}
-                  >
-                    이 약사에게 상담받기
-                  </button>
                 </div>
               </article>
             </div>
@@ -653,15 +702,87 @@ function FeedNewContent() {
 
       {/* ── 등록 확인 팝업 ── */}
       {showConfirm && (
-        <div className="fn-modal-overlay" onClick={() => setShowConfirm(false)}>
-          <div className="fn-confirm" onClick={(e) => e.stopPropagation()}>
-            <h3 className="fn-confirm-title">개선 사례를 등록하시겠습니까?</h3>
-            <p className="fn-confirm-desc">등록 후 개선 사례 피드에 공개됩니다.</p>
-            <div className="fn-confirm-actions">
-              <button className="fn-btn secondary" onClick={() => setShowConfirm(false)} type="button">
+        <div
+          onClick={() => setShowConfirm(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            zIndex: 200,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "fixed",
+              top: "50%",
+              left: "50%",
+              transform: "translate(-50%, -50%)",
+              background: "#fff",
+              borderRadius: 16,
+              padding: "28px 24px 20px",
+              width: "min(92vw, 380px)",
+              boxShadow: "0 10px 40px rgba(0,0,0,0.2)",
+              animation: "none",
+              transition: "none",
+              zIndex: 201,
+            }}
+          >
+            <h3
+              style={{
+                fontSize: 18,
+                fontWeight: 700,
+                color: "var(--text-dark)",
+                margin: "0 0 8px",
+                textAlign: "center",
+              }}
+            >
+              개선 사례를 등록하시겠습니까?
+            </h3>
+            <p
+              style={{
+                fontSize: 15,
+                color: "var(--text-mid)",
+                margin: "0 0 24px",
+                textAlign: "center",
+                lineHeight: 1.5,
+              }}
+            >
+              등록 후 개선 사례 피드에 공개됩니다.
+            </p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={() => setShowConfirm(false)}
+                type="button"
+                style={{
+                  flex: 1,
+                  padding: "12px 0",
+                  background: "#F4F6F4",
+                  color: "var(--text-mid)",
+                  fontSize: 15,
+                  fontWeight: 600,
+                  border: "none",
+                  borderRadius: 10,
+                  cursor: "pointer",
+                }}
+              >
                 취소
               </button>
-              <button className="fn-btn primary" onClick={handleSubmit} type="button">
+              <button
+                onClick={handleSubmit}
+                type="button"
+                style={{
+                  flex: 1,
+                  padding: "12px 0",
+                  background: "var(--color-terra)",
+                  color: "#fff",
+                  fontSize: 15,
+                  fontWeight: 700,
+                  border: "none",
+                  borderRadius: 10,
+                  cursor: "pointer",
+                }}
+              >
                 등록하기
               </button>
             </div>

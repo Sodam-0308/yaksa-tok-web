@@ -305,6 +305,34 @@ const MOCK_HEALTH_CHECKS: HealthCheck[] = [
   { date: "2026-04-10", energy: 5, sleep: 4, digestion: 6, mood: 4, symptomDiscomfort: 4 },
 ];
 
+/* ── 추가 질문 답변 (환자가 제출한 개별 문답 답변) ── */
+type AdditionalAnswerQType = "객관식" | "주관식" | "다중 선택";
+interface AdditionalAnswerEntry {
+  question: string;
+  type: AdditionalAnswerQType;
+  answers: string[];
+}
+interface AdditionalAnswerSet {
+  id: string;
+  setName: string;
+  answeredAt: string;
+  entries: AdditionalAnswerEntry[];
+}
+
+const MOCK_ADDITIONAL_ANSWERS: AdditionalAnswerSet[] = [
+  {
+    id: "aans-1",
+    setName: "피로·무기력용",
+    answeredAt: "2026-04-20",
+    entries: [
+      { question: "오전과 오후 중 언제 더 피곤함을 느끼나요?", type: "객관식", answers: ["하루종일"] },
+      { question: "피로와 함께 오는 증상을 모두 선택해주세요", type: "다중 선택", answers: ["두통", "집중력 저하"] },
+      { question: "최근 운동 빈도는?", type: "객관식", answers: ["안 함"] },
+      { question: "평소 스트레스 요인이 있다면 적어주세요", type: "주관식", answers: ["업무량이 많고 야근이 잦습니다"] },
+    ],
+  },
+];
+
 const INITIAL_PROBLEMS: ProblemItem[] = [
   {
     id: "p1", label: "만성피로", color: "#3B6D11", bg: "#EAF3DE",
@@ -651,6 +679,21 @@ function ChartContent() {
   const sortedHealthChecks = [...healthChecks].sort((a, b) => (a.date > b.date ? 1 : -1));
   const prevCheck = sortedHealthChecks[sortedHealthChecks.length - 2];
   const latestCheck = sortedHealthChecks[sortedHealthChecks.length - 1];
+
+  /* ── 추가 질문 답변 ── */
+  const showAdditionalAnswerEmpty = false; // true면 빈 상태, false면 답변 표시
+  const [additionalAnswers] = useState<AdditionalAnswerSet[]>(MOCK_ADDITIONAL_ANSWERS);
+  const sortedAdditionalAnswers = [...additionalAnswers].sort((a, b) => (a.answeredAt > b.answeredAt ? -1 : 1));
+  const [expandedAnswerSets, setExpandedAnswerSets] = useState<Set<string>>(
+    () => new Set(sortedAdditionalAnswers.slice(0, 1).map((a) => a.id))
+  );
+  const toggleAnswerSet = (id: string) => {
+    setExpandedAnswerSets((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
 
   /* ── 방문 기록 ── */
   const [visits, setVisits] = useState<VisitRecord[]>(MOCK_VISITS);
@@ -1256,21 +1299,40 @@ function ChartContent() {
                         {/* 자유 서술 */}
                         <div>
                           <div style={{ fontSize: 13, fontWeight: 700, color: COLOR.sageDeep, marginBottom: 6 }}>자유 서술</div>
-                          <div style={{
-                            padding: "10px 12px", background: COLOR.sageBg, borderRadius: 10,
-                            fontSize: 14, lineHeight: 1.65, color: COLOR.textDark,
-                            display: "-webkit-box",
-                            WebkitLineClamp: isFreeTextExpanded ? "unset" : 2,
-                            WebkitBoxOrient: "vertical",
-                            overflow: isFreeTextExpanded ? "visible" : "hidden",
-                            whiteSpace: "pre-wrap",
-                          }}>
-                            {c.freeText}
+                          <div style={{ padding: "12px", background: COLOR.sageBg, borderRadius: 10 }}>
+                            <div style={{
+                              fontSize: 14,
+                              color: COLOR.textDark,
+                              ...(isFreeTextExpanded
+                                ? { wordBreak: "break-word" as const }
+                                : {
+                                    overflow: "hidden",
+                                    display: "-webkit-box",
+                                    WebkitLineClamp: 2,
+                                    WebkitBoxOrient: "vertical" as const,
+                                    wordBreak: "break-word" as const,
+                                  }),
+                            }}>
+                              {c.freeText}
+                            </div>
                           </div>
-                          {c.freeText.length > 60 && (
-                            <button type="button" onClick={() => toggleFreeText(c.id)}
-                              style={{ marginTop: 4, padding: "2px 8px", fontSize: 13, fontWeight: 600, color: COLOR.sageDeep, background: "transparent", border: "none", cursor: "pointer" }}>
-                              {isFreeTextExpanded ? "접기 ▲" : "더 보기 ▼"}
+                          {(c.freeText.length > 60 || c.freeText.includes("\n")) && (
+                            <button
+                              type="button"
+                              onClick={() => toggleFreeText(c.id)}
+                              style={{
+                                marginTop: 4,
+                                padding: "2px 0",
+                                fontSize: 14,
+                                fontWeight: 600,
+                                color: "#5E7D6C",
+                                background: "none",
+                                border: "none",
+                                cursor: "pointer",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}
+                            >
+                              {isFreeTextExpanded ? "접기" : "더 보기"}
                             </button>
                           )}
                         </div>
@@ -1282,25 +1344,108 @@ function ChartContent() {
             </div>
           </div>
 
-          {/* ── 6. 약사 개별 문답 답변 (placeholder — 카드 스타일) ── */}
+          {/* ── 6. 추가 질문 답변 ── */}
           <div style={card}>
-            <div style={sectionTitle}>📋 약사 개별 문답 답변</div>
-            <div style={{
-              padding: "28px 20px", background: COLOR.white, borderRadius: 12,
-              border: `1px solid ${COLOR.border}`, textAlign: "center",
-            }}>
+            <div style={sectionTitle}>📋 추가 질문 답변</div>
+
+            {showAdditionalAnswerEmpty || sortedAdditionalAnswers.length === 0 ? (
               <div style={{
-                width: 48, height: 48, margin: "0 auto 12px", borderRadius: "50%",
-                background: COLOR.sagePale, display: "flex", alignItems: "center",
-                justifyContent: "center", fontSize: 22,
-              }}>📝</div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: COLOR.textDark, marginBottom: 6 }}>
-                아직 환자에게 보낸 개별 문답이 없어요
+                padding: "28px 20px", background: COLOR.white, borderRadius: 12,
+                border: `1px solid ${COLOR.border}`, textAlign: "center",
+              }}>
+                <div style={{
+                  width: 48, height: 48, margin: "0 auto 12px", borderRadius: "50%",
+                  background: COLOR.sagePale, display: "flex", alignItems: "center",
+                  justifyContent: "center", fontSize: 22,
+                }}>📝</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: COLOR.textDark, marginBottom: 6 }}>
+                  아직 환자에게 보낸 개별 문답이 없어요
+                </div>
+                <div style={{ fontSize: 13, color: COLOR.textMid, lineHeight: 1.6 }}>
+                  내 정보 &gt; 맞춤 추가 질문에서 질문 세트를 만들 수 있어요
+                </div>
               </div>
-              <div style={{ fontSize: 13, color: COLOR.textMid, lineHeight: 1.6 }}>
-                내 정보 &gt; 개별 문답 관리에서 문답 세트를 만들 수 있어요
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {sortedAdditionalAnswers.map((a) => {
+                  const isOpen = expandedAnswerSets.has(a.id);
+                  return (
+                    <div key={a.id} style={{
+                      borderRadius: 12, overflow: "hidden",
+                      border: `1px solid ${COLOR.border}`,
+                    }}>
+                      <button
+                        type="button"
+                        onClick={() => toggleAnswerSet(a.id)}
+                        style={{
+                          width: "100%", display: "flex",
+                          alignItems: "center", justifyContent: "space-between",
+                          padding: 16, background: "#F8F9F7",
+                          border: "none", cursor: "pointer",
+                          textAlign: "left",
+                        }}
+                      >
+                        <div>
+                          <div style={{ fontSize: 16, fontWeight: 600, color: "#2C3630" }}>
+                            {a.setName}
+                          </div>
+                          <div style={{ fontSize: 13, color: "#3D4A42", marginTop: 2 }}>
+                            답변일 {fmtDate(a.answeredAt)} · 질문 {a.entries.length}개
+                          </div>
+                        </div>
+                        <svg
+                          width="20" height="20" viewBox="0 0 24 24" fill="none"
+                          stroke={COLOR.sageMid} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                          style={{ transition: "transform 0.2s", transform: isOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}
+                        >
+                          <polyline points="6 9 12 15 18 9" />
+                        </svg>
+                      </button>
+
+                      {isOpen && (
+                        <div style={{ padding: "4px 16px 12px 16px", background: COLOR.white }}>
+                          {a.entries.map((e, i) => (
+                            <div
+                              key={i}
+                              style={{
+                                padding: "12px 0",
+                                borderBottom: i === a.entries.length - 1 ? "none" : "1px solid rgba(94,125,108,0.08)",
+                              }}
+                            >
+                              <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, marginBottom: 6 }}>
+                                Q{i + 1}. {e.question}
+                              </div>
+                              {e.type === "주관식" ? (
+                                <div style={{ fontSize: 14, fontWeight: 600, color: "#2C3630", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                                  {e.answers[0] ?? "(답변 없음)"}
+                                </div>
+                              ) : (
+                                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                                  {e.answers.length === 0 ? (
+                                    <span style={{ fontSize: 14, color: "#3D4A42" }}>(답변 없음)</span>
+                                  ) : (
+                                    e.answers.map((ans, ai) => (
+                                      <span key={ai} style={{
+                                        display: "inline-block",
+                                        padding: "4px 10px", borderRadius: 8,
+                                        background: "#EDF4F0", color: "#4A6355",
+                                        fontSize: 14, fontWeight: 600,
+                                      }}>
+                                        {ans}
+                                      </span>
+                                    ))
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
-            </div>
+            )}
           </div>
 
           {/* ── 7. 환자 건강지표 (공용 컴포넌트 — 마이페이지와 100% 동일 렌더) ── */}
