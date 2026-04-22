@@ -602,14 +602,14 @@ function MypageContent() {
                   </div>
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 700, color: "#2C3630" }}>{guide.pharmacist}</div>
-                    <div style={{ fontSize: 13, color: "#5E7D6C" }}>
+                    <div style={{ fontSize: 14, color: "#3D4A42" }}>
                       {guide.pharmacy} · {guide.date}
                     </div>
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   {!isGuideOpen && (
-                    <span style={{ fontSize: 13, color: "#7A8A80" }}>{guide.items.length}개 영양제</span>
+                    <span style={{ fontSize: 14, color: "#3D4A42", fontWeight: 500 }}>{guide.items.length}개 영양제</span>
                   )}
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5E7D6C" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
                     style={{ transition: "transform 0.2s", transform: isGuideOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}>
@@ -632,13 +632,13 @@ function MypageContent() {
                         marginBottom: 8,
                       }}
                     >
-                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
-                        <span style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>{item.name}</span>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: "#C06B45" }}>{item.dosage}</span>
-                        <span style={{ fontSize: 13, color: "#5E7D6C" }}>{item.timing}</span>
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 15, fontWeight: 600, color: "#2C3630" }}>{item.name}</span>
+                        <span style={{ fontSize: 14, fontWeight: 600, color: "#2C3630" }}>{item.dosage}</span>
+                        <span style={{ fontSize: 14, fontWeight: 500, color: "#2C3630" }}>{item.timing}</span>
                       </div>
                       {item.memo && (
-                        <div style={{ fontSize: 13, color: "#5E7D6C", lineHeight: 1.5, fontStyle: "italic" }}>
+                        <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontStyle: "italic" }}>
                           {item.memo}
                         </div>
                       )}
@@ -653,8 +653,8 @@ function MypageContent() {
                       background: "var(--terra-pale, #FBF5F1)",
                       border: "1px solid var(--terra-light, #F5E6DC)",
                     }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: "#C06B45", marginBottom: 4 }}>생활 가이드</div>
-                      <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.6 }}>{guide.lifestyle}</div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: "#2C3630", marginBottom: 4 }}>생활 가이드</div>
+                      <div style={{ fontSize: 15, color: "#3D4A42", lineHeight: 1.6 }}>{guide.lifestyle}</div>
                     </div>
                   )}
                 </div>

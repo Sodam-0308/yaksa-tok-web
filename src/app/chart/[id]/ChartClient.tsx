@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, Suspense } from "react";
+import { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
 
@@ -699,7 +699,7 @@ function ChartContent() {
   const [visits, setVisits] = useState<VisitRecord[]>(MOCK_VISITS);
   const sortedVisits = [...visits].sort((a, b) => (a.date > b.date ? -1 : 1));
   const [expandedVisits, setExpandedVisits] = useState<Set<string>>(
-    new Set(sortedVisits.slice(0, 2).map((v) => v.id))
+    new Set(sortedVisits.slice(0, 1).map((v) => v.id))
   );
   const toggleVisit = (id: string) => {
     setExpandedVisits((prev) => {
@@ -741,6 +741,7 @@ function ChartContent() {
   const [guideMemo, setGuideMemo] = useState("");
   const [guideDosageDays, setGuideDosageDays] = useState<number | undefined>(undefined);
   const [guideSent, setGuideSent] = useState(false);
+  const [sentBadgeVisible, setSentBadgeVisible] = useState(false);
   const [guideShowConfirm, setGuideShowConfirm] = useState(false);
   const copyGuideFromVisit = () => {
     const latest = sortedVisits[0];
@@ -757,7 +758,8 @@ function ChartContent() {
   const confirmSendGuide = () => {
     setGuideShowConfirm(false);
     setGuideSent(true);
-    setTimeout(() => setGuideSent(false), 3500);
+    setSentBadgeVisible(true);
+    setTimeout(() => setSentBadgeVisible(false), 3500);
   };
   const addGuideSupp = () => setGuideSupps((p) => [...p, { name: "", dosage: "", timing: "" }]);
   const updateGuideSupp = (i: number, f: keyof SupplementItem, v: string) =>
@@ -784,13 +786,19 @@ function ChartContent() {
     }
   };
   const handleGuideToggle = () => {
-    if (typeof window !== "undefined" && window.innerWidth >= 1200) {
-      setShowChatPanel(false);
-      setShowGuidePanel((v) => !v);
-    } else {
-      router.push("/report/new?tab=after");
-    }
+    setShowChatPanel(false);
+    setShowGuidePanel((v) => !v);
   };
+
+  /* 복용 가이드 패널 열림 시 body 스크롤 잠금 */
+  useEffect(() => {
+    if (!showGuidePanel) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [showGuidePanel]);
 
   /* ══════════════════════════════════════════
      Render
@@ -831,23 +839,41 @@ function ChartContent() {
           .chart-grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
           .chart-grid-2col > * { min-width: 0; }
         }
-        .chart-chat-panel, .chart-guide-panel { display: none; }
+        .chart-chat-panel { display: none; }
         @media (min-width: 1200px) {
-          .chart-chat-panel, .chart-guide-panel {
+          .chart-chat-panel {
             display: flex; flex-direction: column; position: fixed;
             top: 60px; right: 0; width: 400px; height: calc(100vh - 60px);
             border-left: 1px solid ${COLOR.border}; background: ${COLOR.white};
             z-index: 100; overflow: hidden; box-shadow: -4px 0 24px rgba(0,0,0,0.10);
           }
         }
-        @media (min-width: 1600px) { .chart-chat-panel, .chart-guide-panel { width: 500px; } }
+        @media (min-width: 1600px) { .chart-chat-panel { width: 500px; } }
+
+        .chart-guide-backdrop {
+          position: fixed; inset: 0; z-index: 999;
+          background: rgba(0,0,0,0.3);
+        }
+        .chart-guide-panel {
+          display: flex; flex-direction: column; font-style: normal;
+          position: fixed; top: 0; right: 0; bottom: 0; left: 0;
+          background: ${COLOR.white}; z-index: 1000; overflow: hidden;
+        }
+        @media (min-width: 1200px) {
+          .chart-guide-panel {
+            left: auto; width: 460px;
+            border-left: 1px solid ${COLOR.border};
+            box-shadow: -4px 0 24px rgba(0,0,0,0.10);
+          }
+        }
+        @media (min-width: 1600px) { .chart-guide-panel { width: 500px; } }
 
         ${isEmbedded ? `
           html, body { margin: 0 !important; padding: 0 !important; overflow-x: hidden !important; }
           .chart-page { padding-bottom: 0 !important; }
           .chart-page nav { display: none !important; }
           .chart-bottom-bar { display: none !important; }
-          .chart-chat-panel, .chart-guide-panel { display: none !important; }
+          .chart-chat-panel, .chart-guide-panel, .chart-guide-backdrop { display: none !important; }
           .chart-grid-2col { display: flex !important; flex-direction: column !important; }
         ` : ""}
       `}</style>
@@ -1113,8 +1139,8 @@ function ChartContent() {
           <div style={card}>
             <div style={sectionTitle}>방문 기록 ({sortedVisits.length})</div>
             {sortedVisits.length === 0 ? (
-              <div style={{ padding: 20, textAlign: "center", fontSize: 14, color: COLOR.textMid, background: COLOR.sageBg, borderRadius: 10 }}>
-                방문 기록이 없습니다.
+              <div style={{ padding: 32, textAlign: "center", fontSize: 14, color: "#3D4A42", background: COLOR.sageBg, borderRadius: 12 }}>
+                아직 방문 기록이 없어요
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -1122,114 +1148,231 @@ function ChartContent() {
                   const isOpen = expandedVisits.has(v.id);
                   const endDate = getVisitEndDate(v);
                   const isEditingDays = editingDosageVisitId === v.id;
-                  const isRecent = vIdx < 2;
+                  const visitNumber = sortedVisits.length - vIdx;
+
+                  const dividerStyle: React.CSSProperties = {
+                    height: 1,
+                    background: "rgba(94,125,108,0.1)",
+                    margin: "12px 0",
+                  };
+
                   return (
-                    <div key={v.id} style={{
-                      borderRadius: 14,
-                      border: isRecent ? `1.5px solid ${COLOR.sageLight}` : `1px solid ${COLOR.border}`,
-                      overflow: "hidden",
-                    }}>
-                      <button type="button" onClick={() => toggleVisit(v.id)}
+                    <div
+                      key={v.id}
+                      style={{
+                        background: "#fff",
+                        borderRadius: 16,
+                        border: "1px solid rgba(94,125,108,0.1)",
+                        boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => toggleVisit(v.id)}
+                        aria-expanded={isOpen}
                         style={{
-                          display: "flex", alignItems: "center", justifyContent: "space-between",
-                          width: "100%", padding: 16,
-                          background: isRecent ? COLOR.sagePale : "#F4F6F3",
-                          border: "none", cursor: "pointer", textAlign: "left",
-                        }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                          <div style={{
-                            width: 32, height: 32, borderRadius: "50%", background: COLOR.white,
-                            display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
-                            border: `1px solid ${COLOR.sageLight}`,
-                          }}>
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                              <circle cx="12" cy="8" r="4" fill={COLOR.sageMid} />
-                              <path d="M4 20c0-3.31 3.58-6 8-6s8 2.69 8 6" fill={COLOR.sageMid} />
-                            </svg>
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          width: "100%",
+                          padding: 16,
+                          minHeight: 56,
+                          background: "transparent",
+                          border: "none",
+                          cursor: "pointer",
+                          textAlign: "left",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: "#2C3630" }}>
+                            {fmtDate(v.date)}
                           </div>
-                          <div>
-                            <div style={{ fontSize: 15, fontWeight: 700, color: COLOR.textDark }}>{fmtDate(v.date)} 방문</div>
-                            <div style={{ fontSize: 13, color: COLOR.sageMid }}>
-                              {v.products.length}개 영양제{v.durationDays ? ` · ${v.durationDays}일치` : ""}
-                            </div>
-                          </div>
+                          <span
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 600,
+                              padding: "3px 8px",
+                              borderRadius: 6,
+                              background: "#EDF4F0",
+                              color: "#4A6355",
+                              letterSpacing: "0.01em",
+                            }}
+                          >
+                            {visitNumber}번째 방문
+                          </span>
                         </div>
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={COLOR.sageMid} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
-                          style={{ transition: "transform 0.2s", transform: isOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}>
+                        <svg
+                          width="20"
+                          height="20"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="#5E7D6C"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          style={{ transition: "transform 0.2s", transform: isOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}
+                          aria-hidden="true"
+                        >
                           <polyline points="6 9 12 15 18 9" />
                         </svg>
                       </button>
 
                       {isOpen && (
-                        <div style={{ padding: "14px 16px 16px", background: COLOR.white, borderTop: `1px solid ${COLOR.border}`, display: "flex", flexDirection: "column", gap: 10 }}>
+                        <div style={{ padding: "0 16px 16px", borderTop: "1px solid rgba(94,125,108,0.1)" }}>
                           {/* 구매 영양제 */}
-                          {v.products.length > 0 && (
-                            <div>
-                              {v.products.map((p, i) => (
-                                <div key={i} style={{
-                                  padding: 12, borderRadius: 10,
-                                  background: COLOR.sagePale, marginBottom: 8,
-                                }}>
-                                  <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                                    <span style={{ fontSize: 15, fontWeight: 700, color: COLOR.textDark }}>{p.name}</span>
-                                    <span style={{ fontSize: 13, fontWeight: 600, color: COLOR.terra }}>{p.dosage}</span>
-                                    <span style={{ fontSize: 13, color: COLOR.sageMid }}>{p.timing}</span>
+                          <div style={{ paddingTop: 14 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 8 }}>
+                              구매 영양제
+                            </div>
+                            {v.products.length > 0 ? (
+                              v.products.map((p, i) => (
+                                <div
+                                  key={i}
+                                  style={{
+                                    padding: 16,
+                                    borderRadius: 12,
+                                    background: "#EDF4F0",
+                                    marginBottom: i < v.products.length - 1 ? 8 : 0,
+                                  }}
+                                >
+                                  <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>
+                                    {p.name}
+                                  </div>
+                                  <div style={{ fontSize: 14, marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                                    <span style={{ fontWeight: 600, color: COLOR.terra }}>{p.dosage}</span>
+                                    <span style={{ color: "#3D4A42" }}>{p.timing}</span>
                                   </div>
                                 </div>
-                              ))}
-                            </div>
-                          )}
-                          {/* 복용 일수 */}
-                          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                            <span style={{ fontSize: 13, fontWeight: 700, color: COLOR.sageDeep }}>복용 일수</span>
-                            {isEditingDays ? (
-                              <>
-                                <input type="number" value={editDosageDaysValue} autoFocus min={1}
-                                  onChange={(e) => setEditDosageDaysValue(e.target.value)}
-                                  onKeyDown={(e) => { if (e.key === "Enter") saveDosageDays(v.id); if (e.key === "Escape") setEditingDosageVisitId(null); }}
-                                  style={{ width: 70, padding: "4px 8px", borderRadius: 6, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none" }} />
-                                <span style={{ fontSize: 14, color: COLOR.textMid }}>일</span>
-                                <button type="button" onClick={() => saveDosageDays(v.id)} style={{ padding: "3px 8px", borderRadius: 4, fontSize: 12, fontWeight: 600, background: COLOR.sageDeep, color: COLOR.white, border: "none", cursor: "pointer" }}>저장</button>
-                                <button type="button" onClick={() => setEditingDosageVisitId(null)} style={{ padding: "3px 8px", borderRadius: 4, fontSize: 12, fontWeight: 600, background: "transparent", color: COLOR.textMid, border: `1px solid ${COLOR.border}`, cursor: "pointer" }}>취소</button>
-                              </>
+                              ))
                             ) : (
-                              <>
-                                <span style={{ fontSize: 14, color: COLOR.textDark, fontWeight: 600 }}>
-                                  {v.durationDays ? `${v.durationDays}일` : "미입력"}
-                                </span>
-                                {endDate && <span style={{ fontSize: 13, color: COLOR.sageMid }}>(종료 예정: {endDate})</span>}
-                                <EditBtn onClick={() => startEditDosageDays(v.id, v.durationDays)} label="복용 일수 편집" />
-                              </>
+                              <div style={{ fontSize: 14, color: "#3D4A42" }}>등록된 영양제 없음</div>
                             )}
                           </div>
+
+                          <div style={dividerStyle} />
+
+                          {/* 복용 일수 */}
+                          <div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 4 }}>
+                              복용 일수
+                            </div>
+                            {isEditingDays ? (
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                <input
+                                  type="number"
+                                  value={editDosageDaysValue}
+                                  autoFocus
+                                  min={1}
+                                  onChange={(e) => setEditDosageDaysValue(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") saveDosageDays(v.id);
+                                    if (e.key === "Escape") setEditingDosageVisitId(null);
+                                  }}
+                                  style={{ width: 80, padding: "6px 10px", borderRadius: 8, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 15, color: "#2C3630", outline: "none" }}
+                                />
+                                <span style={{ fontSize: 15, color: "#3D4A42" }}>일</span>
+                                <button type="button" onClick={() => saveDosageDays(v.id)} style={{ padding: "4px 12px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: COLOR.sageDeep, color: "#fff", border: "none", cursor: "pointer" }}>저장</button>
+                                <button type="button" onClick={() => setEditingDosageVisitId(null)} style={{ padding: "4px 12px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: "transparent", color: "#3D4A42", border: `1px solid ${COLOR.border}`, cursor: "pointer" }}>취소</button>
+                              </div>
+                            ) : (
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                <span style={{ fontSize: 15, color: "#2C3630", fontWeight: 600 }}>
+                                  {v.durationDays ? `${v.durationDays}일` : "미입력"}
+                                </span>
+                                {endDate && <span style={{ fontSize: 14, color: "#3D4A42" }}>(종료 예정: {endDate})</span>}
+                                <EditBtn onClick={() => startEditDosageDays(v.id, v.durationDays)} label="복용 일수 편집" />
+                              </div>
+                            )}
+                          </div>
+
                           {/* 환자 호소 */}
-                          <VisitField label="환자 호소 내용" value={v.complaint}
-                            editing={editingVisitField?.id === v.id && editingVisitField.field === "complaint"}
-                            editValue={editVisitValue} setEditValue={setEditVisitValue}
-                            onStart={() => { setEditingVisitField({ id: v.id, field: "complaint" }); setEditVisitValue(v.complaint || ""); }}
-                            onSave={() => { updateVisit(v.id, { complaint: editVisitValue }); setEditingVisitField(null); }}
-                            onCancel={() => setEditingVisitField(null)} />
+                          {(v.complaint || (editingVisitField?.id === v.id && editingVisitField.field === "complaint")) && (
+                            <>
+                              <div style={dividerStyle} />
+                              <VisitField label="환자 호소 내용" value={v.complaint}
+                                editing={editingVisitField?.id === v.id && editingVisitField.field === "complaint"}
+                                editValue={editVisitValue} setEditValue={setEditVisitValue}
+                                onStart={() => { setEditingVisitField({ id: v.id, field: "complaint" }); setEditVisitValue(v.complaint || ""); }}
+                                onSave={() => { updateVisit(v.id, { complaint: editVisitValue }); setEditingVisitField(null); }}
+                                onCancel={() => setEditingVisitField(null)} />
+                            </>
+                          )}
+
                           {/* 환자 개선사항 */}
-                          <VisitField label="환자 개선사항" value={v.improvement}
-                            editing={editingVisitField?.id === v.id && editingVisitField.field === "improvement"}
-                            editValue={editVisitValue} setEditValue={setEditVisitValue}
-                            onStart={() => { setEditingVisitField({ id: v.id, field: "improvement" }); setEditVisitValue(v.improvement || ""); }}
-                            onSave={() => { updateVisit(v.id, { improvement: editVisitValue }); setEditingVisitField(null); }}
-                            onCancel={() => setEditingVisitField(null)} />
-                          {/* 약사 가이드 (terra-pale box) */}
-                          <VisitField label="약사 가이드" value={v.pharmacistGuide} terraBox
-                            editing={editingVisitField?.id === v.id && editingVisitField.field === "pharmacistGuide"}
-                            editValue={editVisitValue} setEditValue={setEditVisitValue}
-                            onStart={() => { setEditingVisitField({ id: v.id, field: "pharmacistGuide" }); setEditVisitValue(v.pharmacistGuide || ""); }}
-                            onSave={() => { updateVisit(v.id, { pharmacistGuide: editVisitValue }); setEditingVisitField(null); }}
-                            onCancel={() => setEditingVisitField(null)} />
-                          {/* 약사 소견 (회색 배경, 줄바꿈 보존) */}
-                          <VisitField label="약사 소견 (내부)" value={v.pharmacistNote} grayBox
-                            editing={editingVisitField?.id === v.id && editingVisitField.field === "pharmacistNote"}
-                            editValue={editVisitValue} setEditValue={setEditVisitValue}
-                            onStart={() => { setEditingVisitField({ id: v.id, field: "pharmacistNote" }); setEditVisitValue(v.pharmacistNote || ""); }}
-                            onSave={() => { updateVisit(v.id, { pharmacistNote: editVisitValue }); setEditingVisitField(null); }}
-                            onCancel={() => setEditingVisitField(null)} />
+                          {(v.improvement || (editingVisitField?.id === v.id && editingVisitField.field === "improvement")) && (
+                            <>
+                              <div style={dividerStyle} />
+                              <VisitField label="환자 개선사항" value={v.improvement}
+                                editing={editingVisitField?.id === v.id && editingVisitField.field === "improvement"}
+                                editValue={editVisitValue} setEditValue={setEditVisitValue}
+                                onStart={() => { setEditingVisitField({ id: v.id, field: "improvement" }); setEditVisitValue(v.improvement || ""); }}
+                                onSave={() => { updateVisit(v.id, { improvement: editVisitValue }); setEditingVisitField(null); }}
+                                onCancel={() => setEditingVisitField(null)} />
+                            </>
+                          )}
+
+                          {/* 약사 가이드 */}
+                          {(v.pharmacistGuide || (editingVisitField?.id === v.id && editingVisitField.field === "pharmacistGuide")) && (
+                            <>
+                              <div style={dividerStyle} />
+                              <VisitField label="약사 가이드" value={v.pharmacistGuide} terraBox
+                                editing={editingVisitField?.id === v.id && editingVisitField.field === "pharmacistGuide"}
+                                editValue={editVisitValue} setEditValue={setEditVisitValue}
+                                onStart={() => { setEditingVisitField({ id: v.id, field: "pharmacistGuide" }); setEditVisitValue(v.pharmacistGuide || ""); }}
+                                onSave={() => { updateVisit(v.id, { pharmacistGuide: editVisitValue }); setEditingVisitField(null); }}
+                                onCancel={() => setEditingVisitField(null)} />
+                            </>
+                          )}
+
+                          {/* 약사 소견 */}
+                          {(v.pharmacistNote || (editingVisitField?.id === v.id && editingVisitField.field === "pharmacistNote")) && (
+                            <>
+                              <div style={dividerStyle} />
+                              <VisitField label="약사 소견 (내부)" value={v.pharmacistNote} grayBox
+                                editing={editingVisitField?.id === v.id && editingVisitField.field === "pharmacistNote"}
+                                editValue={editVisitValue} setEditValue={setEditVisitValue}
+                                onStart={() => { setEditingVisitField({ id: v.id, field: "pharmacistNote" }); setEditVisitValue(v.pharmacistNote || ""); }}
+                                onSave={() => { updateVisit(v.id, { pharmacistNote: editVisitValue }); setEditingVisitField(null); }}
+                                onCancel={() => setEditingVisitField(null)} />
+                            </>
+                          )}
+
+                          {/* 빈 텍스트 필드 추가 진입점 */}
+                          {(() => {
+                            const emptyFields: { key: "complaint" | "improvement" | "pharmacistGuide" | "pharmacistNote"; label: string }[] = [];
+                            if (!v.complaint && !(editingVisitField?.id === v.id && editingVisitField.field === "complaint")) emptyFields.push({ key: "complaint", label: "환자 호소 내용" });
+                            if (!v.improvement && !(editingVisitField?.id === v.id && editingVisitField.field === "improvement")) emptyFields.push({ key: "improvement", label: "환자 개선사항" });
+                            if (!v.pharmacistGuide && !(editingVisitField?.id === v.id && editingVisitField.field === "pharmacistGuide")) emptyFields.push({ key: "pharmacistGuide", label: "약사 가이드" });
+                            if (!v.pharmacistNote && !(editingVisitField?.id === v.id && editingVisitField.field === "pharmacistNote")) emptyFields.push({ key: "pharmacistNote", label: "약사 소견 (내부)" });
+                            if (emptyFields.length === 0) return null;
+                            return (
+                              <>
+                                <div style={dividerStyle} />
+                                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                                  {emptyFields.map((ef) => (
+                                    <button
+                                      key={ef.key}
+                                      type="button"
+                                      onClick={() => { setEditingVisitField({ id: v.id, field: ef.key }); setEditVisitValue(""); }}
+                                      style={{
+                                        padding: "8px 12px",
+                                        borderRadius: 8,
+                                        border: `1px dashed ${COLOR.sageLight}`,
+                                        background: "transparent",
+                                        color: "#5E7D6C",
+                                        fontSize: 13,
+                                        fontWeight: 600,
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      + {ef.label}
+                                    </button>
+                                  ))}
+                                </div>
+                              </>
+                            );
+                          })()}
                         </div>
                       )}
                     </div>
@@ -1516,18 +1659,24 @@ function ChartContent() {
 
         {/* ── 복용 가이드 사이드 패널 ── */}
         {showGuidePanel && (
+          <>
+            <div
+              className="chart-guide-backdrop"
+              onClick={() => setShowGuidePanel(false)}
+              aria-hidden="true"
+            />
           <div className="chart-guide-panel">
             <div style={{ padding: "12px 16px", borderBottom: `1px solid ${COLOR.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, background: COLOR.sageBg }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
                 <span style={{ fontSize: 16, fontWeight: 700, color: COLOR.sageDeep, fontFamily: "'Gothic A1', sans-serif" }}>복용 가이드</span>
-                {guideSent && (
+                {sentBadgeVisible && (
                   <span style={{ padding: "2px 10px", borderRadius: 100, fontSize: 12, fontWeight: 700, background: COLOR.sageDeep, color: COLOR.white }}>
                     ✓ 전송 완료
                   </span>
                 )}
               </div>
               <button type="button" onClick={() => setShowGuidePanel(false)} aria-label="닫기"
-                style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: COLOR.textMid, padding: 8, lineHeight: 1 }}>
+                style={{ width: 40, height: 40, minWidth: 40, minHeight: 40, background: COLOR.white, border: `1px solid ${COLOR.border}`, borderRadius: 10, cursor: "pointer", color: COLOR.textDark, display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 1, fontSize: 18, fontWeight: 600, flexShrink: 0 }}>
                 ✕
               </button>
             </div>
@@ -1657,11 +1806,11 @@ function ChartContent() {
                   </div>
                   <div style={{ display: "flex", gap: 8 }}>
                     <button type="button" onClick={() => setGuideShowConfirm(false)}
-                      style={{ flex: 1, padding: "11px", borderRadius: 10, fontSize: 14, fontWeight: 600, background: COLOR.sageBg, color: COLOR.textMid, border: `1px solid ${COLOR.border}`, cursor: "pointer" }}>
+                      style={{ flex: 1, padding: "12px", minHeight: 48, borderRadius: 10, fontSize: 14, fontWeight: 600, background: COLOR.white, color: COLOR.sageDeep, border: `1.5px solid ${COLOR.sageDeep}`, cursor: "pointer" }}>
                       취소
                     </button>
                     <button type="button" onClick={confirmSendGuide}
-                      style={{ flex: 1, padding: "11px", borderRadius: 10, fontSize: 14, fontWeight: 700, background: COLOR.sageDeep, color: COLOR.white, border: "none", cursor: "pointer" }}>
+                      style={{ flex: 1, padding: "12px", minHeight: 48, borderRadius: 10, fontSize: 14, fontWeight: 700, background: COLOR.sageDeep, color: COLOR.white, border: "none", cursor: "pointer" }}>
                       전송하기
                     </button>
                   </div>
@@ -1669,6 +1818,7 @@ function ChartContent() {
               </div>
             )}
           </div>
+          </>
         )}
 
         {/* 증상 추가 모달 */}
@@ -1794,18 +1944,17 @@ function VisitField({
   grayBox?: boolean;
 }) {
   const boxed = terraBox || grayBox;
-  const labelColor = terraBox ? COLOR.terra : COLOR.sageDeep;
   return (
     <div>
-      <div style={{ fontSize: 13, fontWeight: 700, color: labelColor, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 4 }}>{label}</div>
       {editing ? (
         <div style={{ display: "flex", gap: 6 }}>
           <textarea value={editValue} autoFocus
             onChange={(e) => setEditValue(e.target.value)} rows={3}
-            style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none", resize: "vertical", fontFamily: "'Noto Sans KR', sans-serif", lineHeight: 1.6 }} />
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 15, color: "#2C3630", outline: "none", resize: "vertical", fontFamily: "'Noto Sans KR', sans-serif", lineHeight: 1.6 }} />
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            <button type="button" onClick={onSave} style={{ padding: "4px 10px", borderRadius: 4, fontSize: 12, fontWeight: 600, background: COLOR.sageDeep, color: COLOR.white, border: "none", cursor: "pointer" }}>저장</button>
-            <button type="button" onClick={onCancel} style={{ padding: "4px 10px", borderRadius: 4, fontSize: 12, fontWeight: 600, background: "transparent", color: COLOR.textMid, border: `1px solid ${COLOR.border}`, cursor: "pointer" }}>취소</button>
+            <button type="button" onClick={onSave} style={{ padding: "6px 12px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: COLOR.sageDeep, color: COLOR.white, border: "none", cursor: "pointer" }}>저장</button>
+            <button type="button" onClick={onCancel} style={{ padding: "6px 12px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: "transparent", color: "#3D4A42", border: `1px solid ${COLOR.border}`, cursor: "pointer" }}>취소</button>
           </div>
         </div>
       ) : (
@@ -1815,8 +1964,8 @@ function VisitField({
             padding: boxed ? "10px 12px" : 0,
             background: terraBox ? COLOR.terraPale : grayBox ? "#F4F6F3" : "transparent",
             border: terraBox ? `1px solid ${COLOR.terraLight}` : undefined,
-            borderRadius: boxed ? 8 : 0,
-            fontSize: 14, color: COLOR.textDark, lineHeight: 1.65,
+            borderRadius: boxed ? 10 : 0,
+            fontSize: 15, color: "#2C3630", lineHeight: 1.6,
             whiteSpace: "pre-wrap",
           }}>
             {value || "—"}
