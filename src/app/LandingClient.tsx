@@ -3,6 +3,8 @@
 import { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
 import {
   IconBattery, IconBowl, IconMoon, IconFemale, IconSkin, IconAllergy,
   IconKnot, IconSadFace, IconHair, IconScale, IconAntiAging, IconImmune,
@@ -54,10 +56,42 @@ export default function LandingClient() {
 
 function LandingContent() {
   const router = useRouter();
+  const { user, signOut } = useAuth();
+  const [displayName, setDisplayName] = useState<string | null>(null);
   const [navScrolled, setNavScrolled] = useState(false);
   const [showMore, setShowMore] = useState(false);
   const [customSymptom, setCustomSymptom] = useState("");
   const revealRefs = useRef<(HTMLElement | null)[]>([]);
+
+  // 로그인된 경우 profiles.name 조회
+  useEffect(() => {
+    let cancelled = false;
+    if (!user) {
+      setDisplayName(null);
+      return;
+    }
+    (async () => {
+      const { data } = await supabase
+        .from("profiles")
+        .select("name")
+        .eq("id", user.id)
+        .maybeSingle<{ name: string }>();
+      if (cancelled) return;
+      const metaName =
+        (user.user_metadata?.name as string | undefined) ??
+        (user.user_metadata?.full_name as string | undefined) ??
+        (user.user_metadata?.nickname as string | undefined);
+      setDisplayName(data?.name ?? metaName ?? null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  const handleLogout = async () => {
+    await signOut();
+    router.replace("/");
+  };
 
   // Nav scroll effect
   useEffect(() => {
@@ -99,7 +133,39 @@ function LandingContent() {
         <div className="nav-right">
           <a href="#how" className="nav-link">이용방법</a>
           <a href="#pharmacists" className="nav-link">약사 소개</a>
-          <Link href="/signup" className="nav-cta">시작하기</Link>
+          {user ? (
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 14,
+                color: "#3D4A42",
+              }}
+            >
+              <span>
+                {displayName ? `${displayName}님 환영합니다` : "환영합니다"}
+              </span>
+              <button
+                type="button"
+                onClick={handleLogout}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  padding: "4px 6px",
+                  fontSize: 13,
+                  color: "#5E7D6C",
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                로그아웃
+              </button>
+            </span>
+          ) : (
+            <Link href="/signup" className="nav-cta">시작하기</Link>
+          )}
         </div>
       </nav>
 

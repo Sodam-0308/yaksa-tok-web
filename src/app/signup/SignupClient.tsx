@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
+import { signInWithKakao } from "@/lib/auth";
+import { useAuth } from "@/contexts/AuthContext";
 
 const GENDERS = ["여성", "남성"];
 const AGE_GROUPS = ["10대", "20대", "30대", "40대", "50대", "60대+"];
@@ -56,9 +58,17 @@ export default function SignupClient() {
 function SignupContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { user, loading: authLoading } = useAuth();
 
   // ── 모드 ──
   const [mode, setMode] = useState<Mode>("select");
+
+  // 이미 로그인된 상태이면 랜딩으로 (mode 변화 없이 최초 진입 시에만)
+  useEffect(() => {
+    if (!authLoading && user && mode === "select") {
+      router.replace("/");
+    }
+  }, [authLoading, user, mode, router]);
 
   // ── 소셜 로그인 ──
   const [socialProvider, setSocialProvider] = useState<"kakao" | "naver" | null>(null);
@@ -68,6 +78,22 @@ function SignupContent() {
 
   // ── 중복 번호 팝업 ──
   const [showDuplicatePopup, setShowDuplicatePopup] = useState(false);
+
+  // ── 소셜 로그인 안내 토스트 (네이버 준비 중 / 카카오 에러) ──
+  const [socialToast, setSocialToast] = useState<string | null>(null);
+  const socialToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showSocialToast = useCallback((msg: string) => {
+    setSocialToast(msg);
+    if (socialToastTimerRef.current) clearTimeout(socialToastTimerRef.current);
+    socialToastTimerRef.current = setTimeout(() => setSocialToast(null), 2200);
+  }, []);
+
+  // ── URL ?error=auth 감지 (콜백 실패 시) ──
+  useEffect(() => {
+    if (searchParams.get("error") === "auth") {
+      showSocialToast("로그인에 실패했어요. 다시 시도해주세요.");
+    }
+  }, [searchParams, showSocialToast]);
 
   // ── 휴대폰 OTP flow (기존) ──
   const [currentStep, setCurrentStep] = useState(1);
@@ -167,17 +193,26 @@ function SignupContent() {
   };
 
   // ── 소셜 로그인 ──
-  const startSocial = (provider: "kakao" | "naver") => {
-    setSocialProvider(provider);
-    setSocialStep(1);
-    setSocialPhone("010-1234-5678");
-    setMode("social");
-    socialTimerRef.current = setTimeout(() => setSocialStep(2), 2000);
+  const startSocial = async (provider: "kakao" | "naver") => {
+    if (provider === "naver") {
+      showSocialToast("네이버 로그인은 준비 중입니다.");
+      return;
+    }
+    // 카카오: 실제 OAuth 호출. 성공 시 브라우저가 카카오 인증 페이지로 이동하므로 이 컴포넌트는 언마운트됨
+    try {
+      const { error } = await signInWithKakao();
+      if (error) {
+        showSocialToast("카카오 로그인을 시작할 수 없어요. 잠시 후 다시 시도해주세요.");
+      }
+    } catch {
+      showSocialToast("카카오 로그인 중 문제가 발생했어요.");
+    }
   };
 
   useEffect(() => {
     return () => {
       if (socialTimerRef.current) clearTimeout(socialTimerRef.current);
+      if (socialToastTimerRef.current) clearTimeout(socialToastTimerRef.current);
     };
   }, []);
 
@@ -780,6 +815,32 @@ function SignupContent() {
         <div className="page-footer">
           약사톡은 의료 행위를 하지 않으며, 영양 상담 연결 서비스를 제공합니다.
         </div>
+
+        {/* 소셜 로그인 안내 토스트 */}
+        {socialToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              position: "fixed",
+              bottom: 32,
+              left: "50%",
+              transform: "translateX(-50%)",
+              background: "#2C3630",
+              color: "#fff",
+              padding: "12px 20px",
+              borderRadius: 12,
+              fontSize: 14,
+              fontWeight: 600,
+              boxShadow: "0 4px 20px rgba(0,0,0,0.2)",
+              zIndex: 300,
+              maxWidth: "calc(100vw - 32px)",
+              textAlign: "center",
+            }}
+          >
+            {socialToast}
+          </div>
+        )}
       </div>
     </>
   );
