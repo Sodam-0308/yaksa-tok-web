@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
 
 
 /* ── 타입 ── */
@@ -1796,13 +1797,26 @@ function DashboardContent() {
     questionnaire: { symptoms: string[] | null; free_text: string | null } | null;
     patient_profile: { birth_year: number | null; gender: string | null } | null;
   }
+  interface DbActiveRow {
+    id: string;
+    status: string;
+    created_at: string;
+    last_message_at: string | null;
+    patient: { id: string; name: string; avatar_url: string | null } | null;
+    questionnaire: { symptoms: string[] | null } | null;
+    patient_profile: { birth_year: number | null; gender: string | null } | null;
+  }
+  const { user: authUser } = useAuth();
   const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
   const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
   const [dbPendingLoading, setDbPendingLoading] = useState(true);
+  const [dbActiveList, setDbActiveList] = useState<DbActiveRow[] | null>(null);
+  const [dbActiveLoading, setDbActiveLoading] = useState(true);
   const [actingId, setActingId] = useState<string | null>(null);
 
   const fetchPendingRequests = async () => {
     setDbPendingLoading(true);
+    // pharmacist_id 가 아직 배정되지 않은(=NULL) pending 만 모든 약사에게 노출
     const { data, error } = await supabase
       .from("consultations")
       .select(
@@ -1814,6 +1828,7 @@ function DashboardContent() {
       `,
       )
       .eq("status", "pending")
+      .is("pharmacist_id", null)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -1827,7 +1842,35 @@ function DashboardContent() {
     setDbPendingList(rows);
     setDbPendingCount(rows.length);
     setDbPendingLoading(false);
-    console.log("[dashboard] pending consultations loaded:", rows.length);
+    console.log("[dashboard] pending (unassigned) consultations loaded:", rows.length);
+  };
+
+  const fetchActiveConsultations = async (pharmacistId: string) => {
+    setDbActiveLoading(true);
+    const { data, error } = await supabase
+      .from("consultations")
+      .select(
+        `
+        id, status, created_at, last_message_at,
+        patient:profiles!consultations_patient_id_fkey(id, name, avatar_url),
+        questionnaire:ai_questionnaires(symptoms),
+        patient_profile:patient_profiles!consultations_patient_id_fkey(birth_year, gender)
+      `,
+      )
+      .in("status", ["accepted", "chatting"])
+      .eq("pharmacist_id", pharmacistId)
+      .order("last_message_at", { ascending: false, nullsFirst: false });
+
+    if (error) {
+      console.error("[dashboard] active list failed:", error);
+      setDbActiveList([]);
+      setDbActiveLoading(false);
+      return;
+    }
+    const rows = (data ?? []) as unknown as DbActiveRow[];
+    setDbActiveList(rows);
+    setDbActiveLoading(false);
+    console.log("[dashboard] active consultations loaded:", rows.length);
   };
 
   useEffect(() => {
@@ -1835,22 +1878,44 @@ function DashboardContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (!authUser) {
+      setDbActiveList([]);
+      setDbActiveLoading(false);
+      return;
+    }
+    fetchActiveConsultations(authUser.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser]);
+
   const updatePendingStatus = async (
     id: string,
     nextStatus: "accepted" | "rejected",
   ) => {
     if (actingId) return;
     setActingId(id);
+
+    type Patch = {
+      status: string;
+      rejected_at?: string;
+      pharmacist_id?: string;
+    };
+    const patch: Patch = { status: nextStatus };
+    if (nextStatus === "rejected") {
+      patch.rejected_at = new Date().toISOString();
+    }
+    if (nextStatus === "accepted" && authUser) {
+      // 수락 시 자기 자신을 pharmacist_id 로 설정
+      patch.pharmacist_id = authUser.id;
+    }
+
     const { error } = await (supabase
       .from("consultations") as unknown as {
-        update: (p: { status: string; rejected_at?: string }) => {
+        update: (p: Patch) => {
           eq: (col: string, val: string) => Promise<{ error: Error | null }>;
         };
       })
-      .update({
-        status: nextStatus,
-        ...(nextStatus === "rejected" ? { rejected_at: new Date().toISOString() } : {}),
-      })
+      .update(patch)
       .eq("id", id);
 
     if (error) {
@@ -1863,6 +1928,10 @@ function DashboardContent() {
     // 목록에서 즉시 제거
     setDbPendingList((prev) => prev?.filter((r) => r.id !== id) ?? null);
     setDbPendingCount((prev) => (prev !== null ? Math.max(0, prev - 1) : null));
+    // 수락한 건은 진행 중 영역에 즉시 반영
+    if (nextStatus === "accepted" && authUser) {
+      fetchActiveConsultations(authUser.id);
+    }
   };
   // 뷰 모드: sessionStorage 복원 전까지 null → 깜빡임 없음
   const [viewMode, setViewMode] = useState<"card" | "list" | null>(null);
@@ -2326,6 +2395,186 @@ function DashboardContent() {
                       </button>
                     </div>
                   </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* 진행 중 상담 (DB) */}
+        <section
+          style={{
+            background: "#fff",
+            borderRadius: 14,
+            border: "1px solid rgba(94,125,108,0.14)",
+            padding: 16,
+            marginBottom: 16,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 16,
+              fontWeight: 700,
+              color: "#2C3630",
+              fontFamily: "'Gothic A1', sans-serif",
+              marginBottom: 12,
+            }}
+          >
+            💬 진행 중 상담{" "}
+            {dbActiveList !== null && (
+              <span style={{ color: "#4A6355" }}>{dbActiveList.length}</span>
+            )}
+          </div>
+
+          {dbActiveLoading ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {[0, 1].map((i) => (
+                <div
+                  key={i}
+                  style={{
+                    height: 72,
+                    borderRadius: 10,
+                    background:
+                      "linear-gradient(90deg, #F4F6F3 0%, #ECEFEB 50%, #F4F6F3 100%)",
+                    backgroundSize: "200% 100%",
+                    animation: "dash-skel 1.4s ease-in-out infinite",
+                  }}
+                />
+              ))}
+            </div>
+          ) : !dbActiveList || dbActiveList.length === 0 ? (
+            <div
+              style={{
+                padding: "20px 12px",
+                textAlign: "center",
+                fontSize: 14,
+                color: "#3D4A42",
+                background: "#F8F9F7",
+                borderRadius: 10,
+              }}
+            >
+              진행 중인 상담이 없어요
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {dbActiveList.map((r) => {
+                const age = r.patient_profile?.birth_year
+                  ? new Date().getFullYear() - r.patient_profile.birth_year
+                  : null;
+                const symptoms = r.questionnaire?.symptoms ?? [];
+                const lastIso = r.last_message_at ?? r.created_at;
+                const elapsedMs = Date.now() - new Date(lastIso).getTime();
+                const elapsedHr = Math.max(0, Math.floor(elapsedMs / (1000 * 60 * 60)));
+                const elapsedMin = Math.max(0, Math.floor(elapsedMs / (1000 * 60)));
+                const elapsedLabel =
+                  elapsedHr >= 24
+                    ? `${Math.floor(elapsedHr / 24)}일 전`
+                    : elapsedHr >= 1
+                      ? `${elapsedHr}시간 전`
+                      : `${elapsedMin}분 전`;
+                const statusLabel =
+                  r.status === "chatting" ? "상담 중" : "수락됨";
+                return (
+                  <button
+                    key={r.id}
+                    type="button"
+                    onClick={() => router.push(`/chat/${r.id}?role=pharmacist`)}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                      padding: 14,
+                      borderRadius: 12,
+                      background: "#EDF4F0",
+                      border: "1px solid rgba(74,99,85,0.18)",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      width: "100%",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 36,
+                        height: 36,
+                        borderRadius: "50%",
+                        background: "#fff",
+                        border: "1px solid #B3CCBE",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontSize: 16,
+                        flexShrink: 0,
+                      }}
+                      aria-hidden="true"
+                    >
+                      👤
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div
+                        style={{
+                          fontSize: 15,
+                          fontWeight: 700,
+                          color: "#2C3630",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span>{r.patient?.name ?? "환자"}</span>
+                        {age !== null && (
+                          <span
+                            style={{
+                              fontSize: 13,
+                              fontWeight: 500,
+                              color: "#3D4A42",
+                            }}
+                          >
+                            {age}세
+                            {r.patient_profile?.gender ? ` · ${r.patient_profile.gender}` : ""}
+                          </span>
+                        )}
+                        <span
+                          style={{
+                            fontSize: 12,
+                            fontWeight: 600,
+                            padding: "2px 8px",
+                            borderRadius: 6,
+                            background: "#fff",
+                            color: "#4A6355",
+                            border: "1px solid #B3CCBE",
+                          }}
+                        >
+                          {statusLabel}
+                        </span>
+                      </div>
+                      {symptoms.length > 0 && (
+                        <div
+                          style={{
+                            fontSize: 13,
+                            color: "#3D4A42",
+                            marginTop: 4,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {symptoms.slice(0, 3).join(" · ")}
+                        </div>
+                      )}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: "#5E7D6C",
+                        flexShrink: 0,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {elapsedLabel}
+                    </div>
+                  </button>
                 );
               })}
             </div>
