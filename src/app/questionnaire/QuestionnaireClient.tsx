@@ -4,6 +4,24 @@ import { useState, useMemo, useCallback, useEffect, useRef, Suspense } from "rea
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { questions, Question, OptionItem } from "@/lib/questions";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import type { Database, Json } from "@/types/database";
+
+type AiQuestionnaireInsert = Database["public"]["Tables"]["ai_questionnaires"]["Insert"];
+
+const QUESTIONNAIRE_ID_KEY = "yaksa-tok-questionnaire-id";
+const PENDING_MATCH_KEY = "yaksa-tok-pending-match";
+
+/** 비로그인 유저가 가입/로그인 후 /match 로 이동하도록 표시 (cookie + sessionStorage 모두) */
+function markPendingMatch() {
+  if (typeof document !== "undefined") {
+    document.cookie = `${PENDING_MATCH_KEY}=1; path=/; max-age=3600; samesite=lax`;
+  }
+  if (typeof window !== "undefined") {
+    sessionStorage.setItem(PENDING_MATCH_KEY, "1");
+  }
+}
 
 /* ═══ 증상 SVG 아이콘 (랜딩 페이지와 동일) ═══ */
 
@@ -280,6 +298,98 @@ function QuestionnaireContent() {
   const q = flow[currentIdx] as Question | undefined;
   const isComplete = currentIdx >= flow.length;
   const isLast = currentIdx === flow.length - 1;
+
+  /* ── 완료 시 ai_questionnaires 저장 (1회) ── */
+  const { user, loading: authLoading } = useAuth();
+  const savedRef = useRef(false);
+  useEffect(() => {
+    console.log("[questionnaire] effect tick", {
+      isComplete,
+      restored,
+      authLoading,
+      hasUser: !!user,
+      saved: savedRef.current,
+    });
+    // 인증 상태 확정 전에는 저장 보류 (로그인 사용자가 patient_id=null로 저장되는 것 방지)
+    if (!isComplete || !restored || authLoading || savedRef.current) return;
+    savedRef.current = true;
+
+    // 비로그인 사용자: 가입 후 /match 로 이동하도록 플래그 표시
+    if (!user) {
+      markPendingMatch();
+    }
+
+    const symptoms =
+      Array.isArray(answers.symptoms) ? (answers.symptoms as string[]) : [];
+    const freeText =
+      typeof answers.free_text === "string" ? (answers.free_text as string) : "";
+
+    const payload: AiQuestionnaireInsert = {
+      patient_id: user?.id ?? null,
+      symptoms,
+      free_text: freeText,
+      detailed_answers: answers as unknown as Json,
+      completed_at: new Date().toISOString(),
+    };
+
+    console.log("[questionnaire] saving ai_questionnaires", {
+      patient_id: payload.patient_id,
+      symptomsCount: symptoms.length,
+      freeTextLength: freeText.length,
+      payload,
+    });
+
+    (async () => {
+      try {
+        // 1) INSERT — RLS에서 막히면 error.code = "42501" (insufficient_privilege)
+        //    스키마 불일치면 "PGRST204" 또는 "42703" (column does not exist)
+        const insertResp = await (supabase
+          .from("ai_questionnaires") as unknown as {
+            insert: (
+              p: AiQuestionnaireInsert,
+            ) => {
+              select: (cols: string) => {
+                maybeSingle: () => Promise<{
+                  data: { id: string } | null;
+                  error: { message: string; code?: string; details?: string; hint?: string } | null;
+                }>;
+              };
+            };
+          })
+          .insert(payload)
+          .select("id")
+          .maybeSingle();
+
+        console.log("[questionnaire] insert response:", insertResp);
+
+        if (insertResp.error) {
+          console.error("[questionnaire] save FAILED:", {
+            message: insertResp.error.message,
+            code: insertResp.error.code,
+            details: insertResp.error.details,
+            hint: insertResp.error.hint,
+          });
+          savedRef.current = false;
+          return;
+        }
+
+        const newId = insertResp.data?.id ?? null;
+        if (!newId) {
+          console.warn(
+            "[questionnaire] insert succeeded but no id returned — RLS가 SELECT를 막고 있을 수 있어요",
+          );
+        } else {
+          console.log("[questionnaire] save SUCCESS — id:", newId);
+          if (typeof window !== "undefined") {
+            sessionStorage.setItem(QUESTIONNAIRE_ID_KEY, newId);
+          }
+        }
+      } catch (err) {
+        console.error("[questionnaire] save threw:", err);
+        savedRef.current = false;
+      }
+    })();
+  }, [isComplete, restored, authLoading, answers, user]);
 
   const setAnswer = useCallback(
     (id: string, value: unknown) => {

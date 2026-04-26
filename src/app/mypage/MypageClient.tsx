@@ -1,18 +1,23 @@
 "use client";
 
-import { useState, Suspense } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import type { Database } from "@/types/database";
+
+type ProfileUpdate = Database["public"]["Tables"]["profiles"]["Update"];
 
 /* ══════════════════════════════════════════
-   더미 데이터
+   기본 프로필 (DB 로딩 실패 시 fallback)
    ══════════════════════════════════════════ */
 
-const PROFILE = {
-  name: "박소담",
-  birth: "1990-03-12",
-  phone: "010-****-5678",
+const FALLBACK_PROFILE = {
+  name: "사용자",
+  birth: "",
+  phone: "",
   avatarUrl: "",
 };
 
@@ -172,12 +177,76 @@ const emptyBtnOutline: React.CSSProperties = {
 
 function MypageContent() {
   const router = useRouter();
+  const { user, signOut } = useAuth();
   const showEmptyState = false;
 
-  /* ── 프로필 ── */
+  const doLogout = useCallback(async () => {
+    await signOut();
+    router.replace("/");
+  }, [signOut, router]);
+
+  /* ── 프로필 (DB) ── */
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profile, setProfile] = useState({
+    name: FALLBACK_PROFILE.name,
+    birth: FALLBACK_PROFILE.birth,
+    phone: FALLBACK_PROFILE.phone,
+    avatarUrl: FALLBACK_PROFILE.avatarUrl,
+  });
+
   const [editMode, setEditMode] = useState(false);
-  const [editName, setEditName] = useState(PROFILE.name);
-  const [editBirth, setEditBirth] = useState(PROFILE.birth);
+  const [editName, setEditName] = useState("");
+  const [editBirth, setEditBirth] = useState("");
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  /* DB에서 프로필 로드 */
+  useEffect(() => {
+    let cancelled = false;
+    if (!user) return;
+
+    (async () => {
+      setProfileLoading(true);
+      setProfileError(null);
+
+      const [profileRes, patientRes] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select("name, phone, avatar_url")
+          .eq("id", user.id)
+          .maybeSingle<{ name: string; phone: string | null; avatar_url: string | null }>(),
+        supabase
+          .from("patient_profiles")
+          .select("birth_year")
+          .eq("id", user.id)
+          .maybeSingle<{ birth_year: number | null }>(),
+      ]);
+
+      if (cancelled) return;
+
+      if (profileRes.error) {
+        setProfileError("프로필을 불러오지 못했어요.");
+        setProfileLoading(false);
+        return;
+      }
+
+      const p = profileRes.data;
+      const birthYear = patientRes.data?.birth_year ?? null;
+      setProfile({
+        name: p?.name ?? FALLBACK_PROFILE.name,
+        birth: birthYear ? `${birthYear}-01-01` : "",
+        phone: p?.phone ?? "",
+        avatarUrl: p?.avatar_url ?? "",
+      });
+      setEditName(p?.name ?? "");
+      setEditBirth(birthYear ? `${birthYear}-01-01` : "");
+      setProfileLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
 
   /* ── 영양제 (날짜별 상태) ── */
   const today = new Date();
@@ -249,7 +318,7 @@ function MypageContent() {
   const [showLogout, setShowLogout] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
 
-  const age = calcAge(editMode ? editBirth : PROFILE.birth);
+  const age = calcAge(editMode ? editBirth : profile.birth);
 
   /* 영양제 체크 토글 (날짜별) */
   const toggleCheck = (id: string, timeIndex: number) => {
@@ -283,12 +352,37 @@ function MypageContent() {
     setShowAddModal(false);
   };
 
-  /* 프로필 저장 */
-  const saveProfile = () => {
-    PROFILE.name = editName;
-    PROFILE.birth = editBirth;
+  /* 프로필 저장 — supabase.profiles UPDATE */
+  const saveProfile = useCallback(async () => {
+    if (!user) return;
+    const trimmed = editName.trim();
+    if (!trimmed) {
+      setProfileError("이름을 입력해주세요.");
+      return;
+    }
+    setSavingProfile(true);
+    setProfileError(null);
+
+    const update: ProfileUpdate = { name: trimmed };
+    const { error } = await (supabase
+      .from("profiles") as unknown as {
+        update: (p: ProfileUpdate) => {
+          eq: (col: string, val: string) => Promise<{ error: Error | null }>;
+        };
+      })
+      .update(update)
+      .eq("id", user.id);
+
+    if (error) {
+      setProfileError("이름을 저장하지 못했어요.");
+      setSavingProfile(false);
+      return;
+    }
+
+    setProfile((prev) => ({ ...prev, name: trimmed, birth: editBirth }));
     setEditMode(false);
-  };
+    setSavingProfile(false);
+  }, [user, editName, editBirth]);
 
   const checkedCount = supplements.reduce((acc, s) => acc + getChecks(s.id, s.times.length).filter(Boolean).length, 0);
 
@@ -308,24 +402,49 @@ function MypageContent() {
         <section className="my-profile-card">
           <div className="my-avatar-wrap">
             <div className="my-avatar">
-              <svg width="36" height="36" viewBox="0 0 24 24" fill="none">
-                <circle cx="12" cy="8" r="4" fill="var(--color-sage-light)" />
-                <path d="M4 20c0-3.31 3.58-6 8-6s8 2.69 8 6" fill="var(--color-sage-light)" />
-              </svg>
+              {profile.avatarUrl ? (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={profile.avatarUrl}
+                  alt={`${profile.name} 프로필 사진`}
+                  style={{ width: "100%", height: "100%", borderRadius: "50%", objectFit: "cover" }}
+                />
+              ) : (
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none">
+                  <circle cx="12" cy="8" r="4" fill="var(--color-sage-light)" />
+                  <path d="M4 20c0-3.31 3.58-6 8-6s8 2.69 8 6" fill="var(--color-sage-light)" />
+                </svg>
+              )}
             </div>
             {editMode && (
               <button className="my-avatar-edit" type="button">사진 변경</button>
             )}
           </div>
 
-          {!editMode ? (
+          {profileLoading ? (
             <div className="my-profile-info">
-              <div className="my-profile-name">{PROFILE.name}</div>
-              <div className="my-profile-meta">만 {age}세</div>
-              <div className="my-profile-phone">{PROFILE.phone}</div>
+              <div style={{ fontSize: 14, color: "#3D4A42", padding: "8px 0" }}>
+                불러오는 중...
+              </div>
+            </div>
+          ) : !editMode ? (
+            <div className="my-profile-info">
+              <div className="my-profile-name">{profile.name}</div>
+              {profile.birth && <div className="my-profile-meta">만 {age}세</div>}
+              {profile.phone && <div className="my-profile-phone">{profile.phone}</div>}
+              {profileError && (
+                <div role="alert" style={{ fontSize: 14, color: "#993C1D", marginTop: 6 }}>
+                  {profileError}
+                </div>
+              )}
               <button
                 className="my-profile-edit-btn"
-                onClick={() => setEditMode(true)}
+                onClick={() => {
+                  setEditName(profile.name);
+                  setEditBirth(profile.birth);
+                  setProfileError(null);
+                  setEditMode(true);
+                }}
                 type="button"
               >
                 프로필 수정
@@ -340,6 +459,7 @@ function MypageContent() {
                   className="my-edit-input"
                   value={editName}
                   onChange={(e) => setEditName(e.target.value)}
+                  disabled={savingProfile}
                 />
               </label>
               <label className="my-edit-label">
@@ -349,17 +469,36 @@ function MypageContent() {
                   className="my-edit-input"
                   value={editBirth}
                   onChange={(e) => setEditBirth(e.target.value)}
+                  disabled={savingProfile}
                 />
               </label>
               <div className="my-edit-phone-notice">
                 휴대폰 번호 변경은 재인증이 필요합니다
               </div>
+              {profileError && (
+                <div role="alert" style={{ fontSize: 14, color: "#993C1D", marginTop: 4 }}>
+                  {profileError}
+                </div>
+              )}
               <div className="my-edit-actions">
-                <button className="my-btn secondary" onClick={() => setEditMode(false)} type="button">
+                <button
+                  className="my-btn secondary"
+                  onClick={() => {
+                    setEditMode(false);
+                    setProfileError(null);
+                  }}
+                  type="button"
+                  disabled={savingProfile}
+                >
                   취소
                 </button>
-                <button className="my-btn primary" onClick={saveProfile} type="button">
-                  저장
+                <button
+                  className="my-btn primary"
+                  onClick={saveProfile}
+                  type="button"
+                  disabled={savingProfile || !editName.trim()}
+                >
+                  {savingProfile ? "저장 중..." : "저장"}
                 </button>
               </div>
             </div>
@@ -1019,7 +1158,7 @@ function MypageContent() {
               <button className="my-btn secondary" onClick={() => setShowLogout(false)} type="button">
                 취소
               </button>
-              <button className="my-btn primary" onClick={() => setShowLogout(false)} type="button">
+              <button className="my-btn primary" onClick={doLogout} type="button">
                 로그아웃
               </button>
             </div>

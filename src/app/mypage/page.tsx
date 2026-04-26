@@ -1,4 +1,5 @@
 import { createMetadata } from "@/lib/metadata";
+import AuthGuard from "@/components/AuthGuard";
 import MypageClient from "./MypageClient";
 
 export const metadata = createMetadata({
@@ -7,5 +8,9 @@ export const metadata = createMetadata({
 });
 
 export default function Page() {
-  return <MypageClient />;
+  return (
+    <AuthGuard>
+      <MypageClient />
+    </AuthGuard>
+  );
 }

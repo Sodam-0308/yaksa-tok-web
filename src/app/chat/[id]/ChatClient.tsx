@@ -6,6 +6,33 @@ import {
   type Template as ChatTemplate,
   INITIAL_TEMPLATES as TEMPLATE_ITEMS,
 } from "@/data/templatesMock";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import type { Database } from "@/types/database";
+
+type MessageInsert = Database["public"]["Tables"]["messages"]["Insert"];
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+interface DbMessageRow {
+  id: string;
+  consultation_id: string;
+  sender_id: string;
+  content: string;
+  message_type: string;
+  is_read: boolean;
+  created_at: string;
+}
+
+function fmtChatTime(iso: string): string {
+  const d = new Date(iso);
+  const hours = d.getHours();
+  const minutes = d.getMinutes();
+  const ampm = hours < 12 ? "오전" : "오후";
+  const h = hours > 12 ? hours - 12 : hours === 0 ? 12 : hours;
+  return `${ampm} ${h}:${String(minutes).padStart(2, "0")}`;
+}
 
 interface Message {
   id: string;
@@ -306,7 +333,18 @@ function ChatContent() {
   const role = searchParams.get("role") === "pharmacist" ? "pharmacist" : "patient";
   const isEmbedded = searchParams.get("embedded") === "true";
 
-  const [messages, setMessages] = useState<Message[]>([...DEMO_MESSAGES, SESSION2_SYSTEM_MSG, ...SESSION2_EXTRA_MSGS]);
+  const isDbConsultation = UUID_RE.test(chatId);
+  const { user } = useAuth();
+
+  const [messages, setMessages] = useState<Message[]>(
+    isDbConsultation ? [] : [...DEMO_MESSAGES, SESSION2_SYSTEM_MSG, ...SESSION2_EXTRA_MSGS],
+  );
+  const [dbConsultation, setDbConsultation] = useState<{
+    patient_id: string;
+    pharmacist_id: string | null;
+  } | null>(null);
+  const [dbLoading, setDbLoading] = useState(isDbConsultation);
+  const [dbError, setDbError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -652,9 +690,165 @@ function ChatContent() {
     }
   }, [input]);
 
+  /* ── DB 채팅: consultation + 메시지 로드 + Realtime 구독 ── */
+  useEffect(() => {
+    if (!isDbConsultation) return;
+
+    let cancelled = false;
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+
+    (async () => {
+      setDbLoading(true);
+      setDbError(null);
+
+      // 1) consultation 조회 (patient_id / pharmacist_id 매핑용)
+      const consResp = await supabase
+        .from("consultations")
+        .select("patient_id, pharmacist_id")
+        .eq("id", chatId)
+        .maybeSingle<{ patient_id: string; pharmacist_id: string | null }>();
+      if (cancelled) return;
+      if (consResp.error || !consResp.data) {
+        console.error("[chat] consultation fetch failed:", consResp.error);
+        setDbError("상담을 불러오지 못했어요.");
+        setDbLoading(false);
+        return;
+      }
+      const cons = consResp.data;
+      setDbConsultation(cons);
+
+      const mapRow = (row: DbMessageRow): Message => ({
+        id: row.id,
+        sender: row.sender_id === cons.patient_id ? "patient" : "pharmacist",
+        content: row.content,
+        time: fmtChatTime(row.created_at),
+        isRead: row.is_read,
+      });
+
+      // 2) 기존 메시지 로드
+      const msgResp = await supabase
+        .from("messages")
+        .select("id, consultation_id, sender_id, content, message_type, is_read, created_at")
+        .eq("consultation_id", chatId)
+        .order("created_at", { ascending: true });
+      if (cancelled) return;
+      if (msgResp.error) {
+        console.error("[chat] messages load failed:", msgResp.error);
+        setDbError("메시지를 불러오지 못했어요.");
+        setDbLoading(false);
+        return;
+      }
+      const rows = (msgResp.data ?? []) as unknown as DbMessageRow[];
+      setMessages(rows.map(mapRow));
+      setDbLoading(false);
+      console.log("[chat] loaded messages:", rows.length);
+
+      // 3) Realtime 구독
+      channel = supabase
+        .channel(`consult:${chatId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "messages",
+            filter: `consultation_id=eq.${chatId}`,
+          },
+          (payload) => {
+            const row = payload.new as DbMessageRow;
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === row.id)) return prev; // 옵티미스틱 중복 방지
+              return [...prev, mapRow(row)];
+            });
+          },
+        )
+        .subscribe((status) => {
+          console.log("[chat] realtime status:", status);
+        });
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channel) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, [isDbConsultation, chatId]);
+
   const sendMessage = () => {
     const text = input.trim();
     if (!text) return;
+
+    // DB 모드: messages 테이블 INSERT (Realtime echo로 화면 반영)
+    if (isDbConsultation) {
+      if (!user) {
+        console.warn("[chat] not logged in — cannot send");
+        return;
+      }
+      if (!dbConsultation) {
+        console.warn("[chat] consultation not loaded yet");
+        return;
+      }
+      const payload: MessageInsert = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content: text,
+        message_type: "text",
+      };
+      console.log("[chat] sending message:", payload);
+      setInput("");
+      if (inputRef.current) inputRef.current.style.height = "auto";
+
+      (async () => {
+        const { data, error } = await (supabase
+          .from("messages") as unknown as {
+            insert: (p: MessageInsert) => {
+              select: (cols: string) => {
+                maybeSingle: () => Promise<{
+                  data: DbMessageRow | null;
+                  error: { message: string; code?: string; details?: string; hint?: string } | null;
+                }>;
+              };
+            };
+          })
+          .insert(payload)
+          .select("id, consultation_id, sender_id, content, message_type, is_read, created_at")
+          .maybeSingle();
+
+        if (error) {
+          console.error("[chat] message insert failed:", {
+            message: error.message,
+            code: error.code,
+            details: error.details,
+            hint: error.hint,
+          });
+          // 실패 시 입력값 복원
+          setInput(text);
+          return;
+        }
+        console.log("[chat] message sent — id:", data?.id);
+        // Realtime echo가 곧 도착하지만, 즉시 옵티미스틱 추가 (구독 echo는 dedupe됨)
+        if (data) {
+          const row = data;
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === row.id)) return prev;
+            return [
+              ...prev,
+              {
+                id: row.id,
+                sender:
+                  row.sender_id === dbConsultation.patient_id ? "patient" : "pharmacist",
+                content: row.content,
+                time: fmtChatTime(row.created_at),
+                isRead: row.is_read,
+              },
+            ];
+          });
+        }
+      })();
+      return;
+    }
+
 
     const now = new Date();
     const hours = now.getHours();

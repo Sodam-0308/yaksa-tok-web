@@ -75,11 +75,13 @@ export interface ProfileRow {
   avatar_url: string | null;
   auth_provider: string | null;
   is_active: boolean;
+  role_confirmed: boolean;
   created_at: ISOTimestamp;
   updated_at: ISOTimestamp;
 }
-export type ProfileInsert = Omit<ProfileRow, "created_at" | "updated_at" | "is_active"> & {
+export type ProfileInsert = Omit<ProfileRow, "created_at" | "updated_at" | "is_active" | "role_confirmed"> & {
   is_active?: boolean;
+  role_confirmed?: boolean;
   created_at?: ISOTimestamp;
   updated_at?: ISOTimestamp;
 };
@@ -182,20 +184,9 @@ export interface ConsultationRow {
   unread_count_patient: number;
   unread_count_pharmacist: number;
 }
-export type ConsultationInsert = Omit<
-  ConsultationRow,
-  | "id" | "paid_amount" | "is_dedicated" | "is_favorite"
-  | "purchase_count" | "unread_count_patient" | "unread_count_pharmacist"
-  | "status"
-> & {
-  id?: UUID;
-  status?: ConsultationStatus;
-  paid_amount?: number;
-  is_dedicated?: boolean;
-  is_favorite?: boolean;
-  purchase_count?: number;
-  unread_count_patient?: number;
-  unread_count_pharmacist?: number;
+export type ConsultationInsert = Partial<ConsultationRow> & {
+  patient_id: UUID;
+  consultation_type: ConsultationType;
 };
 export type ConsultationUpdate = Partial<Omit<ConsultationRow, "id" | "patient_id">>;
 
@@ -236,14 +227,10 @@ export interface MessageRow {
   read_at: ISOTimestamp | null;
   created_at: ISOTimestamp;
 }
-export type MessageInsert = Omit<
-  MessageRow, "id" | "created_at" | "is_read" | "is_pharmacist_only" | "message_type"
-> & {
-  id?: UUID;
-  created_at?: ISOTimestamp;
-  is_read?: boolean;
-  is_pharmacist_only?: boolean;
-  message_type?: MessageType;
+export type MessageInsert = Partial<MessageRow> & {
+  consultation_id: UUID;
+  sender_id: UUID;
+  content: string;
 };
 export type MessageUpdate = Partial<Omit<MessageRow, "id" | "consultation_id" | "sender_id" | "created_at">>;
 
@@ -253,7 +240,7 @@ export type MessageUpdate = Partial<Omit<MessageRow, "id" | "consultation_id" | 
 
 export interface AiQuestionnaireRow {
   id: UUID;
-  patient_id: UUID;
+  patient_id: UUID | null;
   symptoms: string[];
   symptom_duration: string | null;
   severity: string | null;
@@ -276,18 +263,10 @@ export interface AiQuestionnaireRow {
   ai_summary: string | null;
   completed_at: ISOTimestamp | null;
 }
-export type AiQuestionnaireInsert = Omit<
-  AiQuestionnaireRow,
-  "id" | "symptoms" | "exercise_types" | "current_supplements" | "current_medications" | "allergies"
-> & {
-  id?: UUID;
-  symptoms?: string[];
-  exercise_types?: string[];
-  current_supplements?: string[];
-  current_medications?: string[];
-  allergies?: string[];
+export type AiQuestionnaireInsert = Partial<AiQuestionnaireRow> & {
+  patient_id: UUID | null;
 };
-export type AiQuestionnaireUpdate = Partial<Omit<AiQuestionnaireRow, "id" | "patient_id">>;
+export type AiQuestionnaireUpdate = Partial<Omit<AiQuestionnaireRow, "id">>;
 
 /* ══════════════════════════════════════════
    case_studies

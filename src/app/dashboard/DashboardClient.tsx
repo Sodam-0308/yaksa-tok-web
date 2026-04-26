@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { supabase } from "@/lib/supabase";
 
 
 /* ── 타입 ── */
@@ -1786,6 +1787,83 @@ function DashboardContent() {
   const [filter, setFilter] = useState<FilterKey>("all");
   const [sortBy, setSortBy] = useState<SortKey>("recent");
   const [search, setSearch] = useState("");
+
+  /* ── 실시간 상담 요청 (DB) — 상단 배너 + 전용 리스트 ── */
+  interface DbPendingRow {
+    id: string;
+    created_at: string;
+    patient: { id: string; name: string; avatar_url: string | null } | null;
+    questionnaire: { symptoms: string[] | null; free_text: string | null } | null;
+    patient_profile: { birth_year: number | null; gender: string | null } | null;
+  }
+  const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
+  const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
+  const [dbPendingLoading, setDbPendingLoading] = useState(true);
+  const [actingId, setActingId] = useState<string | null>(null);
+
+  const fetchPendingRequests = async () => {
+    setDbPendingLoading(true);
+    const { data, error } = await supabase
+      .from("consultations")
+      .select(
+        `
+        id, created_at,
+        patient:profiles!consultations_patient_id_fkey(id, name, avatar_url),
+        questionnaire:ai_questionnaires(symptoms, free_text),
+        patient_profile:patient_profiles!consultations_patient_id_fkey(birth_year, gender)
+      `,
+      )
+      .eq("status", "pending")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("[dashboard] pending list failed:", error);
+      setDbPendingList([]);
+      setDbPendingCount(0);
+      setDbPendingLoading(false);
+      return;
+    }
+    const rows = (data ?? []) as unknown as DbPendingRow[];
+    setDbPendingList(rows);
+    setDbPendingCount(rows.length);
+    setDbPendingLoading(false);
+    console.log("[dashboard] pending consultations loaded:", rows.length);
+  };
+
+  useEffect(() => {
+    fetchPendingRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const updatePendingStatus = async (
+    id: string,
+    nextStatus: "accepted" | "rejected",
+  ) => {
+    if (actingId) return;
+    setActingId(id);
+    const { error } = await (supabase
+      .from("consultations") as unknown as {
+        update: (p: { status: string; rejected_at?: string }) => {
+          eq: (col: string, val: string) => Promise<{ error: Error | null }>;
+        };
+      })
+      .update({
+        status: nextStatus,
+        ...(nextStatus === "rejected" ? { rejected_at: new Date().toISOString() } : {}),
+      })
+      .eq("id", id);
+
+    if (error) {
+      console.error(`[dashboard] consultation ${nextStatus} failed:`, error);
+      setActingId(null);
+      return;
+    }
+    console.log(`[dashboard] consultation ${nextStatus} success — id:`, id);
+    setActingId(null);
+    // 목록에서 즉시 제거
+    setDbPendingList((prev) => prev?.filter((r) => r.id !== id) ?? null);
+    setDbPendingCount((prev) => (prev !== null ? Math.max(0, prev - 1) : null));
+  };
   // 뷰 모드: sessionStorage 복원 전까지 null → 깜빡임 없음
   const [viewMode, setViewMode] = useState<"card" | "list" | null>(null);
 
@@ -2021,6 +2099,239 @@ function DashboardContent() {
             : { transition: "margin 0.25s ease" }
         }
       >
+        {/* DB 실시간 상담 요청 섹션 */}
+        <section
+          style={{
+            background: "#fff",
+            borderRadius: 14,
+            border: "1px solid rgba(94,125,108,0.14)",
+            padding: 16,
+            marginBottom: 16,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 12,
+            }}
+          >
+            <div
+              style={{
+                fontSize: 16,
+                fontWeight: 700,
+                color: "#2C3630",
+                fontFamily: "'Gothic A1', sans-serif",
+              }}
+            >
+              🔔 새 상담 요청{" "}
+              {dbPendingCount !== null && (
+                <span style={{ color: "#B06D00" }}>{dbPendingCount}</span>
+              )}
+            </div>
+          </div>
+
+          {dbPendingLoading ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {[0, 1].map((i) => (
+                <div
+                  key={i}
+                  style={{
+                    height: 84,
+                    borderRadius: 10,
+                    background: "linear-gradient(90deg, #F4F6F3 0%, #ECEFEB 50%, #F4F6F3 100%)",
+                    backgroundSize: "200% 100%",
+                    animation: "dash-skel 1.4s ease-in-out infinite",
+                  }}
+                />
+              ))}
+              <style>{`@keyframes dash-skel { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }`}</style>
+            </div>
+          ) : !dbPendingList || dbPendingList.length === 0 ? (
+            <div
+              style={{
+                padding: "20px 12px",
+                textAlign: "center",
+                fontSize: 14,
+                color: "#3D4A42",
+                background: "#F8F9F7",
+                borderRadius: 10,
+              }}
+            >
+              새 상담 요청이 없어요
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {dbPendingList.map((r) => {
+                const age = r.patient_profile?.birth_year
+                  ? new Date().getFullYear() - r.patient_profile.birth_year
+                  : null;
+                const symptoms = r.questionnaire?.symptoms ?? [];
+                const elapsedMs = Date.now() - new Date(r.created_at).getTime();
+                const elapsedHr = Math.max(0, Math.floor(elapsedMs / (1000 * 60 * 60)));
+                const elapsedMin = Math.max(0, Math.floor(elapsedMs / (1000 * 60)));
+                const elapsedLabel =
+                  elapsedHr >= 1 ? `${elapsedHr}시간 전` : `${elapsedMin}분 전`;
+                const isActing = actingId === r.id;
+                return (
+                  <div
+                    key={r.id}
+                    style={{
+                      padding: 14,
+                      borderRadius: 12,
+                      background: "#FFF8E1",
+                      border: "1px solid #F5DCA0",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        marginBottom: 8,
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: 36,
+                          height: 36,
+                          borderRadius: "50%",
+                          background: "#fff",
+                          border: "1px solid #E8D5A0",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontSize: 16,
+                          flexShrink: 0,
+                        }}
+                        aria-hidden="true"
+                      >
+                        👤
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div
+                          style={{
+                            fontSize: 15,
+                            fontWeight: 700,
+                            color: "#2C3630",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span>{r.patient?.name ?? "환자"}</span>
+                          {age !== null && (
+                            <span
+                              style={{
+                                fontSize: 13,
+                                fontWeight: 500,
+                                color: "#3D4A42",
+                              }}
+                            >
+                              {age}세
+                              {r.patient_profile?.gender ? ` · ${r.patient_profile.gender}` : ""}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 13, color: "#7A5300", marginTop: 2 }}>
+                          {elapsedLabel}
+                        </div>
+                      </div>
+                    </div>
+                    {symptoms.length > 0 && (
+                      <div
+                        style={{
+                          display: "flex",
+                          flexWrap: "wrap",
+                          gap: 6,
+                          marginBottom: 10,
+                        }}
+                      >
+                        {symptoms.slice(0, 5).map((s) => (
+                          <span
+                            key={s}
+                            style={{
+                              fontSize: 12,
+                              fontWeight: 600,
+                              padding: "3px 8px",
+                              borderRadius: 6,
+                              background: "#fff",
+                              color: "#7A5300",
+                              border: "1px solid #F5DCA0",
+                            }}
+                          >
+                            {s}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {r.questionnaire?.free_text && (
+                      <div
+                        style={{
+                          fontSize: 13,
+                          color: "#3D4A42",
+                          lineHeight: 1.5,
+                          marginBottom: 10,
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden",
+                        }}
+                      >
+                        {r.questionnaire.free_text}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        type="button"
+                        onClick={() => updatePendingStatus(r.id, "rejected")}
+                        disabled={isActing}
+                        style={{
+                          flex: 1,
+                          minHeight: 44,
+                          padding: "10px 0",
+                          borderRadius: 10,
+                          background: "#fff",
+                          color: "#993C1D",
+                          fontSize: 14,
+                          fontWeight: 600,
+                          border: "1px solid #E8C9BD",
+                          cursor: isActing ? "default" : "pointer",
+                          opacity: isActing ? 0.6 : 1,
+                        }}
+                      >
+                        거절
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => updatePendingStatus(r.id, "accepted")}
+                        disabled={isActing}
+                        style={{
+                          flex: 1,
+                          minHeight: 44,
+                          padding: "10px 0",
+                          borderRadius: 10,
+                          background: "#4A6355",
+                          color: "#fff",
+                          fontSize: 14,
+                          fontWeight: 700,
+                          border: "none",
+                          cursor: isActing ? "default" : "pointer",
+                          opacity: isActing ? 0.7 : 1,
+                        }}
+                      >
+                        {isActing ? "처리 중..." : "수락"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
         {/* 환자 직접 등록 버튼 */}
         <button
           type="button"
@@ -2044,7 +2355,7 @@ function DashboardContent() {
         <div className="dash-stats-row">
           <div className="dash-stat-card">
             <div style={{ display: "inline-flex", alignItems: "baseline", gap: 8, justifyContent: "center" }}>
-              <span className="dash-stat-num" style={{ color: "#B06D00" }}>🔔 {totalRequested}</span>
+              <span className="dash-stat-num" style={{ color: "#B06D00" }}>🔔 {dbPendingCount ?? totalRequested}</span>
               {totalUrgent > 0 && (
                 <span
                   title="24시간 이상 미답변 환자"

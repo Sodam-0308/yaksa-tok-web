@@ -3,6 +3,15 @@
 import { useState, useEffect, useMemo, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import type { Database } from "@/types/database";
+
+type AiQuestionnaireUpdate = Database["public"]["Tables"]["ai_questionnaires"]["Update"];
+type ConsultationInsert = Database["public"]["Tables"]["consultations"]["Insert"];
+
+const QUESTIONNAIRE_ID_KEY = "yaksa-tok-questionnaire-id";
+const PENDING_MATCH_KEY = "yaksa-tok-pending-match";
 
 interface PharmacistData {
   id: string;
@@ -101,6 +110,8 @@ function MatchContent() {
   const [tab, setTab] = useState<TabView>("list");
   const [sortBy, setSortBy] = useState<SortKey>("match");
   const [requestedNames, setRequestedNames] = useState<Set<string>>(new Set());
+  const [requestingNames, setRequestingNames] = useState<Set<string>>(new Set());
+  const [requestToast, setRequestToast] = useState<string | null>(null);
 
   const symptoms = useMemo(() => {
     const s = searchParams.get("symptom");
@@ -116,6 +127,41 @@ function MatchContent() {
     return () => clearTimeout(timer);
   }, [loading]);
 
+  /* ── 비로그인으로 작성한 문답이 있으면 현재 user 에 연결 ── */
+  const { user } = useAuth();
+  useEffect(() => {
+    if (!user) return;
+    if (typeof window === "undefined") return;
+
+    const orphanId = sessionStorage.getItem(QUESTIONNAIRE_ID_KEY);
+    if (!orphanId) return;
+
+    (async () => {
+      try {
+        const update: AiQuestionnaireUpdate = { patient_id: user.id };
+        const { error } = await (supabase
+          .from("ai_questionnaires") as unknown as {
+            update: (p: AiQuestionnaireUpdate) => {
+              eq: (col: string, val: string) => {
+                is: (col: string, val: null) => Promise<{ error: Error | null }>;
+              };
+            };
+          })
+          .update(update)
+          .eq("id", orphanId)
+          .is("patient_id", null);
+        if (error) {
+          console.error("[match] questionnaire link failed:", error);
+          return;
+        }
+        sessionStorage.removeItem(QUESTIONNAIRE_ID_KEY);
+        sessionStorage.removeItem(PENDING_MATCH_KEY);
+      } catch (err) {
+        console.error("[match] questionnaire link threw:", err);
+      }
+    })();
+  }, [user]);
+
   const sorted = useMemo(() => {
     const list = [...MOCK_PHARMACISTS];
     if (sortBy === "match")
@@ -127,13 +173,94 @@ function MatchContent() {
     return list;
   }, [sortBy]);
 
-  const handleRequestConsult = (name: string, e: React.MouseEvent) => {
+  const handleRequestConsult = async (
+    pharmacistName: string,
+    e: React.MouseEvent,
+  ) => {
     e.preventDefault();
     e.stopPropagation();
-    setRequestedNames((prev) => new Set(prev).add(name));
-    setTimeout(() => {
-      alert(`${name}에게 상담을 요청했어요!\n약사가 수락하면 채팅이 시작됩니다.`);
-    }, 300);
+
+    if (!user) {
+      setRequestToast("로그인이 필요해요.");
+      router.push("/signup");
+      return;
+    }
+    if (requestingNames.has(pharmacistName) || requestedNames.has(pharmacistName)) {
+      return;
+    }
+
+    setRequestingNames((prev) => new Set(prev).add(pharmacistName));
+
+    const questionnaireId =
+      typeof window !== "undefined"
+        ? sessionStorage.getItem(QUESTIONNAIRE_ID_KEY)
+        : null;
+
+    // Mock 약사 — 실제 pharmacist 행이 DB에 없으므로 pharmacist_id는 null로 둠.
+    // Phase 2에서 매칭 로직이 실제 약사 UUID를 반환하도록 교체 예정.
+    const payload: ConsultationInsert = {
+      patient_id: user.id,
+      pharmacist_id: null,
+      questionnaire_id: questionnaireId,
+      consultation_type: "local",
+      status: "pending",
+      matching_source: "ai_questionnaire",
+    };
+
+    console.log("[match] consultations insert payload:", payload);
+
+    try {
+      const { data, error } = await (supabase
+        .from("consultations") as unknown as {
+          insert: (p: ConsultationInsert) => {
+            select: (cols: string) => {
+              maybeSingle: () => Promise<{
+                data: { id: string } | null;
+                error: { message: string; code?: string; details?: string; hint?: string } | null;
+              }>;
+            };
+          };
+        })
+        .insert(payload)
+        .select("id")
+        .maybeSingle();
+
+      if (error) {
+        console.error("[match] consultation create FAILED:", {
+          message: error.message,
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+        });
+        setRequestToast("상담 요청을 보내지 못했어요. 잠시 후 다시 시도해주세요.");
+        setRequestingNames((prev) => {
+          const next = new Set(prev);
+          next.delete(pharmacistName);
+          return next;
+        });
+        setTimeout(() => setRequestToast(null), 2500);
+        return;
+      }
+
+      console.log("[match] consultation created — id:", data?.id);
+      setRequestedNames((prev) => new Set(prev).add(pharmacistName));
+      setRequestingNames((prev) => {
+        const next = new Set(prev);
+        next.delete(pharmacistName);
+        return next;
+      });
+      setRequestToast(`${pharmacistName}에게 상담 요청을 보냈어요!`);
+      setTimeout(() => setRequestToast(null), 2500);
+    } catch (err) {
+      console.error("[match] consultation create threw:", err);
+      setRequestingNames((prev) => {
+        const next = new Set(prev);
+        next.delete(pharmacistName);
+        return next;
+      });
+      setRequestToast("상담 요청을 보내지 못했어요.");
+      setTimeout(() => setRequestToast(null), 2500);
+    }
   };
 
   return (
@@ -382,8 +509,13 @@ function MatchContent() {
                         <button
                           className="match-pharm-action"
                           onClick={(e) => handleRequestConsult(p.name, e)}
+                          disabled={requestedNames.has(p.name) || requestingNames.has(p.name)}
                         >
-                          {requestedNames.has(p.name) ? "요청 완료 ✓" : "상담 요청"}
+                          {requestedNames.has(p.name)
+                            ? "요청 완료 ✓"
+                            : requestingNames.has(p.name)
+                              ? "요청 중..."
+                              : "상담 요청"}
                         </button>
                       </div>
                     </Link>
@@ -411,6 +543,32 @@ function MatchContent() {
           상담 요청은 <strong>무료</strong>예요. 약사가 수락하면 채팅이 시작돼요.
         </div>
       </div>
+
+      {/* 상담 요청 토스트 */}
+      {requestToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: "fixed",
+            bottom: 80,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#2C3630",
+            color: "#fff",
+            padding: "12px 20px",
+            borderRadius: 12,
+            fontSize: 14,
+            fontWeight: 600,
+            boxShadow: "0 4px 20px rgba(0,0,0,0.2)",
+            zIndex: 300,
+            maxWidth: "calc(100vw - 32px)",
+            textAlign: "center",
+          }}
+        >
+          {requestToast}
+        </div>
+      )}
     </div>
   );
 }

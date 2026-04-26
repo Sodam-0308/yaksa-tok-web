@@ -1,7 +1,9 @@
 "use client";
 
+import { Suspense, useEffect } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
 
 /* ══════════════════════════════════════════
    컬러
@@ -65,7 +67,64 @@ const PREVIEW_PHARMACISTS: PreviewPharmacist[] = [
    ══════════════════════════════════════════ */
 
 export default function QuestionnaireResultClient() {
+  return (
+    <Suspense
+      fallback={
+        <div
+          style={{
+            minHeight: "100dvh",
+            background: C.sageBg,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: C.textMid,
+            fontSize: 15,
+          }}
+        >
+          불러오는 중...
+        </div>
+      }
+    >
+      <QuestionnaireResultContent />
+    </Suspense>
+  );
+}
+
+function QuestionnaireResultContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const { user, loading } = useAuth();
+
+  // 로그인된 사용자는 가입 유도를 건너뛰고 바로 매칭으로 이동
+  useEffect(() => {
+    if (loading) return;
+    if (user) {
+      const symptom = searchParams.get("symptom") ?? "";
+      const target = symptom
+        ? `/match?symptom=${encodeURIComponent(symptom)}`
+        : "/match";
+      router.replace(target);
+    }
+  }, [loading, user, router, searchParams]);
+
+  // 로그인 확인 중 또는 로그인 사용자 — 가입 유도 UI를 잠깐도 보이지 않도록 가림
+  if (loading || user) {
+    return (
+      <div
+        style={{
+          minHeight: "100dvh",
+          background: C.sageBg,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: C.textMid,
+          fontSize: 15,
+        }}
+      >
+        매칭 화면으로 이동 중...
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: "100dvh", background: C.sageBg, fontFamily: "'Noto Sans KR', sans-serif" }}>
