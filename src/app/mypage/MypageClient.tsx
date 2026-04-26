@@ -9,6 +9,7 @@ import { supabase } from "@/lib/supabase";
 import type { Database } from "@/types/database";
 
 type ProfileUpdate = Database["public"]["Tables"]["profiles"]["Update"];
+type HealthCheckRow = Database["public"]["Tables"]["health_checks"]["Row"];
 
 /* ══════════════════════════════════════════
    기본 프로필 (DB 로딩 실패 시 fallback)
@@ -199,6 +200,32 @@ function MypageContent() {
   const [editName, setEditName] = useState("");
   const [editBirth, setEditBirth] = useState("");
   const [savingProfile, setSavingProfile] = useState(false);
+
+  /* health_checks 로드 (가장 최신 2건이 변화 비교에 사용) */
+  const [hcRows, setHcRows] = useState<HealthCheckRow[] | null>(null);
+
+  useEffect(() => {
+    if (!user) {
+      setHcRows([]);
+      return;
+    }
+    (async () => {
+      const { data, error } = await supabase
+        .from("health_checks")
+        .select(
+          "id, patient_id, consultation_id, energy_score, sleep_score, digestion_score, mood_score, discomfort_score, memo, created_at",
+        )
+        .eq("patient_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(10);
+      if (error) {
+        console.error("[mypage] health_checks load failed:", error);
+        setHcRows([]);
+        return;
+      }
+      setHcRows((data ?? []) as unknown as HealthCheckRow[]);
+    })();
+  }, [user]);
 
   /* DB에서 프로필 로드 */
   useEffect(() => {
@@ -873,20 +900,61 @@ function MypageContent() {
         {/* ═══════ 3. 내 건강 변화 ═══════ */}
         <section className="my-section">
           <h2 className="my-section-title">내 건강 변화</h2>
-          <HealthIndicatorComparison
-            emptyState={showEmptyState}
-            onEmptyCheckClick={() => router.push("/health-check")}
-            previousDate="2026.03.15"
-            currentDate="2026.04.05"
-            summaryHeadline="처음보다 에너지가 40% 좋아졌어요!"
-            items={HEALTH_SCORES.map((h) => ({
-              label: h.label,
-              before: h.before,
-              after: h.after,
-              lowerIsBetter: h.lowerIsBetter,
-            }))}
-            onCheckClick={() => router.push("/health-check")}
-          />
+          {(() => {
+            // hcRows: 최신순. [0] = current, [1] = previous (있으면 비교)
+            const fmt = (iso: string) => {
+              const d = new Date(iso);
+              return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+            };
+
+            // DB 데이터가 아직 로딩 중이거나(null) 비어있으면 빈 상태 또는 Mock 폴백
+            const dbReady = hcRows !== null;
+            const hasDbData = dbReady && hcRows.length > 0;
+
+            if (!hasDbData) {
+              // DB 비어있을 때: 기존 Mock 데이터 폴백 (showEmptyState 토글로 빈 상태도 노출 가능)
+              return (
+                <HealthIndicatorComparison
+                  emptyState={showEmptyState || (dbReady && hcRows.length === 0)}
+                  onEmptyCheckClick={() => router.push("/health-check")}
+                  previousDate="2026.03.15"
+                  currentDate="2026.04.05"
+                  summaryHeadline="처음보다 에너지가 40% 좋아졌어요!"
+                  items={HEALTH_SCORES.map((h) => ({
+                    label: h.label,
+                    before: h.before,
+                    after: h.after,
+                    lowerIsBetter: h.lowerIsBetter,
+                  }))}
+                  onCheckClick={() => router.push("/health-check")}
+                />
+              );
+            }
+
+            const current = hcRows[0];
+            const previous = hcRows.length >= 2 ? hcRows[1] : null;
+            const items = [
+              { label: "에너지/활력", key: "energy_score" as const, lowerIsBetter: false },
+              { label: "수면", key: "sleep_score" as const, lowerIsBetter: false },
+              { label: "소화", key: "digestion_score" as const, lowerIsBetter: false },
+              { label: "기분", key: "mood_score" as const, lowerIsBetter: false },
+              { label: "증상 불편도", key: "discomfort_score" as const, lowerIsBetter: true },
+            ].map((m) => ({
+              label: m.label,
+              before: previous ? (previous[m.key] as number) : undefined,
+              after: current[m.key] as number,
+              lowerIsBetter: m.lowerIsBetter,
+            }));
+
+            return (
+              <HealthIndicatorComparison
+                previousDate={previous ? fmt(previous.created_at) : undefined}
+                currentDate={fmt(current.created_at)}
+                items={items}
+                onCheckClick={() => router.push("/health-check")}
+              />
+            );
+          })()}
         </section>
 
         {/* ═══════ 4. 약국 방문 도장 ═══════ */}

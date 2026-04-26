@@ -1,7 +1,13 @@
 "use client";
 
-import { useState, Suspense } from "react";
+import { useState, useEffect, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import type { Database } from "@/types/database";
+
+type HealthCheckRow = Database["public"]["Tables"]["health_checks"]["Row"];
+type HealthCheckInsert = Database["public"]["Tables"]["health_checks"]["Insert"];
 
 /* ══════════════════════════════════════════
    더미 데이터 & 상수
@@ -132,6 +138,7 @@ function ScoreHearts({ score, size = 24 }: { score: number; size?: number }) {
 
 function HealthCheckContent() {
   const router = useRouter();
+  const { user } = useAuth();
   const [scores, setScores] = useState(INITIAL_SCORES);
   const [memo, setMemo] = useState("");
   const [isCompleted, setIsCompleted] = useState(false);
@@ -139,6 +146,72 @@ function HealthCheckContent() {
   const [showConsentModal, setShowConsentModal] = useState(false);
   const [openHistory, setOpenHistory] = useState<Set<number>>(new Set());
   const [step1HistoryOpen, setStep1HistoryOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  /* ── DB 기록 로드 ── */
+  const [dbHistory, setDbHistory] = useState<HealthCheckRow[] | null>(null);
+
+  useEffect(() => {
+    if (!user) {
+      setDbHistory([]);
+      return;
+    }
+    (async () => {
+      const { data, error } = await supabase
+        .from("health_checks")
+        .select(
+          "id, patient_id, consultation_id, energy_score, sleep_score, digestion_score, mood_score, discomfort_score, memo, created_at",
+        )
+        .eq("patient_id", user.id)
+        .order("created_at", { ascending: false });
+      if (error) {
+        console.error("[health-check] history load failed:", error);
+        setDbHistory([]);
+        return;
+      }
+      console.log("[health-check] history loaded:", data?.length ?? 0);
+      setDbHistory((data ?? []) as unknown as HealthCheckRow[]);
+    })();
+  }, [user]);
+
+  // app score key (energy/sleep/digestion/mood/symptom) ↔ DB column 매핑
+  const dbColByKey: Record<string, keyof HealthCheckRow> = {
+    energy: "energy_score",
+    sleep: "sleep_score",
+    digestion: "digestion_score",
+    mood: "mood_score",
+    symptom: "discomfort_score",
+  };
+  const fmtIsoDate = (iso: string) => {
+    const d = new Date(iso);
+    return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+  };
+  const dbToHistoryEntry = (row: HealthCheckRow): HistoryEntry => ({
+    date: fmtIsoDate(row.created_at),
+    scores: {
+      energy: row.energy_score,
+      sleep: row.sleep_score,
+      digestion: row.digestion_score,
+      mood: row.mood_score,
+      symptom: row.discomfort_score,
+    },
+    memo: row.memo ?? undefined,
+  });
+
+  /* DB 데이터가 있으면 그걸 사용, 없으면 Mock 폴백 */
+  const useDb = dbHistory !== null && dbHistory.length > 0;
+  const effectivePrevScores: Record<string, number> = useDb
+    ? {
+        energy: dbHistory[0].energy_score,
+        sleep: dbHistory[0].sleep_score,
+        digestion: dbHistory[0].digestion_score,
+        mood: dbHistory[0].mood_score,
+        symptom: dbHistory[0].discomfort_score,
+      }
+    : PREV_SCORES;
+  const effectiveHistory: HistoryEntry[] = useDb
+    ? dbHistory.map(dbToHistoryEntry)
+    : HISTORY;
 
   const update = (key: string, val: number) => setScores({ ...scores, [key]: val });
 
@@ -150,13 +223,70 @@ function HealthCheckContent() {
     }, 1800);
   };
 
+  /** DB INSERT */
+  const saveToDb = async (): Promise<boolean> => {
+    if (!user) {
+      console.warn("[health-check] not logged in — skipping DB save");
+      return true;
+    }
+    setSaving(true);
+    const payload: HealthCheckInsert = {
+      patient_id: user.id,
+      consultation_id: null,
+      energy_score: scores.energy,
+      sleep_score: scores.sleep,
+      digestion_score: scores.digestion,
+      mood_score: scores.mood,
+      discomfort_score: scores.symptom,
+      memo: memo.trim() ? memo.trim() : null,
+    };
+    console.log("[health-check] saving:", payload);
+    const { data, error } = await (supabase
+      .from("health_checks") as unknown as {
+        insert: (p: HealthCheckInsert) => {
+          select: (cols: string) => {
+            maybeSingle: () => Promise<{
+              data: HealthCheckRow | null;
+              error: { message: string; code?: string; details?: string; hint?: string } | null;
+            }>;
+          };
+        };
+      })
+      .insert(payload)
+      .select(
+        "id, patient_id, consultation_id, energy_score, sleep_score, digestion_score, mood_score, discomfort_score, memo, created_at",
+      )
+      .maybeSingle();
+    setSaving(false);
+    if (error) {
+      console.error("[health-check] save FAILED:", {
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+      });
+      return false;
+    }
+    console.log("[health-check] save SUCCESS — id:", data?.id);
+    if (data) {
+      setDbHistory((prev) => [data, ...(prev ?? [])]);
+    }
+    return true;
+  };
+
   const handleStep1Complete = () => {
     setIsCompleted(true);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const handleFinalSave = () => {
-    const hasImproved = ITEMS.some((it) => scores[it.key] - PREV_SCORES[it.key] >= 2);
+  const handleFinalSave = async () => {
+    if (saving) return;
+    // 1) DB INSERT 먼저
+    await saveToDb();
+    // 2) 개선 여부 판단 (DB 이전 기록 우선)
+    const hasImproved = ITEMS.some(
+      (it) => scores[it.key] - effectivePrevScores[it.key] >= 2,
+    );
     if (hasImproved) {
       setShowConsentModal(true);
     } else {
@@ -215,7 +345,7 @@ function HealthCheckContent() {
             </div>
             <div style={{ fontSize: 14, color: C.sageMid, display: "flex", alignItems: "center", gap: 6 }}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={C.sageMid} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-              지난 체크: 2026.03.27
+              지난 체크: {effectiveHistory[0]?.date ?? "기록 없음"}
             </div>
           </div>
 
@@ -225,7 +355,7 @@ function HealthCheckContent() {
           {/* ── 3. 체크 항목 ── */}
           {ITEMS.map((item) => {
             const val = scores[item.key];
-            const prev = PREV_SCORES[item.key];
+            const prev = effectivePrevScores[item.key];
             const diff = val - prev;
             return (
               <div key={item.key} style={card}>
@@ -336,17 +466,17 @@ function HealthCheckContent() {
             </button>
             {step1HistoryOpen && (
               <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-                {HISTORY.length === 0 ? (
+                {effectiveHistory.length === 0 ? (
                   <div style={{ fontSize: 14, color: "#3D4A42", textAlign: "center", padding: "12px 0" }}>
                     아직 기록이 없어요
                   </div>
                 ) : (
-                  HISTORY.map((h, hi) => (
+                  effectiveHistory.map((h, hi) => (
                     <div key={hi} style={{ padding: "12px 14px", borderRadius: 10, background: C.sageBg, border: `1px solid ${C.border}` }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                         <div style={{ width: 8, height: 8, borderRadius: "50%", background: hi === 0 ? C.sageDeep : C.sageLight, flexShrink: 0 }} />
                         <span style={{ fontSize: 14, fontWeight: 600, color: C.textDark }}>{h.date}</span>
-                        {hi === HISTORY.length - 1 && (
+                        {hi === effectiveHistory.length - 1 && (
                           <span style={{ fontSize: 12, fontWeight: 600, color: C.sageDeep, padding: "2px 8px", borderRadius: 6, background: C.sagePale }}>첫 체크</span>
                         )}
                       </div>
@@ -443,7 +573,7 @@ function HealthCheckContent() {
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {ITEMS.map((item) => {
                 const val = scores[item.key];
-                const prev = PREV_SCORES[item.key];
+                const prev = effectivePrevScores[item.key];
                 const diff = val - prev;
                 const pct = ((val / 10) * 100);
                 const prevPct = ((prev / 10) * 100);
@@ -493,7 +623,7 @@ function HealthCheckContent() {
 
             {/* 격려 메시지 */}
             {(() => {
-              const improvedCount = ITEMS.filter((it) => scores[it.key] - PREV_SCORES[it.key] >= 2).length;
+              const improvedCount = ITEMS.filter((it) => scores[it.key] - effectivePrevScores[it.key] >= 2).length;
               if (improvedCount === 0) return null;
               return (
                 <div style={{ marginTop: 16, padding: "12px 16px", borderRadius: 12, background: `linear-gradient(135deg, ${C.sagePale} 0%, ${C.white} 100%)`, border: `1px solid ${C.sageLight}`, textAlign: "center" }}>
@@ -513,10 +643,10 @@ function HealthCheckContent() {
             <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 14, fontFamily: "'Gothic A1', sans-serif" }}>
               지난 기록
             </div>
-            {HISTORY.map((h, hi) => {
+            {effectiveHistory.map((h, hi) => {
               const isOpen = openHistory.has(hi);
               return (
-                <div key={hi} style={{ marginBottom: hi < HISTORY.length - 1 ? 8 : 0 }}>
+                <div key={hi} style={{ marginBottom: hi < effectiveHistory.length - 1 ? 8 : 0 }}>
                   <button
                     type="button"
                     onClick={() => toggleHistory(hi)}
@@ -536,7 +666,7 @@ function HealthCheckContent() {
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <div style={{ width: 8, height: 8, borderRadius: "50%", background: hi === 0 ? C.sageDeep : C.sageLight, flexShrink: 0 }} />
                       <span style={{ fontSize: 15, fontWeight: 600, color: C.textDark }}>{h.date}</span>
-                      {hi === HISTORY.length - 1 && (
+                      {hi === effectiveHistory.length - 1 && (
                         <span style={{ fontSize: 12, fontWeight: 600, color: C.sageDeep, padding: "2px 8px", borderRadius: 6, background: C.sagePale }}>첫 체크</span>
                       )}
                     </div>
