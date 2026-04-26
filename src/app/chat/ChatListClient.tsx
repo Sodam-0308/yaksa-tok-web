@@ -2,6 +2,9 @@
 
 import { useEffect, useMemo, useState, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import { SYMPTOM_META, TAG_LABEL_TO_KEY } from "@/components/SymptomIcon";
 
 /* ══════════════════════════════════════════
    컬러
@@ -22,32 +25,36 @@ const C = {
 };
 
 /* ══════════════════════════════════════════
-   타입 & Mock
+   타입 & Mock 폴백 (비로그인 데모용)
    ══════════════════════════════════════════ */
 
 interface ChatRoom {
   id: string;
-  patientName: string;
-  /** 아바타 이니셜 (한글 1자 권장) */
+  /** 자기 역할 ("patient" | "pharmacist") — /chat/[id]?role=... 라우팅에 사용 */
+  myRole: "patient" | "pharmacist";
+  /** 상대방 표시 이름 */
+  counterpartName: string;
+  /** 아바타 이니셜 (한글 1자) */
   initial: string;
   /** 증상 태그 */
   symptoms: { label: string; bg: string; color: string }[];
   /** 마지막 메시지 미리보기 */
   lastMessage: string;
-  /** 환자 마지막 메시지 시각 (ISO) */
+  /** 마지막 메시지 시각 (ISO) */
   lastMessageAt: string;
-  /** 약사 답장 필요한 안 읽은 메시지 수 (환자가 보낸 미읽음) */
+  /** 안 읽은 메시지 수 (상대방이 보낸 것 중) */
   unreadCount: number;
-  /** ⚠️ 거절 이력 있는 환자 (재요청) */
+  /** ⚠️ 거절 이력 있는 환자 (재요청) — 약사 뷰 전용 */
   hasPrevRejection: boolean;
 }
 
-const NOW_ISO = "2026-04-21T10:00:00+09:00";
+const MOCK_NOW_ISO = "2026-04-21T10:00:00+09:00";
 
 const MOCK_CHATS: ChatRoom[] = [
   {
     id: "c-2",
-    patientName: "박○○",
+    myRole: "pharmacist",
+    counterpartName: "박○○",
     initial: "박",
     symptoms: [{ label: "소화장애", bg: "#FAEEDA", color: "#854F0B" }],
     lastMessage: "약사님, 어제 알려주신 유산균 먹고 속이 좀 편해졌는데 아직 점심 이후에는 더부룩해요.",
@@ -57,7 +64,8 @@ const MOCK_CHATS: ChatRoom[] = [
   },
   {
     id: "c-9",
-    patientName: "조○○",
+    myRole: "pharmacist",
+    counterpartName: "조○○",
     initial: "조",
     symptoms: [{ label: "탈모", bg: "#FAECE7", color: "#993C1D" }],
     lastMessage: "추천해주신 영양제 관련해서 질문이 있어요. 언제쯤 효과를 볼 수 있나요?",
@@ -67,7 +75,8 @@ const MOCK_CHATS: ChatRoom[] = [
   },
   {
     id: "c-1",
-    patientName: "김○○",
+    myRole: "pharmacist",
+    counterpartName: "김○○",
     initial: "김",
     symptoms: [
       { label: "만성피로", bg: "#EAF3DE", color: "#3B6D11" },
@@ -78,54 +87,21 @@ const MOCK_CHATS: ChatRoom[] = [
     unreadCount: 2,
     hasPrevRejection: false,
   },
-  {
-    id: "c-7",
-    patientName: "윤○○",
-    initial: "윤",
-    symptoms: [
-      { label: "소화장애", bg: "#FAEEDA", color: "#854F0B" },
-      { label: "만성피로", bg: "#EAF3DE", color: "#3B6D11" },
-    ],
-    lastMessage: "약사 김서연: 오늘 방문하실 때 꼭 아침 드시고 오세요.",
-    lastMessageAt: "2026-04-20T19:12:00+09:00",
-    unreadCount: 0,
-    hasPrevRejection: false,
-  },
-  {
-    id: "c-3",
-    patientName: "이○○",
-    initial: "이",
-    symptoms: [{ label: "관절통", bg: "#E1F5EE", color: "#0F6E56" }],
-    lastMessage: "오메가3 복용 시작한 지 2주째인데 아침 손가락 강직이 좀 덜한 것 같아요.",
-    lastMessageAt: "2026-04-18T11:05:00+09:00",
-    unreadCount: 0,
-    hasPrevRejection: false,
-  },
-  {
-    id: "c-12",
-    patientName: "장○○",
-    initial: "장",
-    symptoms: [{ label: "소화장애", bg: "#FAEEDA", color: "#854F0B" }],
-    lastMessage: "다시 상담 신청드립니다. 이번엔 증상이 좀 달라서요.",
-    lastMessageAt: "2026-04-21T06:50:00+09:00",
-    unreadCount: 1,
-    hasPrevRejection: true,
-  },
 ];
 
 /* ══════════════════════════════════════════
    Helpers
    ══════════════════════════════════════════ */
 
-function hoursSince(iso: string, nowIso = NOW_ISO): number {
+function hoursSince(iso: string, nowIso?: string): number {
   const then = new Date(iso).getTime();
-  const now = new Date(nowIso).getTime();
+  const now = nowIso ? new Date(nowIso).getTime() : Date.now();
   if (Number.isNaN(then) || Number.isNaN(now)) return 0;
   return Math.max(0, (now - then) / 3_600_000);
 }
 
 /** 카카오톡 스타일 시간 표시 */
-function fmtChatTime(iso: string, nowIso = NOW_ISO): string {
+function fmtChatTime(iso: string, nowIso?: string): string {
   const h = hoursSince(iso, nowIso);
   if (h < 1) return "방금";
   if (h < 24) return `${Math.floor(h)}시간 전`;
@@ -144,34 +120,183 @@ function getUnreadBadgeStyle(hours: number): React.CSSProperties {
   return { background: "#E02020", color: "#fff", animation: "chatListUnreadPulse 1s ease-in-out infinite" };
 }
 
+/** symptom 라벨 → bg/color 매핑 (SYMPTOM_META 활용, 없으면 sage 폴백) */
+function symptomTagStyle(label: string): { label: string; bg: string; color: string } {
+  const key = TAG_LABEL_TO_KEY[label];
+  if (key) {
+    const meta = SYMPTOM_META[key];
+    return { label, bg: meta.bg, color: meta.accent };
+  }
+  return { label, bg: "#EDF4F0", color: "#4A6355" };
+}
+
 type SortKey = "urgent" | "recent";
 
 /* ══════════════════════════════════════════
    메인
    ══════════════════════════════════════════ */
 
+interface DbConsultationRow {
+  id: string;
+  patient_id: string;
+  pharmacist_id: string | null;
+  status: string;
+  created_at: string;
+  patient: { id: string; name: string; avatar_url: string | null } | null;
+  pharmacist: { id: string; name: string; avatar_url: string | null } | null;
+  questionnaire: { symptoms: string[] | null } | null;
+}
+
+interface DbMessageRow {
+  id: string;
+  consultation_id: string;
+  sender_id: string;
+  content: string;
+  is_read: boolean;
+  created_at: string;
+}
+
 function Content() {
   const router = useRouter();
-  const [sortKey, setSortKey] = useState<SortKey>("urgent");
+  const { user, loading: authLoading } = useAuth();
 
-  // 채팅방이 1개뿐이면 바로 해당 방으로 이동
+  const [sortKey, setSortKey] = useState<SortKey>("urgent");
+  const [dbRooms, setDbRooms] = useState<ChatRoom[] | null>(null);
+  const [dbLoading, setDbLoading] = useState(true);
+
+  /* ── DB 채팅방 로드 (로그인 사용자만) ── */
   useEffect(() => {
-    if (MOCK_CHATS.length === 1) {
-      router.replace(`/chat/${MOCK_CHATS[0].id}?role=pharmacist`);
+    let cancelled = false;
+    if (authLoading) return;
+    if (!user) {
+      setDbRooms(null);
+      setDbLoading(false);
+      return;
     }
-  }, [router]);
+
+    (async () => {
+      setDbLoading(true);
+
+      // 1) consultations + 환자/약사/문답 JOIN — 내가 patient_id 또는 pharmacist_id 인 행
+      const { data: consultations, error: consError } = await supabase
+        .from("consultations")
+        .select(
+          `
+          id, patient_id, pharmacist_id, status, created_at,
+          patient:profiles!consultations_patient_id_fkey(id, name, avatar_url),
+          pharmacist:profiles!consultations_pharmacist_id_fkey(id, name, avatar_url),
+          questionnaire:ai_questionnaires(symptoms)
+        `,
+        )
+        .or(`patient_id.eq.${user.id},pharmacist_id.eq.${user.id}`)
+        .order("created_at", { ascending: false });
+
+      if (cancelled) return;
+      if (consError) {
+        console.error("[chat-list] consultations failed:", consError);
+        setDbRooms([]);
+        setDbLoading(false);
+        return;
+      }
+
+      const rows = (consultations ?? []) as unknown as DbConsultationRow[];
+      if (rows.length === 0) {
+        setDbRooms([]);
+        setDbLoading(false);
+        return;
+      }
+
+      // 2) 해당 consultation들의 메시지 일괄 로드 (최신부터)
+      const consIds = rows.map((r) => r.id);
+      const { data: msgRows, error: msgError } = await supabase
+        .from("messages")
+        .select("id, consultation_id, sender_id, content, is_read, created_at")
+        .in("consultation_id", consIds)
+        .order("created_at", { ascending: false });
+
+      if (cancelled) return;
+      if (msgError) {
+        console.error("[chat-list] messages failed:", msgError);
+      }
+
+      const allMsgs = ((msgRows ?? []) as unknown as DbMessageRow[]) ?? [];
+
+      // 3) consultation별 마지막 메시지 + 안 읽은 카운트 집계
+      const lastByCons = new Map<string, DbMessageRow>();
+      const unreadByCons = new Map<string, number>();
+      for (const m of allMsgs) {
+        if (!lastByCons.has(m.consultation_id)) {
+          lastByCons.set(m.consultation_id, m);
+        }
+        if (!m.is_read && m.sender_id !== user.id) {
+          unreadByCons.set(
+            m.consultation_id,
+            (unreadByCons.get(m.consultation_id) ?? 0) + 1,
+          );
+        }
+      }
+
+      // 4) ChatRoom 매핑
+      const built: ChatRoom[] = rows.map((r) => {
+        const isPatient = r.patient_id === user.id;
+        const myRole: "patient" | "pharmacist" = isPatient ? "patient" : "pharmacist";
+        const counterpart = isPatient ? r.pharmacist : r.patient;
+        const counterpartName = counterpart?.name ?? (isPatient ? "약사" : "환자");
+        const initial = counterpartName.trim().charAt(0) || "?";
+
+        const symptoms = (r.questionnaire?.symptoms ?? [])
+          .slice(0, 2)
+          .map((label) => symptomTagStyle(label));
+
+        const lastMsg = lastByCons.get(r.id);
+        const lastMessage = lastMsg?.content ?? "아직 메시지가 없어요";
+        const lastMessageAt = lastMsg?.created_at ?? r.created_at;
+        const unreadCount = unreadByCons.get(r.id) ?? 0;
+
+        return {
+          id: r.id,
+          myRole,
+          counterpartName,
+          initial,
+          symptoms,
+          lastMessage,
+          lastMessageAt,
+          unreadCount,
+          hasPrevRejection: false,
+        };
+      });
+
+      setDbRooms(built);
+      setDbLoading(false);
+      console.log("[chat-list] loaded rooms:", built.length);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, user]);
+
+  // 표시 대상: 로그인 + DB 로드 완료 → DB 결과 사용 / 비로그인 → Mock 폴백
+  const useDb = !!user;
+  const rooms: ChatRoom[] = useMemo(() => {
+    if (useDb) return dbRooms ?? [];
+    return MOCK_CHATS;
+  }, [useDb, dbRooms]);
+  const isLoading = authLoading || (useDb && dbLoading);
+  const isEmpty = !isLoading && rooms.length === 0;
+  const nowIso = useDb ? undefined : MOCK_NOW_ISO;
+
+  // 상담 개수와 관계없이 항상 목록 화면을 먼저 보여줌 (자동 진입 제거)
 
   const sortedChats = useMemo(() => {
-    const list = [...MOCK_CHATS];
+    const list = [...rooms];
     if (sortKey === "recent") {
-      // 마지막 대화 최신순
       list.sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime());
       return list;
     }
-    // urgent: 24h+ unread → unread → 최신
     list.sort((a, b) => {
-      const aHours = hoursSince(a.lastMessageAt);
-      const bHours = hoursSince(b.lastMessageAt);
+      const aHours = hoursSince(a.lastMessageAt, nowIso);
+      const bHours = hoursSince(b.lastMessageAt, nowIso);
       const aUrgent = a.unreadCount > 0 && aHours >= 24 ? 0 : 1;
       const bUrgent = b.unreadCount > 0 && bHours >= 24 ? 0 : 1;
       if (aUrgent !== bUrgent) return aUrgent - bUrgent;
@@ -183,9 +308,7 @@ function Content() {
       return new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime();
     });
     return list;
-  }, [sortKey]);
-
-  const isEmpty = MOCK_CHATS.length === 0;
+  }, [rooms, sortKey, nowIso]);
 
   return (
     <div style={{ minHeight: "100dvh", background: C.sageBg, fontFamily: "'Noto Sans KR', sans-serif" }}>
@@ -198,6 +321,10 @@ function Content() {
         .chat-list-wrap { max-width: 560px; margin: 0 auto; padding: 20px 16px 80px; }
         @media (min-width: 1200px) {
           .chat-list-wrap { max-width: 700px; }
+        }
+        @keyframes chatListSkel {
+          0% { background-position: 200% 0; }
+          100% { background-position: -200% 0; }
         }
       `}</style>
 
@@ -213,7 +340,7 @@ function Content() {
           }}>
             채팅
           </h1>
-          {!isEmpty && (
+          {!isLoading && !isEmpty && (
             <div style={{ display: "inline-flex", gap: 0, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", background: C.white }}>
               {(["urgent", "recent"] as const).map((k) => {
                 const active = sortKey === k;
@@ -239,7 +366,36 @@ function Content() {
           )}
         </div>
 
-        {isEmpty ? (
+        {isLoading ? (
+          <ul style={{
+            listStyle: "none", padding: 0, margin: 0,
+            background: C.white, borderRadius: 14, border: `1px solid ${C.border}`,
+            overflow: "hidden",
+          }}>
+            {[0, 1, 2].map((i) => (
+              <li
+                key={i}
+                style={{
+                  padding: 16,
+                  borderBottom: i === 2 ? "none" : `1px solid ${C.borderSoft}`,
+                  display: "flex", alignItems: "center", gap: 12,
+                }}
+              >
+                <div style={{
+                  width: 44, height: 44, borderRadius: "50%",
+                  background: "linear-gradient(90deg, #F4F6F3 0%, #ECEFEB 50%, #F4F6F3 100%)",
+                  backgroundSize: "200% 100%",
+                  animation: "chatListSkel 1.4s ease-in-out infinite",
+                  flexShrink: 0,
+                }} />
+                <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div style={{ height: 14, width: "40%", borderRadius: 4, background: "#ECEFEB" }} />
+                  <div style={{ height: 12, width: "85%", borderRadius: 4, background: "#F2F4F1" }} />
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : isEmpty ? (
           <div style={{
             marginTop: 40,
             padding: "48px 20px", borderRadius: 14,
@@ -248,10 +404,12 @@ function Content() {
           }}>
             <div style={{ fontSize: 44, marginBottom: 10, lineHeight: 1 }}>📭</div>
             <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>
-              아직 진행 중인 채팅이 없어요
+              아직 상담 내역이 없어요
             </div>
             <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6 }}>
-              환자 상담 요청을 수락하면 채팅이 시작됩니다
+              {useDb
+                ? "상담 요청을 보내거나 수락하면 채팅이 시작됩니다"
+                : "환자 상담 요청을 수락하면 채팅이 시작됩니다"}
             </div>
           </div>
         ) : (
@@ -262,12 +420,12 @@ function Content() {
             overflow: "hidden",
           }}>
             {sortedChats.map((room, idx) => {
-              const hrs = hoursSince(room.lastMessageAt);
+              const hrs = hoursSince(room.lastMessageAt, nowIso);
               const hasUnread = room.unreadCount > 0;
               return (
                 <li
                   key={room.id}
-                  onClick={() => router.push(`/chat/${room.id}?role=pharmacist`)}
+                  onClick={() => router.push(`/chat/${room.id}?role=${room.myRole}`)}
                   className="chat-list-row"
                   style={{
                     display: "flex", alignItems: "center",
@@ -296,7 +454,7 @@ function Content() {
                         fontSize: 16, fontWeight: hasUnread ? 700 : 600,
                         color: C.textDark, whiteSpace: "nowrap",
                       }}>
-                        {room.patientName}
+                        {room.counterpartName}
                       </span>
                       {room.hasPrevRejection && (
                         <span
@@ -337,7 +495,7 @@ function Content() {
                     flexShrink: 0, minWidth: 48,
                   }}>
                     <span style={{ fontSize: 13, color: C.textMid, whiteSpace: "nowrap" }}>
-                      {fmtChatTime(room.lastMessageAt)}
+                      {fmtChatTime(room.lastMessageAt, nowIso)}
                     </span>
                     {room.unreadCount > 0 && (
                       <span
