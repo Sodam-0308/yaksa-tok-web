@@ -900,8 +900,10 @@ function ChatContent() {
     return () => clearTimeout(t);
   }, [searchQuery]);
 
-  const visibleMessages = messages.filter(
-    (m) => m.sessionId === activeSession && !(m.pharmacistOnly && role !== "pharmacist"),
+  // DB 모드에서는 세션(차수) 분리가 없으므로 sessionId 필터를 건너뜀
+  const visibleMessages = messages.filter((m) =>
+    !(m.pharmacistOnly && role !== "pharmacist") &&
+    (isDbConsultation || m.sessionId === activeSession),
   );
   const searchResults = debouncedQuery
     ? visibleMessages.filter(
@@ -1261,10 +1263,15 @@ function ChatContent() {
 
       {/* Messages */}
       <div className="chat-messages" style={{ borderTop: "none" }}>
-        <div className="chat-date-divider">
-          <span>{activeSession === "s1" ? "오늘" : "2026년 4월 11일"}</span>
-        </div>
-        {messages.filter((m) => m.sessionId === activeSession && !(m.pharmacistOnly && role !== "pharmacist")).map((msg) => {
+        {!isDbConsultation && (
+          <div className="chat-date-divider">
+            <span>{activeSession === "s1" ? "오늘" : "2026년 4월 11일"}</span>
+          </div>
+        )}
+        {messages.filter((m) =>
+          !(m.pharmacistOnly && role !== "pharmacist") &&
+          (isDbConsultation || m.sessionId === activeSession),
+        ).map((msg) => {
           const isSystem = msg.content.startsWith("[시스템]");
           const isVisitCard = msg.content.startsWith("[방문안내]");
           const isQSetCard = msg.content.startsWith("[추가질문]") && !msg.content.startsWith("[추가질문답변]");
