@@ -10,6 +10,10 @@ import type { Database } from "@/types/database";
 
 type ProfileUpdate = Database["public"]["Tables"]["profiles"]["Update"];
 type HealthCheckRow = Database["public"]["Tables"]["health_checks"]["Row"];
+type MedicationStatusRow = Database["public"]["Tables"]["medication_status"]["Row"];
+type MedicationStatusInsert = Database["public"]["Tables"]["medication_status"]["Insert"];
+type MedicationCheckRow = Database["public"]["Tables"]["medication_checks"]["Row"];
+type MedicationCheckInsert = Database["public"]["Tables"]["medication_checks"]["Insert"];
 
 /* ══════════════════════════════════════════
    기본 프로필 (DB 로딩 실패 시 fallback)
@@ -292,39 +296,149 @@ function MypageContent() {
   const dateKey = `${selectedDate.getFullYear()}-${String(selectedDate.getMonth() + 1).padStart(2, "0")}-${String(selectedDate.getDate()).padStart(2, "0")}`;
 
   // 날짜별 복약 상태: Record<dateKey, Record<supplementId, boolean[]>>
-  const [checksByDate, setChecksByDate] = useState<Record<string, Record<string, boolean[]>>>(() => {
-    const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
-    return {
-      [todayKey]: Object.fromEntries(
-        INITIAL_SUPPLEMENTS.map((s) => [s.id, s.times.map((t) => t.checked)])
-      ),
-    };
-  });
+  const [checksByDate, setChecksByDate] = useState<Record<string, Record<string, boolean[]>>>({});
 
   const getChecks = (suppId: string, timesLen: number): boolean[] => {
     return checksByDate[dateKey]?.[suppId] ?? new Array(timesLen).fill(false);
   };
 
   const [supplements, setSupplements] = useState<Supplement[]>(INITIAL_SUPPLEMENTS);
+
+  /* ── 이번 주 (월~일) 날짜 계산 — 실제 today 기준 ── */
+  const fmtKey = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const todayKey = fmtKey(today);
+  const weekDates = (() => {
+    const dow = today.getDay(); // 0=일,1=월,...,6=토
+    const mondayOffset = dow === 0 ? -6 : 1 - dow;
+    const monday = new Date(today);
+    monday.setHours(0, 0, 0, 0);
+    monday.setDate(today.getDate() + mondayOffset);
+    return Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(monday);
+      d.setDate(monday.getDate() + i);
+      return d;
+    });
+  })();
+
+  /* ── DB 로드: 본인 medication_checks (이번 주 + 최근 3일) ── */
+  useEffect(() => {
+    if (!user) return;
+    const fromDate = fmtKey(weekDates[0]);
+    const toDate = fmtKey(weekDates[6]);
+    (async () => {
+      const { data, error } = await supabase
+        .from("medication_checks")
+        .select("supplement_name, time_slot, check_date, is_checked")
+        .eq("patient_id", user.id)
+        .gte("check_date", fromDate)
+        .lte("check_date", toDate);
+      if (error) {
+        console.error("[mypage] medication_checks load failed:", error);
+        return;
+      }
+      const rows = (data ?? []) as unknown as Pick<
+        MedicationCheckRow,
+        "supplement_name" | "time_slot" | "check_date" | "is_checked"
+      >[];
+      const nameToSupp = new Map(supplements.map((s) => [s.name, s] as const));
+
+      setChecksByDate((prev) => {
+        const next: Record<string, Record<string, boolean[]>> = { ...prev };
+        for (const row of rows) {
+          const supp = nameToSupp.get(row.supplement_name);
+          if (!supp) continue;
+          const slotIndex = supp.times.findIndex((t) => t.slot === row.time_slot);
+          if (slotIndex < 0) continue;
+          const dateMap = { ...(next[row.check_date] ?? {}) };
+          const arr = [...(dateMap[supp.id] ?? new Array(supp.times.length).fill(false))];
+          arr[slotIndex] = !!row.is_checked;
+          dateMap[supp.id] = arr;
+          next[row.check_date] = dateMap;
+        }
+        return next;
+      });
+      console.log("[mypage] medication_checks loaded:", rows.length);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, supplements.length]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState("");
   const [newTimes, setNewTimes] = useState<Set<TimeSlot>>(new Set());
   const [swipedId, setSwipedId] = useState<string | null>(null);
 
-  /* ── 지난 상담 복용 상태 ── */
+  /* ── 지난 상담 복용 상태 (DB: medication_status) ── */
   type DoseStatus = "taking" | "completed" | "stopped";
   const [doseStatus, setDoseStatus] = useState<Record<string, DoseStatus>>({});
+  const [doseLoaded, setDoseLoaded] = useState(false);
   const [statusModalId, setStatusModalId] = useState<string | null>(null);
   const [statusDraft, setStatusDraft] = useState<DoseStatus>("completed");
+  const [statusSaving, setStatusSaving] = useState(false);
   const getDoseStatus = (id: string): DoseStatus => doseStatus[id] ?? "completed";
   const openStatusModal = (id: string) => {
     setStatusDraft(getDoseStatus(id));
     setStatusModalId(id);
   };
-  const saveStatus = () => {
-    if (!statusModalId) return;
-    setDoseStatus((prev) => ({ ...prev, [statusModalId]: statusDraft }));
+
+  // DB 로드: 사용자별 medication_status 모두 조회 → doseStatus 맵으로 변환
+  useEffect(() => {
+    if (!user) {
+      setDoseLoaded(true);
+      return;
+    }
+    (async () => {
+      const { data, error } = await supabase
+        .from("medication_status")
+        .select("consultation_key, status")
+        .eq("patient_id", user.id);
+      if (error) {
+        console.error("[mypage] medication_status load failed:", error);
+        setDoseLoaded(true);
+        return;
+      }
+      const rows = (data ?? []) as unknown as Pick<MedicationStatusRow, "consultation_key" | "status">[];
+      const map: Record<string, DoseStatus> = {};
+      for (const r of rows) {
+        map[r.consultation_key] = r.status;
+      }
+      setDoseStatus(map);
+      setDoseLoaded(true);
+      console.log("[mypage] medication_status loaded:", rows.length);
+    })();
+  }, [user]);
+
+  const saveStatus = async () => {
+    if (!statusModalId || statusSaving) return;
+    const targetId = statusModalId;
+    const nextStatus = statusDraft;
+
+    // 1) 즉시 UI 반영
+    setDoseStatus((prev) => ({ ...prev, [targetId]: nextStatus }));
     setStatusModalId(null);
+
+    // 2) DB upsert (로그인 사용자만)
+    if (!user) return;
+    setStatusSaving(true);
+    const payload: MedicationStatusInsert = {
+      patient_id: user.id,
+      consultation_key: targetId,
+      status: nextStatus,
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await (supabase
+      .from("medication_status") as unknown as {
+        upsert: (
+          p: MedicationStatusInsert,
+          opts?: { onConflict?: string },
+        ) => Promise<{ error: Error | null }>;
+      })
+      .upsert(payload, { onConflict: "patient_id,consultation_key" });
+    setStatusSaving(false);
+    if (error) {
+      console.error("[mypage] medication_status save failed:", error);
+    } else {
+      console.log("[mypage] medication_status saved:", targetId, nextStatus);
+    }
   };
 
   /* ── 복용 가이드 아코디언 (각각 독립 펼침/접힘) ── */
@@ -347,16 +461,60 @@ function MypageContent() {
 
   const age = calcAge(editMode ? editBirth : profile.birth);
 
-  /* 영양제 체크 토글 (날짜별) */
+  /* 영양제 체크 토글 (날짜별) — 즉시 UI 반영 + DB upsert */
   const toggleCheck = (id: string, timeIndex: number) => {
+    const supp = supplements.find((s) => s.id === id);
+    if (!supp) return;
+    const slot = supp.times[timeIndex]?.slot;
+    if (!slot) return;
+    const prevArr = checksByDate[dateKey]?.[id] ?? new Array(supp.times.length).fill(false);
+    const nextChecked = !prevArr[timeIndex];
+
+    // 1) 즉시 UI 반영
     setChecksByDate((prev) => {
       const dayChecks = { ...(prev[dateKey] || {}) };
-      const supp = supplements.find((s) => s.id === id);
-      const arr = [...(dayChecks[id] ?? new Array(supp?.times.length ?? 0).fill(false))];
-      arr[timeIndex] = !arr[timeIndex];
+      const arr = [...(dayChecks[id] ?? new Array(supp.times.length).fill(false))];
+      arr[timeIndex] = nextChecked;
       dayChecks[id] = arr;
       return { ...prev, [dateKey]: dayChecks };
     });
+
+    // 2) DB upsert (로그인 사용자만)
+    if (!user) return;
+    const payload: MedicationCheckInsert = {
+      patient_id: user.id,
+      dosage_guide_id: null,
+      supplement_name: supp.name,
+      time_slot: slot,
+      check_date: dateKey,
+      is_checked: nextChecked,
+      updated_at: new Date().toISOString(),
+    };
+    (async () => {
+      const { error } = await (supabase
+        .from("medication_checks") as unknown as {
+          upsert: (
+            p: MedicationCheckInsert,
+            opts?: { onConflict?: string },
+          ) => Promise<{ error: Error | null }>;
+        })
+        .upsert(payload, {
+          onConflict: "patient_id,supplement_name,time_slot,check_date",
+        });
+      if (error) {
+        console.error("[mypage] medication_checks upsert failed:", error);
+        // 실패 시 롤백
+        setChecksByDate((prev) => {
+          const dayChecks = { ...(prev[dateKey] || {}) };
+          const arr = [...(dayChecks[id] ?? new Array(supp.times.length).fill(false))];
+          arr[timeIndex] = !nextChecked;
+          dayChecks[id] = arr;
+          return { ...prev, [dateKey]: dayChecks };
+        });
+      } else {
+        console.log("[mypage] medication_checks upsert OK:", supp.name, slot, dateKey, nextChecked);
+      }
+    })();
   };
 
   /* 영양제 삭제 */
@@ -684,24 +842,37 @@ function MypageContent() {
             })}
           </div>
 
-          {/* 복약 달력 */}
+          {/* 복약 달력 — 실제 today 기준 월~일 + DB 체크 기반 하트 */}
           <div className="my-week-calendar">
             <div className="my-week-label">이번 주 복약</div>
             <div className="my-week-row">
-              {WEEK_DAYS.map((day, i) => {
-                const status = WEEK_HEARTS[i];
+              {weekDates.map((d, i) => {
+                const dayKey = fmtKey(d);
+                const isToday = dayKey === todayKey;
+                // 해당 날짜에 모든 영양제·시간슬롯의 체크 비율 계산
+                const allFlags = supplements.flatMap((s) => {
+                  const arr = checksByDate[dayKey]?.[s.id]
+                    ?? new Array(s.times.length).fill(false);
+                  return arr;
+                });
+                const total = allFlags.length;
+                const checked = allFlags.filter(Boolean).length;
+                let status: HeartStatus;
+                if (total === 0) status = "empty";
+                else if (checked === total) status = "full";
+                else if (checked > 0) status = "half";
+                else status = "empty";
+
                 return (
                   <div
-                    key={day}
-                    className={`my-week-cell${status === "today" ? " today" : ""}`}
+                    key={dayKey}
+                    className={`my-week-cell${isToday ? " today" : ""}`}
                   >
-                    <span className="my-week-day">{day}</span>
+                    <span className="my-week-day">{WEEK_DAYS[i]}</span>
                     <span className="my-week-heart">
                       {status === "full" && <HeartIcon filled size={16} />}
                       {status === "half" && <HalfHeartIcon size={16} />}
-                      {(status === "empty" || status === "today") && (
-                        <HeartIcon filled={false} size={16} />
-                      )}
+                      {status === "empty" && <HeartIcon filled={false} size={16} />}
                     </span>
                   </div>
                 );
@@ -1037,7 +1208,26 @@ function MypageContent() {
 
           {/* 지난 상담 */}
           <div className="my-consult-past-label">지난 상담</div>
-          {CONSULTS.filter((c) => c.status === "completed").map((c) => {
+          {(() => {
+            const past = CONSULTS.filter((c) => c.status === "completed");
+            // 로그인 사용자가 DB 로드 완료 후, mock 상담도 비어있고 doseStatus 도 비어있으면 빈 상태
+            if (past.length === 0 && doseLoaded && Object.keys(doseStatus).length === 0) {
+              return (
+                <div
+                  style={{
+                    padding: "32px 16px",
+                    textAlign: "center",
+                    fontSize: 14,
+                    color: "#3D4A42",
+                    background: "#F8F9F7",
+                    borderRadius: 12,
+                  }}
+                >
+                  아직 복약 기록이 없어요
+                </div>
+              );
+            }
+            return past.map((c) => {
             const st = getDoseStatus(c.id);
             const stLabel = st === "taking" ? "복용 중" : st === "completed" ? "복용 완료" : "복용 중단";
             const stTheme =
@@ -1105,7 +1295,8 @@ function MypageContent() {
                 </div>
               </div>
             );
-          })}
+          });
+          })()}
           </>
           )}
         </section>

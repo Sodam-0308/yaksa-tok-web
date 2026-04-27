@@ -597,22 +597,45 @@ export type ImprovementConfirmationInsert = Omit<ImprovementConfirmationRow, "id
 export type ImprovementConfirmationUpdate = Partial<Omit<ImprovementConfirmationRow, "id" | "consultation_id" | "pharmacist_id" | "patient_id">>;
 
 /* ══════════════════════════════════════════
+   medication_status (지난 상담 단위 복용 상태 — 복용 중/완료/중단)
+   ══════════════════════════════════════════ */
+
+export interface MedicationStatusRow {
+  id: UUID;
+  patient_id: UUID;
+  consultation_key: string;     // mock id 또는 실제 consultation UUID
+  status: DosageStatus;
+  updated_at: ISOTimestamp;
+}
+export type MedicationStatusInsert = Partial<MedicationStatusRow> & {
+  patient_id: UUID;
+  consultation_key: string;
+  status: DosageStatus;
+};
+export type MedicationStatusUpdate = Partial<Omit<MedicationStatusRow, "id" | "patient_id" | "consultation_key">>;
+
+/* ══════════════════════════════════════════
    medication_checks
    ══════════════════════════════════════════ */
 
 export interface MedicationCheckRow {
   id: UUID;
   patient_id: UUID;
-  dosage_guide_id: UUID;
+  dosage_guide_id: UUID | null;
   supplement_name: string;
+  time_slot: string;             // 아침 / 점심 / 저녁 / 취침 전
   check_date: ISODate;
   is_checked: boolean;
+  updated_at: ISOTimestamp;
 }
-export type MedicationCheckInsert = Omit<MedicationCheckRow, "id" | "is_checked"> & {
-  id?: UUID;
-  is_checked?: boolean;
+export type MedicationCheckInsert = Partial<MedicationCheckRow> & {
+  patient_id: UUID;
+  supplement_name: string;
+  time_slot: string;
+  check_date: ISODate;
+  is_checked: boolean;
 };
-export type MedicationCheckUpdate = Partial<Omit<MedicationCheckRow, "id" | "patient_id" | "dosage_guide_id">>;
+export type MedicationCheckUpdate = Partial<Omit<MedicationCheckRow, "id" | "patient_id">>;
 
 /* ══════════════════════════════════════════
    pharmacist_stories
@@ -804,6 +827,11 @@ export interface Database {
         Row: MedicationCheckRow;
         Insert: MedicationCheckInsert;
         Update: MedicationCheckUpdate;
+      };
+      medication_status: {
+        Row: MedicationStatusRow;
+        Insert: MedicationStatusInsert;
+        Update: MedicationStatusUpdate;
       };
       pharmacist_stories: {
         Row: PharmacistStoryRow;
