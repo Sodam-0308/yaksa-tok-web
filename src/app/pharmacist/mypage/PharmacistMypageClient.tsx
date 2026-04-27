@@ -1,7 +1,9 @@
 "use client";
 
-import { useState, useRef, Suspense } from "react";
+import { useState, useRef, useEffect, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
 
 /* ══════════════════════════════════════════
    더미 데이터 & 상수
@@ -99,6 +101,7 @@ const modal: React.CSSProperties = { background: C.white, borderRadius: "20px 20
 function Content() {
   const router = useRouter();
   const showEmptyState = false;
+  const { user } = useAuth();
 
   /* ── 프로필 ── */
   const [editMode, setEditMode] = useState(false);
@@ -106,8 +109,70 @@ function Content() {
   const [pPharmacy, setPPharmacy] = useState(PROFILE.pharmacy);
   const [pAddress, setPAddress] = useState(PROFILE.address);
   const [saved, setSaved] = useState({ name: PROFILE.name, pharmacy: PROFILE.pharmacy, address: PROFILE.address });
+
+  /* ── DB 상태 ── */
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const [hasPharmacistProfile, setHasPharmacistProfile] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  /* DB 저장 헬퍼 — pharmacist_profiles UPSERT */
+  const persistPharmacistFields = async (fields: Partial<{
+    pharmacy_name: string;
+    address: string;
+    expert_specialties: string[];
+    available_specialties: string[];
+  }>) => {
+    if (!user) return;
+    type PpUpsert = {
+      id: string;
+      pharmacy_name?: string;
+      address?: string;
+      expert_specialties?: string[];
+      available_specialties?: string[];
+    };
+    const payload: PpUpsert = { id: user.id, ...fields };
+    const { error } = await (supabase
+      .from("pharmacist_profiles") as unknown as {
+        upsert: (
+          p: PpUpsert,
+          opts?: { onConflict?: string },
+        ) => Promise<{ error: Error | null }>;
+      })
+      .upsert(payload, { onConflict: "id" });
+    if (error) {
+      console.error("[ph-mypage] pharmacist_profiles upsert failed:", error);
+      return;
+    }
+    setHasPharmacistProfile(true);
+    console.log("[ph-mypage] pharmacist_profiles saved:", Object.keys(fields));
+  };
+
+  /* DB 저장 헬퍼 — profiles.name UPDATE */
+  const persistProfileName = async (name: string) => {
+    if (!user) return;
+    const { error } = await (supabase
+      .from("profiles") as unknown as {
+        update: (p: { name: string }) => {
+          eq: (col: string, val: string) => Promise<{ error: Error | null }>;
+        };
+      })
+      .update({ name })
+      .eq("id", user.id);
+    if (error) console.error("[ph-mypage] profiles.name update failed:", error);
+  };
+
   const cancelEdit = () => { setPName(saved.name); setPPharmacy(saved.pharmacy); setPAddress(saved.address); setEditMode(false); };
-  const saveEdit = () => { setSaved({ name: pName, pharmacy: pPharmacy, address: pAddress }); setEditMode(false); };
+  const saveEdit = async () => {
+    if (savingProfile) return;
+    setSavingProfile(true);
+    await Promise.all([
+      persistProfileName(pName),
+      persistPharmacistFields({ pharmacy_name: pPharmacy, address: pAddress }),
+    ]);
+    setSaved({ name: pName, pharmacy: pPharmacy, address: pAddress });
+    setEditMode(false);
+    setSavingProfile(false);
+  };
 
   /* ── 약국 사진 ── */
   const [pharmacyPhotos, setPharmacyPhotos] = useState<{ file: File; url: string }[]>([]);
@@ -136,13 +201,80 @@ function Content() {
   const [available, setAvailable] = useState<Set<string>>(new Set(ALL_SPECIALTIES));
 
   const toggleExpert = (s: string) => {
-    setExpert((prev) => { const n = new Set(prev); n.has(s) ? n.delete(s) : (n.size < 3 && n.add(s)); return n; });
+    setExpert((prev) => {
+      const n = new Set(prev);
+      n.has(s) ? n.delete(s) : (n.size < 3 && n.add(s));
+      // DB 저장 (배열로 변환)
+      persistPharmacistFields({ expert_specialties: Array.from(n) });
+      return n;
+    });
   };
   const toggleAvailable = (s: string) => {
-    setAvailable((prev) => { const n = new Set(prev); n.has(s) ? n.delete(s) : n.add(s); return n; });
+    setAvailable((prev) => {
+      const n = new Set(prev);
+      n.has(s) ? n.delete(s) : n.add(s);
+      persistPharmacistFields({ available_specialties: Array.from(n) });
+      return n;
+    });
   };
   const allSelected = available.size === ALL_SPECIALTIES.length;
-  const toggleAll = () => setAvailable(allSelected ? new Set() : new Set(ALL_SPECIALTIES));
+  const toggleAll = () => {
+    const next = allSelected ? new Set<string>() : new Set<string>(ALL_SPECIALTIES);
+    setAvailable(next);
+    persistPharmacistFields({ available_specialties: Array.from(next) });
+  };
+
+  /* ── DB 로드 ── */
+  useEffect(() => {
+    if (!user) {
+      setProfileLoaded(true);
+      return;
+    }
+    (async () => {
+      const [profileRes, ppRes] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select("name")
+          .eq("id", user.id)
+          .maybeSingle<{ name: string }>(),
+        supabase
+          .from("pharmacist_profiles")
+          .select("pharmacy_name, address, expert_specialties, available_specialties")
+          .eq("id", user.id)
+          .maybeSingle<{
+            pharmacy_name: string | null;
+            address: string | null;
+            expert_specialties: string[] | null;
+            available_specialties: string[] | null;
+          }>(),
+      ]);
+
+      const profileName = profileRes.data?.name ?? PROFILE.name;
+      const pp = ppRes.data;
+      setPName(profileName);
+      if (pp) {
+        setHasPharmacistProfile(true);
+        if (pp.pharmacy_name) setPPharmacy(pp.pharmacy_name);
+        if (pp.address) setPAddress(pp.address);
+        if (Array.isArray(pp.expert_specialties)) setExpert(new Set(pp.expert_specialties));
+        if (Array.isArray(pp.available_specialties)) setAvailable(new Set(pp.available_specialties));
+        setSaved({
+          name: profileName,
+          pharmacy: pp.pharmacy_name ?? PROFILE.pharmacy,
+          address: pp.address ?? PROFILE.address,
+        });
+      } else {
+        setSaved({
+          name: profileName,
+          pharmacy: PROFILE.pharmacy,
+          address: PROFILE.address,
+        });
+      }
+      setProfileLoaded(true);
+      console.log("[ph-mypage] profile loaded — has pharmacist_profile:", !!pp);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   /* ── 스케줄 ── */
   const [schedule, setSchedule] = useState(INITIAL_SCHEDULE);
@@ -230,6 +362,26 @@ function Content() {
         </nav>
 
         <div className="pm-c">
+          {/* 프로필 미등록 안내 */}
+          {profileLoaded && user && !hasPharmacistProfile && (
+            <div
+              role="status"
+              style={{
+                background: "#FBF5F1",
+                border: "1px solid #F5E6DC",
+                color: "#A35A39",
+                padding: "12px 14px",
+                borderRadius: 12,
+                fontSize: 14,
+                lineHeight: 1.5,
+                marginBottom: 16,
+                fontWeight: 500,
+              }}
+            >
+              아직 약사 프로필이 등록되지 않았어요. 약국명·전문 분야를 입력하고 저장하면 바로 등록돼요.
+            </div>
+          )}
+
           {/* ── 2. 프로필 ── */}
           <div style={card}>
             <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 16 }}>
@@ -257,7 +409,14 @@ function Content() {
                 <div style={{ fontSize: 14, color: C.textMid, padding: "10px 14px", background: C.sagePale, borderRadius: 8 }}>면허번호: {PROFILE.license}</div>
                 <div style={{ display: "flex", gap: 10 }}>
                   <button type="button" style={btnS} onClick={cancelEdit}>취소</button>
-                  <button type="button" style={btnP} onClick={saveEdit}>저장</button>
+                  <button
+                    type="button"
+                    style={{ ...btnP, opacity: savingProfile ? 0.7 : 1 }}
+                    onClick={saveEdit}
+                    disabled={savingProfile}
+                  >
+                    {savingProfile ? "저장 중..." : "저장"}
+                  </button>
                 </div>
               </div>
             ) : (
