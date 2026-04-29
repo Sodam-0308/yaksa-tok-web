@@ -118,6 +118,7 @@ export interface PharmacistProfileRow {
   lat: number | null;
   lng: number | null;
   license_number: string | null;
+  license_name: string | null;
   license_photo_url: string | null;
   business_number: string | null;
   expert_specialties: string[];
@@ -144,6 +145,7 @@ export type PharmacistProfileInsert = Omit<
   | "is_nationwide" | "remote_fee" | "can_ship_supplements"
   | "total_consultations" | "total_improvements"
   | "is_verified" | "is_active"
+  | "license_name"
 > & {
   expert_specialties?: string[];
   available_specialties?: string[];
@@ -155,6 +157,7 @@ export type PharmacistProfileInsert = Omit<
   total_improvements?: number;
   is_verified?: boolean;
   is_active?: boolean;
+  license_name?: string | null;
 };
 export type PharmacistProfileUpdate = Partial<Omit<PharmacistProfileRow, "id">>;
 

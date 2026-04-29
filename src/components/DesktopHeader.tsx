@@ -1,7 +1,9 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
 
 /* ── 타입 ── */
 interface Tab {
@@ -52,6 +54,32 @@ export default function DesktopHeader({ pathname }: { pathname: string }) {
 
   const tabs = isPharmacist ? PHARMACIST_TABS : PATIENT_TABS;
   const logoHref = isPharmacist ? "/dashboard" : "/";
+
+  // 약사 본인 환영 텍스트는 license_name(면허증 이름) 우선, 없으면 profile.name 폴백
+  const [pharmacistLicenseName, setPharmacistLicenseName] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!user || !isPharmacist) {
+      setPharmacistLicenseName(null);
+      return;
+    }
+    (async () => {
+      const { data } = await supabase
+        .from("pharmacist_profiles")
+        .select("license_name")
+        .eq("id", user.id)
+        .maybeSingle<{ license_name: string | null }>();
+      if (cancelled) return;
+      const ln = data?.license_name?.trim() || null;
+      setPharmacistLicenseName(ln);
+    })();
+    return () => { cancelled = true; };
+  }, [user, isPharmacist]);
+
+  const displayName =
+    (isPharmacist && pharmacistLicenseName) ||
+    (profile?.name && profile.name.trim()) ||
+    "";
 
   const isActive = (href: string) => {
     const base = href.split("?")[0];
@@ -178,7 +206,7 @@ export default function DesktopHeader({ pathname }: { pathname: string }) {
             }}
           >
             <span>
-              {profile?.name ? `${profile.name}님 환영합니다` : "환영합니다"}
+              {displayName ? `${displayName}님 환영합니다` : "환영합니다"}
             </span>
             <button
               type="button"

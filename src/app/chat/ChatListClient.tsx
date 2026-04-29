@@ -221,6 +221,32 @@ function Content() {
 
       const allMsgs = ((msgRows ?? []) as unknown as DbMessageRow[]) ?? [];
 
+      // 2.5) 약사 카운터파트의 license_name (면허증 이름) 조회 — 환자에게 보여지는 표시 이름은 면허증 이름 우선
+      const pharmacistIds = Array.from(
+        new Set(
+          rows
+            .map((r) => r.pharmacist_id)
+            .filter((id): id is string => !!id && id !== user.id),
+        ),
+      );
+      const licenseNameByPharmId = new Map<string, string>();
+      if (pharmacistIds.length > 0) {
+        const { data: ppRows, error: ppErr } = await supabase
+          .from("pharmacist_profiles")
+          .select("id, license_name")
+          .in("id", pharmacistIds);
+        if (cancelled) return;
+        if (ppErr) {
+          console.error("[chat-list] pharmacist_profiles license_name failed:", ppErr);
+        } else {
+          for (const pp of (ppRows ?? []) as { id: string; license_name: string | null }[]) {
+            if (pp.license_name && pp.license_name.trim()) {
+              licenseNameByPharmId.set(pp.id, pp.license_name.trim());
+            }
+          }
+        }
+      }
+
       // 3) consultation별 마지막 메시지 + 안 읽은 카운트 집계
       const lastByCons = new Map<string, DbMessageRow>();
       const unreadByCons = new Map<string, number>();
@@ -241,7 +267,12 @@ function Content() {
         const isPatient = r.patient_id === user.id;
         const myRole: "patient" | "pharmacist" = isPatient ? "patient" : "pharmacist";
         const counterpart = isPatient ? r.pharmacist : r.patient;
-        const counterpartName = counterpart?.name ?? (isPatient ? "약사" : "환자");
+        // 환자가 보는 약사 이름은 license_name 우선, 없으면 profiles.name 폴백
+        const pharmLicense = isPatient && r.pharmacist_id
+          ? licenseNameByPharmId.get(r.pharmacist_id)
+          : undefined;
+        const counterpartName =
+          pharmLicense ?? counterpart?.name ?? (isPatient ? "약사" : "환자");
         const initial = counterpartName.trim().charAt(0) || "?";
 
         const symptoms = (r.questionnaire?.symptoms ?? [])

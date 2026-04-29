@@ -101,21 +101,34 @@ const modal: React.CSSProperties = { background: C.white, borderRadius: "20px 20
 function Content() {
   const router = useRouter();
   const showEmptyState = false;
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
 
   /* ── 프로필 ── */
   const [editMode, setEditMode] = useState(false);
-  const [pName, setPName] = useState(PROFILE.name);
-  const [pPharmacy, setPPharmacy] = useState(PROFILE.pharmacy);
-  const [pAddress, setPAddress] = useState(PROFILE.address);
-  const [saved, setSaved] = useState({ name: PROFILE.name, pharmacy: PROFILE.pharmacy, address: PROFILE.address });
+  // 초기값은 빈 문자열 — DB 로드 전 더미 이름("김서연") 깜빡임 방지
+  const [pName, setPName] = useState("");
+  const [pPharmacy, setPPharmacy] = useState("");
+  const [pAddress, setPAddress] = useState("");
+  const [saved, setSaved] = useState({ name: "", pharmacy: "", address: "" });
 
-  /* ── DB 상태 ── */
-  const [profileLoaded, setProfileLoaded] = useState(false);
+  /* ── DB 상태 ──
+   * profileLoaded 를 boolean state 로 두면, useAuth.user 가 null→object 로 바뀌는
+   * 한 프레임 동안 stale=true 가 남아 안내 깜빡임 발생.
+   * → uid 기준 derived 로 변환: user 가 바뀌는 즉시 false 가 되어 stale 상태 원천 차단.
+   */
+  const [loadedForUid, setLoadedForUid] = useState<string | null>(null);
   const [hasPharmacistProfile, setHasPharmacistProfile] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
+  // license_name 이 DB 에 존재하면 "이름" 인풋을 잠금 (면허 인증 무결성 보호)
+  const [licenseNameLocked, setLicenseNameLocked] = useState(false);
 
-  /* DB 저장 헬퍼 — pharmacist_profiles UPSERT */
+  /* DB 저장 헬퍼 — pharmacist_profiles UPSERT
+   *
+   * SAFETY: license_name 은 가입 시 1회 입력 후 절대 수정 불가.
+   *   - 타입(PpUpsert)에 license_name 키 의도적으로 부재 → 누가 호출 시 license_name 넘기면 컴파일 에러.
+   *   - fields 인자 타입도 license_name 미포함.
+   *   - 변경이 필요하면 관리자가 Supabase 에서 직접 UPDATE.
+   */
   const persistPharmacistFields = async (fields: Partial<{
     pharmacy_name: string;
     address: string;
@@ -129,6 +142,7 @@ function Content() {
       address?: string;
       expert_specialties?: string[];
       available_specialties?: string[];
+      // license_name 은 의도적으로 제외 — 면허 인증 무결성 보호
     };
     const payload: PpUpsert = { id: user.id, ...fields };
     const { error } = await (supabase
@@ -165,10 +179,14 @@ function Content() {
   const saveEdit = async () => {
     if (savingProfile) return;
     setSavingProfile(true);
-    await Promise.all([
-      persistProfileName(pName),
+    // license_name 이 잠겨 있으면 profiles.name 도 건드리지 않음 (이름 변경 시도 차단)
+    const tasks: Promise<void>[] = [
       persistPharmacistFields({ pharmacy_name: pPharmacy, address: pAddress }),
-    ]);
+    ];
+    if (!licenseNameLocked) {
+      tasks.push(persistProfileName(pName));
+    }
+    await Promise.all(tasks);
     setSaved({ name: pName, pharmacy: pPharmacy, address: pAddress });
     setEditMode(false);
     setSavingProfile(false);
@@ -224,12 +242,20 @@ function Content() {
     persistPharmacistFields({ available_specialties: Array.from(next) });
   };
 
-  /* ── DB 로드 ── */
+  /* derived profileLoaded — render 시점에 즉시 평가 (stale boolean state 미사용)
+   *  - 인증 부트스트랩 중(authLoading=true): false → 스켈레톤
+   *  - 비로그인(user 없음): true → 안내 게이트의 user 체크가 차단
+   *  - 로그인 + 현재 user.id 의 데이터 로드 완료: true
+   *  - 로그인 + 미로드: false → 스켈레톤
+   */
+  const profileLoaded = !authLoading && (!user || loadedForUid === user.id);
+
+  /* ── DB 로드 ──
+   * 로드 완료 표시는 setLoadedForUid(user.id) 로 — derived profileLoaded 가
+   * 즉시 true 로 바뀜. user 가 바뀌면 자동으로 다시 false (uid 미일치).
+   */
   useEffect(() => {
-    if (!user) {
-      setProfileLoaded(true);
-      return;
-    }
+    if (!user) return; // 비로그인 — derived 가 자동으로 적절한 값 (아래 참조)
     (async () => {
       const [profileRes, ppRes] = await Promise.all([
         supabase
@@ -239,19 +265,25 @@ function Content() {
           .maybeSingle<{ name: string }>(),
         supabase
           .from("pharmacist_profiles")
-          .select("pharmacy_name, address, expert_specialties, available_specialties")
+          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name")
           .eq("id", user.id)
           .maybeSingle<{
             pharmacy_name: string | null;
             address: string | null;
             expert_specialties: string[] | null;
             available_specialties: string[] | null;
+            license_name: string | null;
           }>(),
       ]);
 
-      const profileName = profileRes.data?.name ?? PROFILE.name;
+      // 더미 폴백 제거 — 실제 데이터 없으면 빈 문자열
+      const profileName = profileRes.data?.name?.trim() ?? "";
       const pp = ppRes.data;
-      setPName(profileName);
+      // 표시 이름 우선순위: pharmacist_profiles.license_name → profiles.name → mock fallback
+      const licenseName = pp?.license_name?.trim() || null;
+      const displayName = licenseName || profileName;
+      setPName(displayName);
+      setLicenseNameLocked(!!licenseName); // license_name 존재 시 인풋 잠금
       if (pp) {
         setHasPharmacistProfile(true);
         if (pp.pharmacy_name) setPPharmacy(pp.pharmacy_name);
@@ -259,18 +291,18 @@ function Content() {
         if (Array.isArray(pp.expert_specialties)) setExpert(new Set(pp.expert_specialties));
         if (Array.isArray(pp.available_specialties)) setAvailable(new Set(pp.available_specialties));
         setSaved({
-          name: profileName,
-          pharmacy: pp.pharmacy_name ?? PROFILE.pharmacy,
-          address: pp.address ?? PROFILE.address,
+          name: displayName,
+          pharmacy: pp.pharmacy_name ?? "",
+          address: pp.address ?? "",
         });
       } else {
         setSaved({
-          name: profileName,
-          pharmacy: PROFILE.pharmacy,
-          address: PROFILE.address,
+          name: displayName,
+          pharmacy: "",
+          address: "",
         });
       }
-      setProfileLoaded(true);
+      setLoadedForUid(user.id);
       console.log("[ph-mypage] profile loaded — has pharmacist_profile:", !!pp);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -384,15 +416,42 @@ function Content() {
 
           {/* ── 2. 프로필 ── */}
           <div style={card}>
+            <style>{`@keyframes pm-skel { 0%{background-position:200% 0} 100%{background-position:-200% 0} }`}</style>
             <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 16 }}>
               <div style={{ width: 80, height: 80, borderRadius: "50%", background: C.sagePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, fontWeight: 700, color: C.sageDeep, flexShrink: 0 }}>
-                {saved.name.charAt(0)}
+                {/* 로드 전에는 빈 원, 로드 후 첫 글자. saved.name 이 빈 문자열이면 자연스럽게 빈 원 유지 */}
+                {profileLoaded && saved.name ? saved.name.charAt(0) : ""}
               </div>
               <div style={{ flex: 1 }}>
-                {!editMode ? (
+                {!profileLoaded ? (
+                  // 스켈레톤 — 이름/약국/면허번호/가입일 자리 (깜빡임 방지)
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {[
+                      { w: 140, h: 22 },
+                      { w: 110, h: 16 },
+                      { w: 130, h: 14 },
+                      { w: 100, h: 13 },
+                    ].map((s, i) => (
+                      <div
+                        key={i}
+                        aria-hidden="true"
+                        style={{
+                          width: s.w,
+                          height: s.h,
+                          borderRadius: 6,
+                          background: "linear-gradient(90deg, #F4F6F3 0%, #ECEFEB 50%, #F4F6F3 100%)",
+                          backgroundSize: "200% 100%",
+                          animation: "pm-skel 1.4s ease-in-out infinite",
+                        }}
+                      />
+                    ))}
+                  </div>
+                ) : !editMode ? (
                   <>
-                    <div style={{ fontSize: 20, fontWeight: 800, color: C.sageDeep, fontFamily: "'Gothic A1', sans-serif", marginBottom: 2 }}>{saved.name} 약사</div>
-                    <div style={{ fontSize: 15, color: C.textMid, marginBottom: 2 }}>{saved.pharmacy}</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: C.sageDeep, fontFamily: "'Gothic A1', sans-serif", marginBottom: 2 }}>
+                      {saved.name ? `${saved.name} 약사` : "약사"}
+                    </div>
+                    <div style={{ fontSize: 15, color: C.textMid, marginBottom: 2 }}>{saved.pharmacy || "약국명 미등록"}</div>
                     <div style={{ fontSize: 14, color: C.textMid }}>면허번호 {PROFILE.license}</div>
                     <div style={{ fontSize: 13, color: C.sageMid, marginTop: 4 }}>가입일 {PROFILE.joinDate}</div>
                   </>
@@ -403,7 +462,17 @@ function Content() {
             </div>
             {editMode ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                <Field label="이름" value={pName} onChange={setPName} />
+                <Field
+                  label="이름"
+                  value={pName}
+                  onChange={setPName}
+                  disabled={licenseNameLocked}
+                  helpText={
+                    licenseNameLocked
+                      ? "면허증 이름은 가입 후 수정할 수 없습니다. 변경이 필요하시면 고객센터로 문의해주세요"
+                      : undefined
+                  }
+                />
                 <Field label="약국명" value={pPharmacy} onChange={setPPharmacy} />
                 <Field label="약국 주소" value={pAddress} onChange={setPAddress} />
                 <div style={{ fontSize: 14, color: C.textMid, padding: "10px 14px", background: C.sagePale, borderRadius: 8 }}>면허번호: {PROFILE.license}</div>
@@ -861,11 +930,34 @@ function Toggle({ checked, onChange, size }: { checked: boolean; onChange: () =>
   );
 }
 
-function Field({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
+function Field({
+  label, value, onChange, placeholder, disabled, helpText,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  helpText?: string;
+}) {
+  const disabledStyle: React.CSSProperties = disabled
+    ? { ...inp, background: "#F0F0F0", color: "#7A8A80", cursor: "not-allowed" }
+    : inp;
   return (
     <div>
       <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 4 }}>{label}</label>
-      <input style={inp} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />
+      <input
+        style={disabledStyle}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        disabled={disabled}
+      />
+      {helpText && (
+        <div style={{ fontSize: 14, color: C.textMid, marginTop: 6, lineHeight: 1.5 }}>
+          {helpText}
+        </div>
+      )}
     </div>
   );
 }

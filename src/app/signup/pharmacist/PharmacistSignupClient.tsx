@@ -2,12 +2,20 @@
 
 import { useState, useRef, useEffect, useCallback, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
 
 /* ══════════════════════════════════════════
    상수
    ══════════════════════════════════════════ */
 
 const TOTAL_STEPS = 5;
+
+/* TEMP-MOCK-OTP — NICE/KCB 본인인증 연동 시 아래 4줄 + sendOTP/verifyOTP 내 sessionStorage 로직 + 노란 안내 박스 모두 제거 */
+const MOCK_OTP = "1234";
+const OTP_STORAGE_KEY = "yaksa_mock_otp";
+const OTP_TIMESTAMP_KEY = "yaksa_mock_otp_ts";
+const OTP_EXPIRY_MS = 3 * 60 * 1000;
 
 const SPECIALTIES = [
   "만성피로", "소화장애", "불면", "비염", "두통",
@@ -21,6 +29,8 @@ const C = {
   terra: "#C06B45",
   textDark: "#2C3630", textMid: "#3D4A42",
   border: "rgba(94, 125, 108, 0.14)", white: "#fff",
+  // 진짜 에러용 빨강 (terra 와 구분)
+  errorRed: "#D02F2F",
 };
 
 /* ══════════════════════════════════════════
@@ -29,12 +39,15 @@ const C = {
 
 function PharmacistSignupContent() {
   const router = useRouter();
+  const { user } = useAuth();
   const [step, setStep] = useState(1);
+  const [submitting, setSubmitting] = useState(false);
 
   /* ── Step 1: 본인 인증 ── */
   const [phone, setPhone] = useState("");
   const [otpSent, setOtpSent] = useState(false);
-  const [otp, setOtp] = useState(["", "", "", ""]);
+  const [otp, setOtp] = useState(["", "", "", ""]); // 4자리
+  const [otpError, setOtpError] = useState("");
   const [timer, setTimer] = useState(0);
   const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -45,6 +58,7 @@ function PharmacistSignupContent() {
 
   /* ── Step 3: 면허 인증 ── */
   const [license, setLicense] = useState("");
+  const [licenseName, setLicenseName] = useState("");
 
   /* ── Step 4: 약국 정보 ── */
   const [pharmacyName, setPharmacyName] = useState("");
@@ -80,11 +94,20 @@ function PharmacistSignupContent() {
     return d;
   };
   const phoneDigits = phone.replace(/-/g, "");
+  // 010 + 8자리 = 11자리 정확히 일치할 때만 유효
+  const phoneValid = phoneDigits.length === 11 && phoneDigits.startsWith("010");
 
+  /* TEMP-MOCK-OTP — sendOTP: 실제 SMS 미발송, sessionStorage에 고정 코드 저장 */
   const sendOTP = () => {
-    if (phoneDigits.length < 10) return;
+    if (!phoneValid) return;
+    if (typeof window !== "undefined") {
+      sessionStorage.setItem(OTP_STORAGE_KEY, MOCK_OTP);
+      sessionStorage.setItem(OTP_TIMESTAMP_KEY, String(Date.now()));
+    }
     setOtpSent(true);
     setTimer(180);
+    setOtp(["", "", "", ""]);
+    setOtpError("");
   };
 
   useEffect(() => {
@@ -92,10 +115,11 @@ function PharmacistSignupContent() {
   }, [otpSent]);
 
   const handleOtpChange = (i: number, v: string) => {
-    const digit = v.replace(/[^0-9]/g, "");
+    const digit = v.replace(/[^0-9]/g, "").slice(0, 1);
     const next = [...otp];
     next[i] = digit;
     setOtp(next);
+    if (otpError) setOtpError(""); // 입력 시 에러 자동 해제
     if (digit && i < 3) otpRefs.current[i + 1]?.focus();
   };
 
@@ -105,7 +129,42 @@ function PharmacistSignupContent() {
   };
 
   const otpFilled = otp.every((d) => d !== "");
-  const verifyOTP = () => { if (otpFilled) setStep(2); };
+  const enteredOtp = otp.join("");
+
+  /* TEMP-MOCK-OTP — verifyOTP: sessionStorage 값과 비교 + 만료/일치 검사 */
+  const verifyOTP = () => {
+    if (!otpFilled) return;
+    if (!/^[0-9]{4}$/.test(enteredOtp)) {
+      setOtpError("인증번호 4자리를 정확히 입력해주세요");
+      return;
+    }
+    if (typeof window !== "undefined") {
+      const storedOtp = sessionStorage.getItem(OTP_STORAGE_KEY);
+      const storedTs = sessionStorage.getItem(OTP_TIMESTAMP_KEY);
+      if (!storedOtp || !storedTs) {
+        setOtpError("인증번호를 먼저 받아주세요");
+        return;
+      }
+      const elapsedMs = Date.now() - Number(storedTs);
+      if (Number.isNaN(elapsedMs) || elapsedMs > OTP_EXPIRY_MS) {
+        setOtpError("인증번호가 만료되었습니다. 다시 받아주세요");
+        return;
+      }
+      if (enteredOtp !== storedOtp) {
+        setOtpError("인증번호가 일치하지 않습니다");
+        return;
+      }
+      // 인증 성공 — 재사용 방지를 위해 즉시 삭제
+      sessionStorage.removeItem(OTP_STORAGE_KEY);
+      sessionStorage.removeItem(OTP_TIMESTAMP_KEY);
+    }
+    setOtpError("");
+    setStep(2);
+  };
+
+  const otpExpired = otpSent && timer <= 0;
+  const otpReady = otpFilled && !otpExpired && /^[0-9]{4}$/.test(enteredOtp);
+
   const timerDisplay = `${String(Math.floor(timer / 60)).padStart(2, "0")}:${String(timer % 60).padStart(2, "0")}`;
 
   /* ═══ Biz number format ═══ */
@@ -117,8 +176,39 @@ function PharmacistSignupContent() {
   };
 
   /* ═══ Validity ═══ */
-  const step2Valid = name.trim() && birthDate;
-  const step3Valid = license.trim().length > 0;
+  // 완성형 한글 2~10자 (자음/모음 단독·영문·숫자·공백 모두 차단)
+  const KOREAN_NAME_RE = /^[가-힣]{2,10}$/;
+
+  // 이름 (Step 2)
+  const nameTrimmed = name.trim();
+  const nameValid = KOREAN_NAME_RE.test(nameTrimmed);
+  const showNameError = nameTrimmed.length > 0 && !nameValid;
+
+  // 생년월일 (Step 2) — YYYY-MM-DD 정확히 4-2-2 자리, 1940~2010 범위
+  const BIRTH_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const birthDateValid = (() => {
+    if (!birthDate) return false;
+    if (!BIRTH_DATE_RE.test(birthDate)) return false; // 6자리 년도 등 비표준 차단
+    const d = new Date(birthDate);
+    if (Number.isNaN(d.getTime())) return false;
+    const y = d.getFullYear();
+    return y >= 1940 && y <= 2010;
+  })();
+  const showBirthDateError = !!birthDate && !birthDateValid;
+
+  // 면허증 이름 (Step 3)
+  const licenseNameTrimmed = licenseName.trim();
+  const licenseNameValid = KOREAN_NAME_RE.test(licenseNameTrimmed);
+  const showLicenseNameError = licenseNameTrimmed.length > 0 && !licenseNameValid;
+
+  // 약사 면허번호 (Step 3) — 숫자 4~6자리
+  const LICENSE_NUMBER_RE = /^[0-9]{4,6}$/;
+  const licenseTrimmed = license.trim();
+  const licenseValid = LICENSE_NUMBER_RE.test(licenseTrimmed);
+  const showLicenseError = licenseTrimmed.length > 0 && !licenseValid;
+
+  const step2Valid = nameValid && birthDateValid;
+  const step3Valid = licenseValid && licenseNameValid;
   const step4Valid = pharmacyName.trim() && pharmacyAddr.trim() && bizNumber.replace(/[^0-9]/g, "").length === 10;
   const step5Valid = specialties.size > 0 && specialties.size <= 3;
 
@@ -137,7 +227,72 @@ function PharmacistSignupContent() {
     else setStep((s) => s - 1);
   }, [step, router]);
 
-  const handleComplete = () => setDone(true);
+  const handleComplete = async () => {
+    if (submitting) return;
+
+    // 면허증 이름 최종 검증 — disabled로 막혀 있더라도 안전망
+    if (!licenseNameValid) {
+      setStep(3);
+      return;
+    }
+
+    if (!user) {
+      // 인증 컨텍스트가 없는 경우(로그인 안 된 상태) — DB 저장 생략하고 완료 화면만 노출
+      setDone(true);
+      return;
+    }
+
+    setSubmitting(true);
+
+    // pharmacist_profiles upsert (license_name 포함, onConflict=id)
+    type PpUpsert = {
+      id: string;
+      pharmacy_name: string;
+      address: string;
+      license_number: string | null;
+      license_name: string;
+      business_number: string | null;
+      expert_specialties?: string[];
+    };
+    const ppPayload: PpUpsert = {
+      id: user.id,
+      pharmacy_name: pharmacyName.trim(),
+      address: pharmacyAddr.trim(),
+      license_number: license.trim() || null,
+      license_name: licenseNameTrimmed,
+      business_number: bizNumber || null,
+      expert_specialties: Array.from(specialties),
+    };
+    const ppRes = await (supabase
+      .from("pharmacist_profiles") as unknown as {
+        upsert: (
+          p: PpUpsert,
+          opts?: { onConflict?: string },
+        ) => Promise<{ error: { message: string; code?: string } | null }>;
+      })
+      .upsert(ppPayload, { onConflict: "id" });
+    if (ppRes.error) {
+      console.error("[ph-signup] pharmacist_profiles upsert failed:", ppRes.error);
+    } else {
+      console.log("[ph-signup] pharmacist_profiles saved with license_name:", licenseNameTrimmed);
+    }
+
+    // profiles.name = license_name (환자에게 보여지는 약사 이름)
+    const nameRes = await (supabase
+      .from("profiles") as unknown as {
+        update: (p: { name: string }) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update({ name: licenseNameTrimmed })
+      .eq("id", user.id);
+    if (nameRes.error) {
+      console.error("[ph-signup] profiles.name update failed:", nameRes.error);
+    }
+
+    setSubmitting(false);
+    setDone(true);
+  };
 
   /* ═══ Enter key ═══ */
   useEffect(() => {
@@ -146,8 +301,8 @@ function PharmacistSignupContent() {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "TEXTAREA") return;
       if (done) return;
-      if (step === 1 && !otpSent && phoneDigits.length >= 10) { e.preventDefault(); sendOTP(); }
-      else if (step === 1 && otpSent && otpFilled) { e.preventDefault(); verifyOTP(); }
+      if (step === 1 && !otpSent && phoneValid) { e.preventDefault(); sendOTP(); }
+      else if (step === 1 && otpSent && otpReady) { e.preventDefault(); verifyOTP(); }
       else if (step === 2 && step2Valid) { e.preventDefault(); setStep(3); }
       else if (step === 3 && step3Valid) { e.preventDefault(); setStep(4); }
       else if (step === 4 && step4Valid) { e.preventDefault(); setStep(5); }
@@ -177,7 +332,7 @@ function PharmacistSignupContent() {
                 </div>
 
                 <h1 className="step-title" style={{ textAlign: "center" }}>
-                  {name || "약사"}님, 환영합니다!
+                  {(licenseNameTrimmed || name || "약사")}님, 환영합니다!
                 </h1>
                 <div className="success-text">
                   약사톡과 함께 환자의 건강을 개선해주세요.
@@ -250,7 +405,7 @@ function PharmacistSignupContent() {
                   />
                   <button
                     className={`btn-send-otp${otpSent ? " sent" : ""}`}
-                    disabled={phoneDigits.length < 10}
+                    disabled={!phoneValid}
                     onClick={sendOTP}
                   >
                     {otpSent ? "재전송" : "인증번호 받기"}
@@ -259,30 +414,65 @@ function PharmacistSignupContent() {
               </div>
 
               {otpSent && (
-                <div className="input-group">
-                  <label className="input-label">인증번호 4자리</label>
-                  <div className="otp-row">
-                    {otp.map((digit, i) => (
-                      <input
-                        key={i}
-                        ref={(el) => { otpRefs.current[i] = el; }}
-                        type="tel"
-                        maxLength={1}
-                        value={digit}
-                        onChange={(e) => handleOtpChange(i, e.target.value)}
-                        onKeyDown={(e) => handleOtpKeyDown(i, e)}
-                        className={`otp-input${digit ? " filled" : ""}`}
-                      />
-                    ))}
+                <>
+                  {/* TEMP-MOCK-OTP — 노란 안내 박스 (NICE/KCB 연동 시 제거) */}
+                  <div
+                    role="alert"
+                    style={{
+                      padding: "12px 14px",
+                      borderRadius: 10,
+                      background: "#FFF8E1",
+                      border: "1px solid #F5DCA0",
+                      color: "#7A5300",
+                      fontSize: 14,
+                      lineHeight: 1.5,
+                      marginBottom: 16,
+                    }}
+                  >
+                    <strong style={{ fontWeight: 700 }}>[테스트 환경]</strong>{" "}
+                    인증번호 <strong style={{ fontWeight: 700, fontSize: 15 }}>{MOCK_OTP}</strong> 을 입력하세요. 실제 SMS는 발송되지 않습니다.
                   </div>
-                  <div className="otp-timer">{timer > 0 ? timerDisplay : "시간 초과"}</div>
-                  <div className="otp-resend">
-                    인증번호가 안 왔나요? <button onClick={sendOTP}>다시 받기</button>
+
+                  <div className="input-group">
+                    <label className="input-label">인증번호 4자리</label>
+                    <div className="otp-row">
+                      {otp.map((digit, i) => (
+                        <input
+                          key={i}
+                          ref={(el) => { otpRefs.current[i] = el; }}
+                          type="tel"
+                          inputMode="numeric"
+                          maxLength={1}
+                          value={digit}
+                          onChange={(e) => handleOtpChange(i, e.target.value)}
+                          onKeyDown={(e) => handleOtpKeyDown(i, e)}
+                          className={`otp-input${digit ? " filled" : ""}`}
+                        />
+                      ))}
+                    </div>
+                    <div className="otp-timer">{timer > 0 ? timerDisplay : "시간 초과"}</div>
+                    {otpError && (
+                      <div style={{ fontSize: 14, color: C.errorRed, marginTop: 6, lineHeight: 1.5 }}>
+                        {otpError}
+                      </div>
+                    )}
+                    {!otpError && otpExpired && (
+                      <div style={{ fontSize: 14, color: C.errorRed, marginTop: 6, lineHeight: 1.5 }}>
+                        인증번호가 만료되었습니다. 다시 받아주세요
+                      </div>
+                    )}
+                    <div className="otp-resend">
+                      인증번호가 안 왔나요? <button onClick={sendOTP}>다시 받기</button>
+                    </div>
                   </div>
-                </div>
+                </>
               )}
 
-              <button className="btn-next" disabled={!otpFilled} onClick={verifyOTP}>
+              <button
+                className="btn-next"
+                disabled={!otpReady}
+                onClick={() => { if (otpReady) verifyOTP(); }}
+              >
                 인증 확인 <span className="arrow">→</span>
               </button>
 
@@ -310,9 +500,15 @@ function PharmacistSignupContent() {
                   type="text"
                   className="input-field"
                   placeholder="홍길동"
+                  maxLength={10}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                 />
+                {showNameError && (
+                  <div style={{ fontSize: 14, color: C.errorRed, marginTop: 6, lineHeight: 1.5 }}>
+                    한글 2~10자로 입력해주세요
+                  </div>
+                )}
               </div>
 
               <div className="input-group">
@@ -320,13 +516,24 @@ function PharmacistSignupContent() {
                 <input
                   type="date"
                   className="input-field"
+                  min="1940-01-01"
+                  max="2010-12-31"
                   value={birthDate}
                   onChange={(e) => setBirthDate(e.target.value)}
                   style={{ colorScheme: "light" }}
                 />
+                {showBirthDateError && (
+                  <div style={{ fontSize: 14, color: C.errorRed, marginTop: 6, lineHeight: 1.5 }}>
+                    올바른 생년월일을 입력해주세요 (1940~2010년)
+                  </div>
+                )}
               </div>
 
-              <button className="btn-next" disabled={!step2Valid} onClick={() => setStep(3)}>
+              <button
+                className="btn-next"
+                disabled={!step2Valid}
+                onClick={() => { if (step2Valid) setStep(3); }}
+              >
                 다음 <span className="arrow">→</span>
               </button>
             </div>
@@ -345,14 +552,49 @@ function PharmacistSignupContent() {
               <p className="step-desc">약사 면허를 확인하여 인증합니다.</p>
 
               <div className="input-group">
+                <label className="input-label">면허증에 등록된 이름</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="예: 홍길동"
+                  maxLength={10}
+                  value={licenseName}
+                  onChange={(e) => setLicenseName(e.target.value)}
+                />
+                {showLicenseNameError ? (
+                  <div style={{ fontSize: 14, color: C.errorRed, marginTop: 6, lineHeight: 1.5 }}>
+                    한글 2~10자로 입력해주세요
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 14, color: C.textMid, marginTop: 6, lineHeight: 1.5 }}>
+                    면허증 사본에 적힌 이름과 똑같이 입력해주세요. 환자에게 보여지는 약사 이름이 됩니다.
+                  </div>
+                )}
+              </div>
+
+              <div className="input-group">
                 <label className="input-label">약사 면허번호</label>
                 <input
                   type="text"
                   className="input-field"
-                  placeholder="예: 제 12345호"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  placeholder="예: 12345"
+                  maxLength={6}
                   value={license}
-                  onChange={(e) => setLicense(e.target.value)}
+                  onChange={(e) =>
+                    setLicense(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))
+                  }
                 />
+                {showLicenseError ? (
+                  <div style={{ fontSize: 14, color: C.errorRed, marginTop: 6, lineHeight: 1.5 }}>
+                    면허번호는 숫자 4~6자리로 입력해주세요
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 14, color: C.textMid, marginTop: 6, lineHeight: 1.5 }}>
+                    약사 면허증에 적힌 면허번호를 입력해주세요
+                  </div>
+                )}
               </div>
 
               <div style={{
@@ -360,10 +602,14 @@ function PharmacistSignupContent() {
                 background: C.sagePale, fontSize: 14,
                 color: C.textMid, lineHeight: 1.6, marginBottom: 20,
               }}>
-                면허 인증��� 가입 후 관리자 확인 절차를 거칩니다. 허위 정보 입력 시 서비스 이용이 제한될 수 있어요.
+                면허 인증은 가입 후 관리자 확인 절차를 거칩니다. 허위 정보 입력 시 서비스 이용이 제한될 수 있어요.
               </div>
 
-              <button className="btn-next" disabled={!step3Valid} onClick={() => setStep(4)}>
+              <button
+                className="btn-next"
+                disabled={!step3Valid}
+                onClick={() => { if (step3Valid) setStep(4); }}
+              >
                 다음 <span className="arrow">→</span>
               </button>
             </div>
@@ -476,8 +722,12 @@ function PharmacistSignupContent() {
                 상담 가능 분야는 가입 후 내 정보에서 추가할 수 있어요
               </div>
 
-              <button className="btn-next" disabled={!step5Valid} onClick={handleComplete}>
-                가입 완료 <span className="arrow">→</span>
+              <button
+                className="btn-next"
+                disabled={!step5Valid || submitting}
+                onClick={handleComplete}
+              >
+                {submitting ? "저장 중..." : "가입 완료"} <span className="arrow">→</span>
               </button>
             </div>
           )}

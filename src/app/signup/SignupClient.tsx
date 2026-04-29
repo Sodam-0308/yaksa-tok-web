@@ -10,6 +10,13 @@ const AGE_GROUPS = ["10대", "20대", "30대", "40대", "50대", "60대+"];
 
 type Mode = "select" | "phone" | "social";
 
+/* TEMP-MOCK-OTP — NICE/KCB 본인인증 연동 시 아래 4줄 + sendOTP/verifyOTP 내 sessionStorage 로직 + 노란 안내 박스 모두 제거 */
+const MOCK_OTP = "1234";
+const OTP_STORAGE_KEY = "yaksa_mock_otp";
+const OTP_TIMESTAMP_KEY = "yaksa_mock_otp_ts";
+const OTP_EXPIRY_MS = 3 * 60 * 1000;
+const ERROR_RED = "#D02F2F";
+
 /* ══════════════════════════════════════════
    SVG 아이콘
    ══════════════════════════════════════════ */
@@ -100,6 +107,7 @@ function SignupContent() {
   const [phone, setPhone] = useState("");
   const [otpSent, setOtpSent] = useState(false);
   const [otp, setOtp] = useState(["", "", "", ""]);
+  const [otpError, setOtpError] = useState("");
   const [timer, setTimer] = useState(0);
   const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -134,11 +142,20 @@ function SignupContent() {
   };
 
   const phoneDigits = phone.replace(/-/g, "");
+  // 010 + 8자리 = 11자리 정확히 일치할 때만 유효 (약사 가입과 동일)
+  const phoneValid = phoneDigits.length === 11 && phoneDigits.startsWith("010");
 
+  /* TEMP-MOCK-OTP — sendOTP: 실제 SMS 미발송, sessionStorage에 고정 코드 저장 */
   const sendOTP = () => {
-    if (phoneDigits.length < 10) return;
+    if (!phoneValid) return;
+    if (typeof window !== "undefined") {
+      sessionStorage.setItem(OTP_STORAGE_KEY, MOCK_OTP);
+      sessionStorage.setItem(OTP_TIMESTAMP_KEY, String(Date.now()));
+    }
     setOtpSent(true);
     setTimer(180);
+    setOtp(["", "", "", ""]);
+    setOtpError("");
   };
 
   useEffect(() => {
@@ -148,10 +165,11 @@ function SignupContent() {
   }, [otpSent]);
 
   const handleOtpChange = (index: number, value: string) => {
-    const digit = value.replace(/[^0-9]/g, "");
+    const digit = value.replace(/[^0-9]/g, "").slice(0, 1);
     const newOtp = [...otp];
     newOtp[index] = digit;
     setOtp(newOtp);
+    if (otpError) setOtpError(""); // 입력 시 에러 자동 해제
     if (digit && index < 3) {
       otpRefs.current[index + 1]?.focus();
     }
@@ -167,16 +185,46 @@ function SignupContent() {
   };
 
   const otpFilled = otp.every((d) => d !== "");
+  const enteredOtp = otp.join("");
 
+  /* TEMP-MOCK-OTP — verifyOTP: sessionStorage 값과 비교 + 만료/일치 검사 */
   const verifyOTP = () => {
     if (!otpFilled) return;
-    // Mock: 010-1234-5678 → 이미 가입된 번호
+    if (!/^[0-9]{4}$/.test(enteredOtp)) {
+      setOtpError("인증번호 4자리를 정확히 입력해주세요");
+      return;
+    }
+    if (typeof window !== "undefined") {
+      const storedOtp = sessionStorage.getItem(OTP_STORAGE_KEY);
+      const storedTs = sessionStorage.getItem(OTP_TIMESTAMP_KEY);
+      if (!storedOtp || !storedTs) {
+        setOtpError("인증번호를 먼저 받아주세요");
+        return;
+      }
+      const elapsedMs = Date.now() - Number(storedTs);
+      if (Number.isNaN(elapsedMs) || elapsedMs > OTP_EXPIRY_MS) {
+        setOtpError("인증번호가 만료되었습니다. 다시 받아주세요");
+        return;
+      }
+      if (enteredOtp !== storedOtp) {
+        setOtpError("인증번호가 일치하지 않습니다");
+        return;
+      }
+      // 인증 성공 — 재사용 방지를 위해 즉시 삭제
+      sessionStorage.removeItem(OTP_STORAGE_KEY);
+      sessionStorage.removeItem(OTP_TIMESTAMP_KEY);
+    }
+    // Mock: 010-1234-5678 → 이미 가입된 번호 (기존 동작 보존)
     if (phoneDigits === "01012345678") {
       setShowDuplicatePopup(true);
       return;
     }
+    setOtpError("");
     setCurrentStep(2);
   };
+
+  const otpExpired = otpSent && timer <= 0;
+  const otpReady = otpFilled && !otpExpired && /^[0-9]{4}$/.test(enteredOtp);
 
   const step2Valid = name.trim() && gender && ageGroup;
 
@@ -258,10 +306,10 @@ function SignupContent() {
       if (showDuplicatePopup) return;
       if (mode === "phone") {
         if (currentStep === 1) {
-          if (!otpSent && phoneDigits.length >= 10) {
+          if (!otpSent && phoneValid) {
             e.preventDefault();
             sendOTP();
-          } else if (otpSent && otpFilled) {
+          } else if (otpSent && otpReady) {
             e.preventDefault();
             verifyOTP();
           }
@@ -472,7 +520,7 @@ function SignupContent() {
                         />
                         <button
                           className={`btn-send-otp${otpSent ? " sent" : ""}`}
-                          disabled={phoneDigits.length < 10}
+                          disabled={!phoneValid}
                           onClick={sendOTP}
                         >
                           {otpSent ? "재전송" : "인증번호 받기"}
@@ -481,36 +529,67 @@ function SignupContent() {
                     </div>
 
                     {otpSent && (
-                      <div className="input-group">
-                        <label className="input-label">인증번호 4자리</label>
-                        <div className="otp-row">
-                          {otp.map((digit, i) => (
-                            <input
-                              key={i}
-                              ref={(el) => { otpRefs.current[i] = el; }}
-                              type="tel"
-                              maxLength={1}
-                              value={digit}
-                              onChange={(e) => handleOtpChange(i, e.target.value)}
-                              onKeyDown={(e) => handleOtpKeyDown(i, e)}
-                              className={`otp-input${digit ? " filled" : ""}`}
-                            />
-                          ))}
+                      <>
+                        {/* TEMP-MOCK-OTP — 노란 안내 박스 (NICE/KCB 연동 시 제거) */}
+                        <div
+                          role="alert"
+                          style={{
+                            padding: "12px 14px",
+                            borderRadius: 10,
+                            background: "#FFF8E1",
+                            border: "1px solid #F5DCA0",
+                            color: "#7A5300",
+                            fontSize: 14,
+                            lineHeight: 1.5,
+                            marginBottom: 16,
+                          }}
+                        >
+                          <strong style={{ fontWeight: 700 }}>[테스트 환경]</strong>{" "}
+                          인증번호 <strong style={{ fontWeight: 700, fontSize: 15 }}>{MOCK_OTP}</strong> 을 입력하세요. 실제 SMS는 발송되지 않습니다.
                         </div>
-                        <div className="otp-timer">
-                          {timer > 0 ? timerDisplay : "시간 초과"}
+
+                        <div className="input-group">
+                          <label className="input-label">인증번호 4자리</label>
+                          <div className="otp-row">
+                            {otp.map((digit, i) => (
+                              <input
+                                key={i}
+                                ref={(el) => { otpRefs.current[i] = el; }}
+                                type="tel"
+                                inputMode="numeric"
+                                maxLength={1}
+                                value={digit}
+                                onChange={(e) => handleOtpChange(i, e.target.value)}
+                                onKeyDown={(e) => handleOtpKeyDown(i, e)}
+                                className={`otp-input${digit ? " filled" : ""}`}
+                              />
+                            ))}
+                          </div>
+                          <div className="otp-timer">
+                            {timer > 0 ? timerDisplay : "시간 초과"}
+                          </div>
+                          {otpError && (
+                            <div style={{ fontSize: 14, color: ERROR_RED, marginTop: 6, lineHeight: 1.5 }}>
+                              {otpError}
+                            </div>
+                          )}
+                          {!otpError && otpExpired && (
+                            <div style={{ fontSize: 14, color: ERROR_RED, marginTop: 6, lineHeight: 1.5 }}>
+                              인증번호가 만료되었습니다. 다시 받아주세요
+                            </div>
+                          )}
+                          <div className="otp-resend">
+                            인증번호가 안 왔나요?{" "}
+                            <button onClick={sendOTP}>다시 받기</button>
+                          </div>
                         </div>
-                        <div className="otp-resend">
-                          인증번호가 안 왔나요?{" "}
-                          <button onClick={sendOTP}>다시 받기</button>
-                        </div>
-                      </div>
+                      </>
                     )}
 
                     <button
                       className="btn-next"
-                      disabled={!otpFilled}
-                      onClick={verifyOTP}
+                      disabled={!otpReady}
+                      onClick={() => { if (otpReady) verifyOTP(); }}
                     >
                       인증 확인 <span className="arrow">→</span>
                     </button>

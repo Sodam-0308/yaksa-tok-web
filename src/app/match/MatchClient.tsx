@@ -123,6 +123,7 @@ function MatchContent() {
     total_consultations: number | null;
     avg_response_minutes: number | null;
     is_active: boolean | null;
+    license_name: string | null;
     profile: { id: string; name: string; avatar_url: string | null; role: string } | null;
   }
   const [dbPharms, setDbPharms] = useState<PharmacistData[] | null>(null);
@@ -141,7 +142,7 @@ function MatchContent() {
         .select(
           `
           id, pharmacy_name, address, expert_specialties, available_specialties,
-          total_consultations, avg_response_minutes, is_active,
+          total_consultations, avg_response_minutes, is_active, license_name,
           profile:profiles!pharmacist_profiles_id_fkey(id, name, avatar_url, role)
         `,
         )
@@ -188,9 +189,14 @@ function MatchContent() {
           const location = addrParts.length >= 2
             ? `${addrParts[0].replace(/(특별시|광역시|특별자치시|특별자치도)$/, "")} ${addrParts[1].replace(/(시|군|구)$/, "")}`
             : (r.address ?? "");
+          // 표시 이름 우선순위: pharmacist_profiles.license_name → profiles.name → "약사"
+          const baseName =
+            (r.license_name && r.license_name.trim()) ||
+            (r.profile?.name && r.profile.name.trim()) ||
+            "";
           return {
             id: r.id,
-            name: r.profile?.name ? `${r.profile.name} 약사` : "약사",
+            name: baseName ? `${baseName} 약사` : "약사",
             avatar: "👩‍⚕️",
             pharmacyName: r.pharmacy_name ?? "",
             location,
