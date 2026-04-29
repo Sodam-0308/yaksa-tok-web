@@ -1814,35 +1814,137 @@ function DashboardContent() {
   const [dbActiveLoading, setDbActiveLoading] = useState(true);
   const [actingId, setActingId] = useState<string | null>(null);
 
-  const fetchPendingRequests = async () => {
+  const fetchPendingRequests = async (myUserId: string | null) => {
     setDbPendingLoading(true);
-    // pharmacist_id 가 아직 배정되지 않은(=NULL) pending 만 모든 약사에게 노출
-    const { data, error } = await supabase
-      .from("consultations")
-      .select(
-        `
-        id, created_at,
-        patient:profiles!consultations_patient_id_fkey(id, name, avatar_url),
-        questionnaire:ai_questionnaires(symptoms, free_text),
-        patient_profile:patient_profiles!consultations_patient_id_fkey(birth_year, gender)
-      `,
-      )
-      .eq("status", "pending")
-      .is("pharmacist_id", null)
-      .order("created_at", { ascending: false });
+    console.log("[dashboard] fetchPendingRequests — myUserId:", myUserId);
 
-    if (error) {
-      console.error("[dashboard] pending list failed:", error);
+    // 1) consultations 만 단순 SELECT — 임베드(JOIN) 없이 가져와 400 회피
+    const unassignedQuery = supabase
+      .from("consultations")
+      .select("*")
+      .eq("status", "pending")
+      .is("pharmacist_id", null);
+
+    const myQuery = myUserId
+      ? supabase
+          .from("consultations")
+          .select("*")
+          .eq("status", "pending")
+          .eq("pharmacist_id", myUserId)
+      : Promise.resolve({ data: [] as unknown[], error: null });
+
+    const [unRes, myRes] = await Promise.all([unassignedQuery, myQuery]);
+
+    console.log("[dashboard] unassigned query result:", unRes);
+    console.log("[dashboard] mine query result:", myRes);
+
+    if (unRes.error) {
+      console.error("[dashboard] pending unassigned query FAILED:", {
+        message: unRes.error.message,
+        code: unRes.error.code,
+        details: unRes.error.details,
+        hint: unRes.error.hint,
+      });
+    }
+    if (myRes && "error" in myRes && myRes.error) {
+      console.error("[dashboard] pending mine query FAILED:", {
+        message: myRes.error.message,
+        code: (myRes.error as { code?: string }).code,
+        details: (myRes.error as { details?: string }).details,
+        hint: (myRes.error as { hint?: string }).hint,
+      });
+    }
+
+    interface ConsRow {
+      id: string;
+      status: string;
+      pharmacist_id: string | null;
+      patient_id: string;
+      questionnaire_id: string | null;
+      created_at: string;
+    }
+    const unRows = ((unRes.data ?? []) as unknown) as ConsRow[];
+    const myRows =
+      myRes && "data" in myRes ? ((myRes.data ?? []) as unknown as ConsRow[]) : [];
+
+    // id 기준 중복 제거
+    const byId = new Map<string, ConsRow>();
+    for (const r of [...unRows, ...myRows]) byId.set(r.id, r);
+    const consultations = Array.from(byId.values()).sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
+
+    console.log("[dashboard] consultations merged:", consultations.length);
+
+    if (consultations.length === 0) {
       setDbPendingList([]);
       setDbPendingCount(0);
       setDbPendingLoading(false);
       return;
     }
-    const rows = (data ?? []) as unknown as DbPendingRow[];
+
+    // 2) 각 consultation의 patient/questionnaire/patient_profile 을 IN 쿼리로 일괄 조회
+    const patientIds = Array.from(new Set(consultations.map((c) => c.patient_id)));
+    const questionnaireIds = consultations
+      .map((c) => c.questionnaire_id)
+      .filter((v): v is string => !!v);
+
+    const [profilesRes, qRes, patientProfRes] = await Promise.all([
+      patientIds.length > 0
+        ? supabase
+            .from("profiles")
+            .select("id, name, avatar_url")
+            .in("id", patientIds)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+      questionnaireIds.length > 0
+        ? supabase
+            .from("ai_questionnaires")
+            .select("id, symptoms, free_text")
+            .in("id", questionnaireIds)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+      patientIds.length > 0
+        ? supabase
+            .from("patient_profiles")
+            .select("id, birth_year, gender")
+            .in("id", patientIds)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+    ]);
+
+    if ("error" in profilesRes && profilesRes.error) {
+      console.error("[dashboard] profiles fetch FAILED:", profilesRes.error);
+    }
+    if ("error" in qRes && qRes.error) {
+      console.error("[dashboard] ai_questionnaires fetch FAILED:", qRes.error);
+    }
+    if ("error" in patientProfRes && patientProfRes.error) {
+      console.error("[dashboard] patient_profiles fetch FAILED:", patientProfRes.error);
+    }
+
+    const profileById = new Map<string, { id: string; name: string; avatar_url: string | null }>();
+    for (const p of (profilesRes.data ?? []) as { id: string; name: string; avatar_url: string | null }[]) {
+      profileById.set(p.id, p);
+    }
+    const qById = new Map<string, { id: string; symptoms: string[] | null; free_text: string | null }>();
+    for (const q of (qRes.data ?? []) as { id: string; symptoms: string[] | null; free_text: string | null }[]) {
+      qById.set(q.id, q);
+    }
+    const patientProfById = new Map<string, { id: string; birth_year: number | null; gender: string | null }>();
+    for (const pp of (patientProfRes.data ?? []) as { id: string; birth_year: number | null; gender: string | null }[]) {
+      patientProfById.set(pp.id, pp);
+    }
+
+    const rows: DbPendingRow[] = consultations.map((c) => ({
+      id: c.id,
+      created_at: c.created_at,
+      patient: profileById.get(c.patient_id) ?? null,
+      questionnaire: c.questionnaire_id ? qById.get(c.questionnaire_id) ?? null : null,
+      patient_profile: patientProfById.get(c.patient_id) ?? null,
+    }));
+
+    console.log("[dashboard] pending list final:", rows);
     setDbPendingList(rows);
     setDbPendingCount(rows.length);
     setDbPendingLoading(false);
-    console.log("[dashboard] pending (unassigned) consultations loaded:", rows.length);
   };
 
   const fetchActiveConsultations = async (pharmacistId: string) => {
@@ -1874,9 +1976,9 @@ function DashboardContent() {
   };
 
   useEffect(() => {
-    fetchPendingRequests();
+    fetchPendingRequests(authUser?.id ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [authUser]);
 
   useEffect(() => {
     if (!authUser) {

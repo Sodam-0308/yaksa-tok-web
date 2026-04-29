@@ -113,6 +113,108 @@ function MatchContent() {
   const [requestingNames, setRequestingNames] = useState<Set<string>>(new Set());
   const [requestToast, setRequestToast] = useState<string | null>(null);
 
+  /* ── DB 약사 로드 (있으면 DB, 없으면 Mock 폴백) ── */
+  interface DbPharmRow {
+    id: string;
+    pharmacy_name: string | null;
+    address: string | null;
+    expert_specialties: string[] | null;
+    available_specialties: string[] | null;
+    total_consultations: number | null;
+    avg_response_minutes: number | null;
+    is_active: boolean | null;
+    profile: { id: string; name: string; avatar_url: string | null; role: string } | null;
+  }
+  const [dbPharms, setDbPharms] = useState<PharmacistData[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // 사용자가 선택한 증상(URL ?symptom=) 추출
+    const targetSymptoms = (() => {
+      const s = searchParams.get("symptom");
+      return s ? s.split(",").map((v) => v.trim()).filter(Boolean) : [];
+    })();
+
+    (async () => {
+      const { data, error } = await supabase
+        .from("pharmacist_profiles")
+        .select(
+          `
+          id, pharmacy_name, address, expert_specialties, available_specialties,
+          total_consultations, avg_response_minutes, is_active,
+          profile:profiles!pharmacist_profiles_id_fkey(id, name, avatar_url, role)
+        `,
+        )
+        .eq("is_active", true);
+      if (cancelled) return;
+      if (error) {
+        console.error("[match] pharmacist_profiles load failed:", error);
+        setDbPharms([]);
+        return;
+      }
+      const rows = (data ?? []) as unknown as DbPharmRow[];
+      const list: PharmacistData[] = rows
+        .filter((r) => r.profile && r.profile.role === "pharmacist")
+        .map((r) => {
+          const expert = r.expert_specialties ?? [];
+          const available = r.available_specialties ?? [];
+          const matchedExpert = targetSymptoms.filter((s) =>
+            expert.some((e) => e.includes(s) || s.includes(e)),
+          );
+          const matchedAvail = targetSymptoms.filter((s) =>
+            available.some((a) => a.includes(s) || s.includes(a)),
+          );
+          const matchLevel: 1 | 2 | 3 =
+            matchedExpert.length > 0 ? 3 : matchedAvail.length > 0 ? 2 : 1;
+          const specialtyTags: PharmacistData["specialties"] = [
+            ...expert.slice(0, 2).map((label) => ({
+              label: matchedExpert.some((m) => label.includes(m) || m.includes(label))
+                ? `${label} 전문`
+                : label,
+              variant: "match",
+              isMatch: matchedExpert.some((m) => label.includes(m) || m.includes(label)),
+            })),
+            ...available.slice(0, 1).map((label) => ({ label, variant: "s" as const })),
+          ];
+          const avgMin = r.avg_response_minutes;
+          const avgResponseTime =
+            avgMin == null
+              ? "—"
+              : avgMin < 60
+                ? `${avgMin}분`
+                : `${Math.round(avgMin / 60)}시간`;
+          // 주소에서 시·구 추출 (예: "서울특별시 강남구 ..." → "서울 강남")
+          const addrParts = (r.address ?? "").trim().split(/\s+/);
+          const location = addrParts.length >= 2
+            ? `${addrParts[0].replace(/(특별시|광역시|특별자치시|특별자치도)$/, "")} ${addrParts[1].replace(/(시|군|구)$/, "")}`
+            : (r.address ?? "");
+          return {
+            id: r.id,
+            name: r.profile?.name ? `${r.profile.name} 약사` : "약사",
+            avatar: "👩‍⚕️",
+            pharmacyName: r.pharmacy_name ?? "",
+            location,
+            distance: "—",
+            travelTime: "—",
+            matchLevel,
+            specialties: specialtyTags.length > 0 ? specialtyTags : [{ label: "건강 상담", variant: "s" }],
+            caseCount: r.total_consultations ?? 0,
+            avgResponseTime,
+          } satisfies PharmacistData;
+        });
+      console.log("[match] DB pharmacists loaded:", list.length);
+      setDbPharms(list);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // DB에 1명이라도 있으면 DB, 아니면 Mock 폴백
+  const effectivePharmacists: PharmacistData[] =
+    dbPharms !== null && dbPharms.length > 0 ? dbPharms : MOCK_PHARMACISTS;
+
   const symptoms = useMemo(() => {
     const s = searchParams.get("symptom");
     return s ? s.split(",").map((v) => v.trim()) : ["만성피로", "소화장애", "불면"];
@@ -163,7 +265,7 @@ function MatchContent() {
   }, [user]);
 
   const sorted = useMemo(() => {
-    const list = [...MOCK_PHARMACISTS];
+    const list = [...effectivePharmacists];
     if (sortBy === "match")
       list.sort((a, b) => b.matchLevel - a.matchLevel);
     else if (sortBy === "distance")
@@ -171,14 +273,19 @@ function MatchContent() {
     else if (sortBy === "cases")
       list.sort((a, b) => b.caseCount - a.caseCount);
     return list;
-  }, [sortBy]);
+  }, [effectivePharmacists, sortBy]);
+
+  const PHARM_UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   const handleRequestConsult = async (
-    pharmacistName: string,
+    pharmacist: PharmacistData,
     e: React.MouseEvent,
   ) => {
     e.preventDefault();
     e.stopPropagation();
+
+    const pharmacistName = pharmacist.name;
 
     if (!user) {
       setRequestToast("로그인이 필요해요.");
@@ -196,11 +303,12 @@ function MatchContent() {
         ? sessionStorage.getItem(QUESTIONNAIRE_ID_KEY)
         : null;
 
-    // Mock 약사 — 실제 pharmacist 행이 DB에 없으므로 pharmacist_id는 null로 둠.
-    // Phase 2에서 매칭 로직이 실제 약사 UUID를 반환하도록 교체 예정.
+    // 실제 DB 약사면 UUID 그대로 사용. Mock 약사면 pharmacist_id는 null.
+    const realPharmacistId = PHARM_UUID_RE.test(pharmacist.id) ? pharmacist.id : null;
+
     const payload: ConsultationInsert = {
       patient_id: user.id,
-      pharmacist_id: null,
+      pharmacist_id: realPharmacistId,
       questionnaire_id: questionnaireId,
       consultation_type: "local",
       status: "pending",
@@ -508,7 +616,7 @@ function MatchContent() {
                         <div />
                         <button
                           className="match-pharm-action"
-                          onClick={(e) => handleRequestConsult(p.name, e)}
+                          onClick={(e) => handleRequestConsult(p, e)}
                           disabled={requestedNames.has(p.name) || requestingNames.has(p.name)}
                         >
                           {requestedNames.has(p.name)
