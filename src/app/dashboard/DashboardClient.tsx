@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, Suspense } from "react";
+import React, { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -1790,11 +1790,32 @@ function DashboardContent() {
   const [search, setSearch] = useState("");
 
   /* ── 실시간 상담 요청 (DB) — 상단 배너 + 전용 리스트 ── */
+  interface DbQuestionnaireDetail {
+    symptoms: string[] | null;
+    symptom_duration: string | null;
+    severity: string | null;
+    occupation: string | null;
+    sleep_hours: number | null;
+    water_intake: number | null;
+    meal_pattern: string | null;
+    snack_frequency: string | null;
+    exercise_frequency: string | null;
+    exercise_types: string[] | null;
+    alcohol: string | null;
+    caffeine: string | null;
+    smoking: string | null;
+    current_supplements: string[] | null;
+    current_medications: string[] | null;
+    allergies: string[] | null;
+    monthly_budget: number | null;
+    free_text: string | null;
+    detailed_answers: Record<string, unknown> | null;
+  }
   interface DbPendingRow {
     id: string;
     created_at: string;
     patient: { id: string; name: string; avatar_url: string | null } | null;
-    questionnaire: { symptoms: string[] | null; free_text: string | null } | null;
+    questionnaire: DbQuestionnaireDetail | null;
     patient_profile: { birth_year: number | null; gender: string | null } | null;
   }
   interface DbActiveRow {
@@ -1810,6 +1831,7 @@ function DashboardContent() {
   const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
   const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
   const [dbPendingLoading, setDbPendingLoading] = useState(true);
+  const [expandedPendingId, setExpandedPendingId] = useState<string | null>(null);
   const [dbActiveList, setDbActiveList] = useState<DbActiveRow[] | null>(null);
   const [dbActiveLoading, setDbActiveLoading] = useState(true);
   const [actingId, setActingId] = useState<string | null>(null);
@@ -1870,11 +1892,20 @@ function DashboardContent() {
     // id 기준 중복 제거
     const byId = new Map<string, ConsRow>();
     for (const r of [...unRows, ...myRows]) byId.set(r.id, r);
-    const consultations = Array.from(byId.values()).sort(
+
+    // 본인(약사)이 환자로서 보낸 요청은 제외
+    const filtered = Array.from(byId.values()).filter(
+      (c) => !myUserId || c.patient_id !== myUserId,
+    );
+
+    const consultations = filtered.sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
     );
 
-    console.log("[dashboard] consultations merged:", consultations.length);
+    console.log(
+      "[dashboard] consultations merged (self-filtered):",
+      consultations.length,
+    );
 
     if (consultations.length === 0) {
       setDbPendingList([]);
@@ -1899,7 +1930,9 @@ function DashboardContent() {
       questionnaireIds.length > 0
         ? supabase
             .from("ai_questionnaires")
-            .select("id, symptoms, free_text")
+            .select(
+              "id, symptoms, symptom_duration, severity, occupation, sleep_hours, water_intake, meal_pattern, snack_frequency, exercise_frequency, exercise_types, alcohol, caffeine, smoking, current_supplements, current_medications, allergies, monthly_budget, free_text, detailed_answers",
+            )
             .in("id", questionnaireIds)
         : Promise.resolve({ data: [] as unknown[], error: null }),
       patientIds.length > 0
@@ -1924,8 +1957,9 @@ function DashboardContent() {
     for (const p of (profilesRes.data ?? []) as { id: string; name: string; avatar_url: string | null }[]) {
       profileById.set(p.id, p);
     }
-    const qById = new Map<string, { id: string; symptoms: string[] | null; free_text: string | null }>();
-    for (const q of (qRes.data ?? []) as { id: string; symptoms: string[] | null; free_text: string | null }[]) {
+    type QFull = DbQuestionnaireDetail & { id: string };
+    const qById = new Map<string, QFull>();
+    for (const q of (qRes.data ?? []) as QFull[]) {
       qById.set(q.id, q);
     }
     const patientProfById = new Map<string, { id: string; birth_year: number | null; gender: string | null }>();
@@ -1949,30 +1983,109 @@ function DashboardContent() {
 
   const fetchActiveConsultations = async (pharmacistId: string) => {
     setDbActiveLoading(true);
-    const { data, error } = await supabase
+    console.log("[dashboard] fetchActiveConsultations — pharmacistId:", pharmacistId);
+
+    // 1) consultations 만 단순 SELECT — 임베드 없이 (400 회피)
+    const consRes = await supabase
       .from("consultations")
-      .select(
-        `
-        id, status, created_at, last_message_at,
-        patient:profiles!consultations_patient_id_fkey(id, name, avatar_url),
-        questionnaire:ai_questionnaires(symptoms),
-        patient_profile:patient_profiles!consultations_patient_id_fkey(birth_year, gender)
-      `,
-      )
-      .in("status", ["accepted", "chatting"])
+      .select("*")
+      .in("status", ["accepted", "chatting", "visit_scheduled"])
       .eq("pharmacist_id", pharmacistId)
       .order("last_message_at", { ascending: false, nullsFirst: false });
 
-    if (error) {
-      console.error("[dashboard] active list failed:", error);
+    console.log("[dashboard] active consultations query result:", consRes);
+
+    if (consRes.error) {
+      console.error("[dashboard] active list failed:", {
+        message: consRes.error.message,
+        code: consRes.error.code,
+        details: consRes.error.details,
+        hint: consRes.error.hint,
+      });
       setDbActiveList([]);
       setDbActiveLoading(false);
       return;
     }
-    const rows = (data ?? []) as unknown as DbActiveRow[];
+
+    interface ActiveConsRow {
+      id: string;
+      status: string;
+      created_at: string;
+      last_message_at: string | null;
+      patient_id: string;
+      questionnaire_id: string | null;
+    }
+    const consultations = ((consRes.data ?? []) as unknown) as ActiveConsRow[];
+
+    if (consultations.length === 0) {
+      setDbActiveList([]);
+      setDbActiveLoading(false);
+      return;
+    }
+
+    // 2) IN 쿼리로 patient/questionnaire/patient_profile 일괄 조회
+    const patientIds = Array.from(new Set(consultations.map((c) => c.patient_id)));
+    const questionnaireIds = consultations
+      .map((c) => c.questionnaire_id)
+      .filter((v): v is string => !!v);
+
+    const [profilesRes, qRes, patientProfRes] = await Promise.all([
+      patientIds.length > 0
+        ? supabase
+            .from("profiles")
+            .select("id, name, avatar_url")
+            .in("id", patientIds)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+      questionnaireIds.length > 0
+        ? supabase
+            .from("ai_questionnaires")
+            .select("id, symptoms")
+            .in("id", questionnaireIds)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+      patientIds.length > 0
+        ? supabase
+            .from("patient_profiles")
+            .select("id, birth_year, gender")
+            .in("id", patientIds)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+    ]);
+
+    if ("error" in profilesRes && profilesRes.error) {
+      console.error("[dashboard] active profiles fetch FAILED:", profilesRes.error);
+    }
+    if ("error" in qRes && qRes.error) {
+      console.error("[dashboard] active ai_questionnaires fetch FAILED:", qRes.error);
+    }
+    if ("error" in patientProfRes && patientProfRes.error) {
+      console.error("[dashboard] active patient_profiles fetch FAILED:", patientProfRes.error);
+    }
+
+    const profileById = new Map<string, { id: string; name: string; avatar_url: string | null }>();
+    for (const p of (profilesRes.data ?? []) as { id: string; name: string; avatar_url: string | null }[]) {
+      profileById.set(p.id, p);
+    }
+    const qById = new Map<string, { id: string; symptoms: string[] | null }>();
+    for (const q of (qRes.data ?? []) as { id: string; symptoms: string[] | null }[]) {
+      qById.set(q.id, q);
+    }
+    const patientProfById = new Map<string, { id: string; birth_year: number | null; gender: string | null }>();
+    for (const pp of (patientProfRes.data ?? []) as { id: string; birth_year: number | null; gender: string | null }[]) {
+      patientProfById.set(pp.id, pp);
+    }
+
+    const rows: DbActiveRow[] = consultations.map((c) => ({
+      id: c.id,
+      status: c.status,
+      created_at: c.created_at,
+      last_message_at: c.last_message_at,
+      patient: profileById.get(c.patient_id) ?? null,
+      questionnaire: c.questionnaire_id ? qById.get(c.questionnaire_id) ?? null : null,
+      patient_profile: patientProfById.get(c.patient_id) ?? null,
+    }));
+
+    console.log("[dashboard] active list final:", rows);
     setDbActiveList(rows);
     setDbActiveLoading(false);
-    console.log("[dashboard] active consultations loaded:", rows.length);
   };
 
   useEffect(() => {
@@ -2145,10 +2258,11 @@ function DashboardContent() {
   };
 
   // 필터 + 검색
-  let result = consults;
-  if (filter === "requested") {
-    result = result.filter((c) => c.patientStatus === "requested" && !c.isRejected);
-  } else if (filter === "managing") {
+  // 새 상담 요청(requested)은 위쪽 영역에서만 표시 — 아래 목록에서 항상 제외
+  let result = consults.filter(
+    (c) => !(c.patientStatus === "requested" && !c.isRejected),
+  );
+  if (filter === "managing") {
     result = result.filter((c) => c.patientStatus === "managing");
   } else if (filter === "visit_scheduled") {
     result = result.filter((c) => !!c.nextVisitDate);
@@ -2338,13 +2452,21 @@ function DashboardContent() {
                 const age = r.patient_profile?.birth_year
                   ? new Date().getFullYear() - r.patient_profile.birth_year
                   : null;
-                const symptoms = r.questionnaire?.symptoms ?? [];
+                // 안전 정규화 — 배열이 아닌 값(string/null/undefined)이 와도 .slice/.map/.join 보호
+                const rawSymptoms: unknown = r.questionnaire?.symptoms;
+                const symptoms: string[] = Array.isArray(rawSymptoms)
+                  ? (rawSymptoms.filter((x) => typeof x === "string" && x.trim()) as string[])
+                  : typeof rawSymptoms === "string" && rawSymptoms.trim()
+                    ? [rawSymptoms.trim()]
+                    : [];
                 const elapsedMs = Date.now() - new Date(r.created_at).getTime();
                 const elapsedHr = Math.max(0, Math.floor(elapsedMs / (1000 * 60 * 60)));
                 const elapsedMin = Math.max(0, Math.floor(elapsedMs / (1000 * 60)));
                 const elapsedLabel =
                   elapsedHr >= 1 ? `${elapsedHr}시간 전` : `${elapsedMin}분 전`;
                 const isActing = actingId === r.id;
+                const isExpanded = expandedPendingId === r.id;
+                const q = r.questionnaire;
                 return (
                   <div
                     key={r.id}
@@ -2392,7 +2514,7 @@ function DashboardContent() {
                             flexWrap: "wrap",
                           }}
                         >
-                          <span>{r.patient?.name ?? "환자"}</span>
+                          <span>{r.patient?.name?.trim() || "이름 없음"}</span>
                           {age !== null && (
                             <span
                               style={{
@@ -2438,7 +2560,7 @@ function DashboardContent() {
                         ))}
                       </div>
                     )}
-                    {r.questionnaire?.free_text && (
+                    {q?.free_text && !isExpanded && (
                       <div
                         style={{
                           fontSize: 13,
@@ -2451,51 +2573,310 @@ function DashboardContent() {
                           overflow: "hidden",
                         }}
                       >
-                        {r.questionnaire.free_text}
+                        {q.free_text}
                       </div>
                     )}
-                    <div style={{ display: "flex", gap: 8 }}>
+                    {/* 상세 보기 토글 (접힘 상태) */}
+                    {!isExpanded && (
                       <button
                         type="button"
-                        onClick={() => updatePendingStatus(r.id, "rejected")}
-                        disabled={isActing}
+                        onClick={() => setExpandedPendingId(r.id)}
                         style={{
-                          flex: 1,
+                          width: "100%",
                           minHeight: 44,
                           padding: "10px 0",
                           borderRadius: 10,
                           background: "#fff",
-                          color: "#993C1D",
+                          color: "#7A5300",
                           fontSize: 14,
                           fontWeight: 600,
-                          border: "1px solid #E8C9BD",
-                          cursor: isActing ? "default" : "pointer",
-                          opacity: isActing ? 0.6 : 1,
+                          border: "1px solid #F5DCA0",
+                          cursor: "pointer",
+                          fontFamily: "'Noto Sans KR', sans-serif",
                         }}
                       >
-                        거절
+                        상세 보기 ▾
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => updatePendingStatus(r.id, "accepted")}
-                        disabled={isActing}
+                    )}
+                    {/* 펼침: 문답 전체 + 수락/거절 */}
+                    {isExpanded && (
+                      <div
                         style={{
-                          flex: 1,
-                          minHeight: 44,
-                          padding: "10px 0",
+                          marginTop: 4,
+                          padding: 14,
+                          background: "#fff",
                           borderRadius: 10,
-                          background: "#4A6355",
-                          color: "#fff",
-                          fontSize: 14,
-                          fontWeight: 700,
-                          border: "none",
-                          cursor: isActing ? "default" : "pointer",
-                          opacity: isActing ? 0.7 : 1,
+                          border: "1px solid #F0E1B4",
                         }}
                       >
-                        {isActing ? "처리 중..." : "수락"}
-                      </button>
-                    </div>
+                        <div
+                          style={{
+                            fontSize: 14,
+                            fontWeight: 700,
+                            color: "#2C3630",
+                            marginBottom: 10,
+                            fontFamily: "'Gothic A1', sans-serif",
+                          }}
+                        >
+                          문답 전체
+                        </div>
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "100px 1fr",
+                            rowGap: 8,
+                            columnGap: 12,
+                            fontSize: 14,
+                            color: "#2C3630",
+                            lineHeight: 1.5,
+                          }}
+                        >
+                          {(() => {
+                            // detailed_answers 폴백 — 컬럼이 비어 있어도 원본 답변에서 추출
+                            const da = (q?.detailed_answers ?? {}) as Record<string, unknown>;
+
+                            // 비어 있음 판정: null/undefined/빈 문자열/빈 배열/빈 객체 모두 빈 것으로 처리
+                            const isEmpty = (v: unknown): boolean => {
+                              if (v === null || v === undefined) return true;
+                              if (typeof v === "string") return v.trim().length === 0;
+                              if (Array.isArray(v)) return v.length === 0;
+                              if (typeof v === "object") {
+                                try {
+                                  return Object.keys(v as Record<string, unknown>).length === 0;
+                                } catch {
+                                  return true;
+                                }
+                              }
+                              return false;
+                            };
+                            // 안전 정규화: 어떤 값이 와도 string 배열로 변환
+                            // - 배열이면 string 항목만 추림 (객체/빈 항목은 제외)
+                            // - 문자열이면 단일 항목 배열
+                            // - 그 외(null/undefined/숫자/객체)는 빈 배열
+                            const toStrArr = (v: unknown): string[] => {
+                              if (Array.isArray(v)) {
+                                return v
+                                  .map((x) => {
+                                    if (typeof x === "string") return x.trim();
+                                    if (typeof x === "number" && Number.isFinite(x)) return String(x);
+                                    return "";
+                                  })
+                                  .filter((s): s is string => s.length > 0);
+                              }
+                              if (typeof v === "string" && v.trim()) return [v.trim()];
+                              return [];
+                            };
+                            // 안전 정규화: 어떤 값이 와도 string 또는 null
+                            // - 문자열이면 그대로 (빈 문자열은 null)
+                            // - 배열이면 join (빈 배열은 null)
+                            // - 숫자는 String()
+                            // - 객체/그 외는 null (JSON 출력 금지 — 사람이 읽을 수 있는 값만)
+                            const toStrOrNull = (v: unknown): string | null => {
+                              if (isEmpty(v)) return null;
+                              if (typeof v === "string") {
+                                const t = v.trim();
+                                return t ? t : null;
+                              }
+                              if (Array.isArray(v)) {
+                                const arr = toStrArr(v);
+                                return arr.length > 0 ? arr.join(", ") : null;
+                              }
+                              if (typeof v === "number" && Number.isFinite(v)) return String(v);
+                              return null;
+                            };
+
+                            const daStr = (k: string): string | null => toStrOrNull(da[k]);
+                            const daArr = (k: string): string[] => toStrArr(da[k]);
+
+                            // 배열/문자열 어느 쪽이든 안전하게 join — string 또는 string[]
+                            // 어느 것이 와도 "—" 폴백까지 일관 처리
+                            const fmtList = (value: unknown, fallbackKey?: string): string => {
+                              const arr = toStrArr(value);
+                              if (arr.length > 0) return arr.join(", ");
+                              // 단일 문자열로 들어왔지만 trim 후 비어 있을 수도 있음
+                              const single = toStrOrNull(value);
+                              if (single) return single;
+                              if (fallbackKey) {
+                                const fbArr = daArr(fallbackKey);
+                                if (fbArr.length > 0) return fbArr.join(", ");
+                                const fbStr = daStr(fallbackKey);
+                                if (fbStr) return fbStr;
+                              }
+                              return "—";
+                            };
+                            const fmtTxt = (value: unknown, fallbackKey?: string): string => {
+                              const s = toStrOrNull(value);
+                              if (s) return s;
+                              if (fallbackKey) {
+                                const fb = daStr(fallbackKey);
+                                if (fb) return fb;
+                              }
+                              return "—";
+                            };
+                            const fmtNum = (
+                              value: unknown,
+                              suffix: string,
+                              fallbackKey?: string,
+                            ): string => {
+                              if (typeof value === "number" && Number.isFinite(value)) {
+                                return `${value}${suffix}`;
+                              }
+                              if (fallbackKey) {
+                                const fb = daStr(fallbackKey);
+                                if (fb) return fb; // 라벨 형태는 그대로 표시
+                              }
+                              return "—";
+                            };
+
+                            const rows: { label: string; value: string }[] = [
+                              { label: "증상", value: fmtList(q?.symptoms, "symptoms") },
+                              { label: "기간", value: fmtTxt(q?.symptom_duration, "duration") },
+                              { label: "심각도", value: fmtTxt(q?.severity, "severity") },
+                              { label: "직업", value: fmtTxt(q?.occupation, "occupation") },
+                              { label: "수면", value: fmtNum(q?.sleep_hours, "시간", "sleep_hours") },
+                              { label: "물 섭취", value: fmtNum(q?.water_intake, "잔", "water_amount") },
+                              { label: "식사 패턴", value: fmtList(q?.meal_pattern, "meal_pattern") },
+                              { label: "간식", value: fmtTxt(q?.snack_frequency, "meal_amount") },
+                              { label: "운동 빈도", value: fmtTxt(q?.exercise_frequency, "exercise") },
+                              { label: "운동 종류", value: fmtList(q?.exercise_types, "exercise_type") },
+                              { label: "음주", value: fmtTxt(q?.alcohol, "alcohol") },
+                              { label: "카페인", value: fmtTxt(q?.caffeine, "caffeine") },
+                              { label: "흡연", value: fmtTxt(q?.smoking, "smoking") },
+                              { label: "복용 영양제", value: fmtList(q?.current_supplements, "supplements") },
+                              { label: "복용 약", value: fmtList(q?.current_medications, "current_medications") },
+                              { label: "알레르기", value: fmtList(q?.allergies, "allergies") },
+                              {
+                                label: "예산(월)",
+                                value:
+                                  typeof q?.monthly_budget === "number" &&
+                                  Number.isFinite(q.monthly_budget)
+                                    ? `${q.monthly_budget.toLocaleString()}원`
+                                    : (daStr("budget") ?? "—"),
+                              },
+                            ];
+                            return rows.map((row) => (
+                              <React.Fragment key={row.label}>
+                                <div
+                                  style={{
+                                    color: "#5E7D6C",
+                                    fontWeight: 600,
+                                    fontSize: 13,
+                                  }}
+                                >
+                                  {row.label}
+                                </div>
+                                <div
+                                  style={{
+                                    color: "#2C3630",
+                                    wordBreak: "break-word",
+                                    overflowWrap: "anywhere",
+                                    minWidth: 0,
+                                  }}
+                                >
+                                  {row.value}
+                                </div>
+                              </React.Fragment>
+                            ));
+                          })()}
+                        </div>
+                        {q?.free_text && q.free_text.trim() && (
+                          <div style={{ marginTop: 12 }}>
+                            <div
+                              style={{
+                                color: "#5E7D6C",
+                                fontWeight: 600,
+                                fontSize: 13,
+                                marginBottom: 4,
+                              }}
+                            >
+                              자유 서술
+                            </div>
+                            <div
+                              style={{
+                                fontSize: 14,
+                                color: "#2C3630",
+                                lineHeight: 1.6,
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                overflowWrap: "anywhere",
+                                width: "100%",
+                                maxWidth: "100%",
+                                background: "#FBF7E9",
+                                padding: 10,
+                                borderRadius: 8,
+                                border: "1px solid #F0E1B4",
+                                boxSizing: "border-box",
+                              }}
+                            >
+                              {q.free_text}
+                            </div>
+                          </div>
+                        )}
+                        {/* 수락/거절 버튼 (상세 안에 배치) */}
+                        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+                          <button
+                            type="button"
+                            onClick={() => setExpandedPendingId(null)}
+                            disabled={isActing}
+                            style={{
+                              flex: "0 0 auto",
+                              minHeight: 44,
+                              padding: "10px 14px",
+                              borderRadius: 10,
+                              background: "#fff",
+                              color: "#5E7D6C",
+                              fontSize: 14,
+                              fontWeight: 600,
+                              border: "1px solid #D5DCD7",
+                              cursor: isActing ? "default" : "pointer",
+                              opacity: isActing ? 0.6 : 1,
+                            }}
+                          >
+                            접기
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updatePendingStatus(r.id, "rejected")}
+                            disabled={isActing}
+                            style={{
+                              flex: 1,
+                              minHeight: 44,
+                              padding: "10px 0",
+                              borderRadius: 10,
+                              background: "#fff",
+                              color: "#993C1D",
+                              fontSize: 14,
+                              fontWeight: 600,
+                              border: "1px solid #E8C9BD",
+                              cursor: isActing ? "default" : "pointer",
+                              opacity: isActing ? 0.6 : 1,
+                            }}
+                          >
+                            거절
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updatePendingStatus(r.id, "accepted")}
+                            disabled={isActing}
+                            style={{
+                              flex: 1,
+                              minHeight: 44,
+                              padding: "10px 0",
+                              borderRadius: 10,
+                              background: "#4A6355",
+                              color: "#fff",
+                              fontSize: 14,
+                              fontWeight: 700,
+                              border: "none",
+                              cursor: isActing ? "default" : "pointer",
+                              opacity: isActing ? 0.7 : 1,
+                            }}
+                          >
+                            {isActing ? "처리 중..." : "수락"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -2563,7 +2944,13 @@ function DashboardContent() {
                 const age = r.patient_profile?.birth_year
                   ? new Date().getFullYear() - r.patient_profile.birth_year
                   : null;
-                const symptoms = r.questionnaire?.symptoms ?? [];
+                // 안전 정규화 — 배열이 아닌 값(string/null/undefined)이 와도 .slice/.map/.join 보호
+                const rawSymptoms: unknown = r.questionnaire?.symptoms;
+                const symptoms: string[] = Array.isArray(rawSymptoms)
+                  ? (rawSymptoms.filter((x) => typeof x === "string" && x.trim()) as string[])
+                  : typeof rawSymptoms === "string" && rawSymptoms.trim()
+                    ? [rawSymptoms.trim()]
+                    : [];
                 const lastIso = r.last_message_at ?? r.created_at;
                 const elapsedMs = Date.now() - new Date(lastIso).getTime();
                 const elapsedHr = Math.max(0, Math.floor(elapsedMs / (1000 * 60 * 60)));
@@ -2575,7 +2962,11 @@ function DashboardContent() {
                       ? `${elapsedHr}시간 전`
                       : `${elapsedMin}분 전`;
                 const statusLabel =
-                  r.status === "chatting" ? "상담 중" : "수락됨";
+                  r.status === "chatting"
+                    ? "상담 중"
+                    : r.status === "visit_scheduled"
+                      ? "방문 예정"
+                      : "수락됨";
                 return (
                   <button
                     key={r.id}
@@ -2624,7 +3015,7 @@ function DashboardContent() {
                           flexWrap: "wrap",
                         }}
                       >
-                        <span>{r.patient?.name ?? "환자"}</span>
+                        <span>{r.patient?.name?.trim() || "이름 없음"}</span>
                         {age !== null && (
                           <span
                             style={{
@@ -2875,7 +3266,6 @@ function DashboardContent() {
           <div className="dash-filters">
             {([
               ["all", "전체"],
-              ["requested", "🔔 상담 요청"],
               ["managing", "💊 사후 관리"],
               ["visit_scheduled", "🗓️ 방문 예정"],
               ["unread", "💬 새 메시지"],

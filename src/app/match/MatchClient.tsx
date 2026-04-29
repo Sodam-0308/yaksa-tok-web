@@ -256,7 +256,9 @@ function MatchContent() {
           console.error("[match] questionnaire link failed:", error);
           return;
         }
-        sessionStorage.removeItem(QUESTIONNAIRE_ID_KEY);
+        // QUESTIONNAIRE_ID_KEY는 의도적으로 유지 — handleRequestConsult에서
+        // consultations.questionnaire_id 로 함께 저장해야 하므로 이 시점에 지우면 안 됨.
+        // (다음 문답이 새로 작성되면 setItem으로 자동 덮어쓰기 됨)
         sessionStorage.removeItem(PENDING_MATCH_KEY);
       } catch (err) {
         console.error("[match] questionnaire link threw:", err);
@@ -302,6 +304,7 @@ function MatchContent() {
       typeof window !== "undefined"
         ? sessionStorage.getItem(QUESTIONNAIRE_ID_KEY)
         : null;
+    console.log("[match] questionnaireId from sessionStorage:", questionnaireId);
 
     // 실제 DB 약사면 UUID 그대로 사용. Mock 약사면 pharmacist_id는 null.
     const realPharmacistId = PHARM_UUID_RE.test(pharmacist.id) ? pharmacist.id : null;

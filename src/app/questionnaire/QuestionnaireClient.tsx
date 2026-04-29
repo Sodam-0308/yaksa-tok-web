@@ -324,9 +324,32 @@ function QuestionnaireContent() {
     const freeText =
       typeof answers.free_text === "string" ? (answers.free_text as string) : "";
 
+    // 답변 키 → ai_questionnaires top-level 컬럼 매핑
+    // 타입(string vs number vs string[])이 일치하는 항목만 매핑하고
+    // 그 외(라벨 형태의 sleep_hours/water_intake 등)는 detailed_answers 안에 그대로 보존
+    const pickStr = (key: string): string | null => {
+      const v = answers[key];
+      return typeof v === "string" && v.trim() ? v : null;
+    };
+    const pickStrArr = (key: string): string[] => {
+      const v = answers[key];
+      return Array.isArray(v) ? (v as unknown[]).filter((x) => typeof x === "string") as string[] : [];
+    };
+    const mealPatternArr = pickStrArr("meal_pattern");
+    const exerciseTypeStr = pickStr("exercise_type");
+
     const payload: AiQuestionnaireInsert = {
       patient_id: user?.id ?? null,
       symptoms,
+      symptom_duration: pickStr("duration"),
+      severity: pickStr("severity"),
+      meal_pattern: mealPatternArr.length > 0 ? mealPatternArr.join(", ") : null,
+      alcohol: pickStr("alcohol"),
+      caffeine: pickStr("caffeine"),
+      smoking: pickStr("smoking"),
+      exercise_frequency: pickStr("exercise"),
+      exercise_types: exerciseTypeStr ? [exerciseTypeStr] : [],
+      current_supplements: pickStrArr("supplements"),
       free_text: freeText,
       detailed_answers: answers as unknown as Json,
       completed_at: new Date().toISOString(),
