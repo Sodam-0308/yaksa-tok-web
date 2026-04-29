@@ -40,8 +40,10 @@ export default function RootLayout({
         />
       </head>
       <body>
-        <ClientProviders>{children}</ClientProviders>
-        <BottomNav />
+        <ClientProviders>
+          {children}
+          <BottomNav />
+        </ClientProviders>
       </body>
     </html>
   );

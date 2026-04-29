@@ -1,8 +1,7 @@
 "use client";
 
-import { usePathname, useSearchParams } from "next/navigation";
-import { useRouter } from "next/navigation";
-import { Suspense } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
 import DesktopHeader from "./DesktopHeader";
 
 /* ══════════════════════════════════════════
@@ -10,8 +9,6 @@ import DesktopHeader from "./DesktopHeader";
    ══════════════════════════════════════════ */
 
 const HIDDEN_PATHS = ["/signup", "/questionnaire"];
-
-const PHARMACIST_PATHS = ["/dashboard", "/report", "/chart", "/pharmacist/mypage"];
 
 const ACTIVE = "#4A6355";
 const INACTIVE = "#8A9A90";
@@ -79,16 +76,6 @@ const PHARMACIST_TABS: Tab[] = [
     ),
   },
   {
-    label: "채팅",
-    href: "/chat/1?role=pharmacist",
-    icon: (c) => (
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2v10z" />
-      </svg>
-    ),
-    badge: true,
-  },
-  {
     label: "피드",
     href: "/feed?role=pharmacist",
     icon: (c) => (
@@ -97,6 +84,16 @@ const PHARMACIST_TABS: Tab[] = [
         <path d="M7 7h10M7 12h10M7 17h6" />
       </svg>
     ),
+  },
+  {
+    label: "채팅",
+    href: "/chat",
+    icon: (c) => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2v10z" />
+      </svg>
+    ),
+    badge: true,
   },
   {
     label: "내 정보",
@@ -111,25 +108,33 @@ const PHARMACIST_TABS: Tab[] = [
 ];
 
 /* ══════════════════════════════════════════
-   내부 컴포넌트 (searchParams 사용)
+   메인 컴포넌트
    ══════════════════════════════════════════ */
 
-function BottomNavInner() {
+export default function BottomNav() {
   const pathname = usePathname();
-  const searchParams = useSearchParams();
   const router = useRouter();
+  const { user, profile, loading, profileLoading } = useAuth();
 
   /* 완전 숨기기 (가입/문답 — 헤더도 하단네비도 없음) */
   const fullyHidden = HIDDEN_PATHS.some((p) => pathname.startsWith(p));
   if (fullyHidden) return null;
 
-  /* 모바일 하단 네비 숨기기 (랜딩 페이지 — 데스크톱 헤더만 표시) */
-  const hideMobileNav = pathname === "/";
+  /* 분기 (LandingClient.tsx 패턴 참고)
+   *   - loading 또는 (user && profileLoading)  → 깜빡임 방지: 하단 네비 미렌더, 헤더는 스켈레톤
+   *   - user 없음                                → 비로그인: 하단 네비 미렌더, 헤더는 로그인 버튼
+   *   - role === 'pharmacist'                    → 약사용 하단 네비
+   *   - role === 'patient'                       → 환자용 하단 네비
+   *   - 그 외 (role NULL 등)                      → 비로그인과 동일 (안전 기본값)
+   */
+  const role = profile?.role ?? null;
+  const isPharmacist = role === "pharmacist";
+  const isPatient = role === "patient";
+  const showSkeleton = loading || (!!user && profileLoading);
+  const showAuthed = !showSkeleton && !!user && (isPharmacist || isPatient);
 
-  /* 약사 판별 */
-  const isPharmacist =
-    searchParams.get("role") === "pharmacist" ||
-    PHARMACIST_PATHS.some((p) => pathname.startsWith(p));
+  // 비로그인 + / 만 숨기는 동작은 showAuthed=false 자동 처리됨.
+  // 로그인한 사용자는 랜딩(/)에서도 하단바 표시 — 별도 hideMobileNav 분기 제거.
 
   const tabs = isPharmacist ? PHARMACIST_TABS : PATIENT_TABS;
 
@@ -145,16 +150,16 @@ function BottomNavInner() {
       <style>{`
         .bnav-mobile-spacer,.bnav-mobile-bar{display:flex}
         .bnav-mobile-spacer{display:block}
-        @media(min-width:1200px){
+        @media(min-width:768px){
           .bnav-mobile-spacer,.bnav-mobile-bar{display:none!important}
         }
       `}</style>
 
-      {/* 데스크톱 상단 헤더 (1200px+) */}
-      <DesktopHeader isPharmacist={isPharmacist} pathname={pathname} />
+      {/* 데스크톱 상단 헤더 (768px+) — 자체적으로 인증 상태 분기 처리 */}
+      <DesktopHeader pathname={pathname} />
 
-      {/* 모바일 하단 네비 (랜딩 페이지에서는 숨김) */}
-      {!hideMobileNav && (
+      {/* 모바일 하단 네비 — 인증된 사용자에게만, 랜딩 포함 모든 페이지 */}
+      {showAuthed && (
         <>
           <div className="bnav-mobile-spacer" style={{ height: 56 }} />
           <nav
@@ -233,17 +238,5 @@ function BottomNavInner() {
         </>
       )}
     </>
-  );
-}
-
-/* ══════════════════════════════════════════
-   export
-   ══════════════════════════════════════════ */
-
-export default function BottomNav() {
-  return (
-    <Suspense>
-      <BottomNavInner />
-    </Suspense>
   );
 }
