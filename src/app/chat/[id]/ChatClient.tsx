@@ -342,9 +342,14 @@ function ChatContent() {
   const [dbConsultation, setDbConsultation] = useState<{
     patient_id: string;
     pharmacist_id: string | null;
+    status: string | null;
   } | null>(null);
   const [dbLoading, setDbLoading] = useState(isDbConsultation);
   const [dbError, setDbError] = useState<string | null>(null);
+  // 종료 액션 상태 (환자 측 "상담 종료" 버튼 → 모달 → UPDATE)
+  const [showEndConfirm, setShowEndConfirm] = useState(false);
+  const [endingConsult, setEndingConsult] = useState(false);
+  const [endError, setEndError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -701,12 +706,12 @@ function ChatContent() {
       setDbLoading(true);
       setDbError(null);
 
-      // 1) consultation 조회 (patient_id / pharmacist_id 매핑용)
+      // 1) consultation 조회 (patient_id / pharmacist_id 매핑용 + 종료 잠금 판정용 status)
       const consResp = await supabase
         .from("consultations")
-        .select("patient_id, pharmacist_id")
+        .select("patient_id, pharmacist_id, status")
         .eq("id", chatId)
-        .maybeSingle<{ patient_id: string; pharmacist_id: string | null }>();
+        .maybeSingle<{ patient_id: string; pharmacist_id: string | null; status: string | null }>();
       if (cancelled) return;
       if (consResp.error || !consResp.data) {
         console.error("[chat] consultation fetch failed:", consResp.error);
@@ -775,9 +780,92 @@ function ChatContent() {
     };
   }, [isDbConsultation, chatId]);
 
+  /* ── 환자 측 상담 종료 ──
+   * 헬퍼로 분리해 추후 약사 측 동일 액션에서 재사용 가능하게 함.
+   *  1) consultations.status='completed' + completed_at=now() UPDATE
+   *  2) messages 시스템 메시지 INSERT (sender 역할 라벨로 약사 측에도 명확히 노출)
+   *  3) /mypage 로 이동
+   */
+  const endConsultation = async (
+    actorRole: "patient" | "pharmacist",
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!isDbConsultation) {
+      return { ok: false, error: "DB 상담이 아닙니다" };
+    }
+    if (!user) {
+      return { ok: false, error: "로그인이 필요해요" };
+    }
+    type ConsUpdate = { status: string; completed_at: string };
+    const upPayload: ConsUpdate = {
+      status: "completed",
+      completed_at: new Date().toISOString(),
+    };
+    const upResp = await (supabase
+      .from("consultations") as unknown as {
+        update: (p: ConsUpdate) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update(upPayload)
+      .eq("id", chatId);
+    if (upResp.error) {
+      console.error("[chat] end-consultation UPDATE failed:", upResp.error);
+      return { ok: false, error: upResp.error.message };
+    }
+    // 시스템 메시지 — 실패해도 상담 종료 자체는 성공이므로 best-effort
+    const sysPayload: MessageInsert = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content:
+        actorRole === "patient"
+          ? "환자가 상담을 종료했습니다."
+          : "약사가 상담을 종료했습니다.",
+      message_type: "system",
+    };
+    const msgResp = await (supabase
+      .from("messages") as unknown as {
+        insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(sysPayload);
+    if (msgResp.error) {
+      console.warn("[chat] end-consultation system message INSERT failed (UPDATE 는 성공):", msgResp.error);
+    }
+    return { ok: true };
+  };
+
+  const handlePatientEndClick = () => {
+    setEndError(null);
+    setShowEndConfirm(true);
+  };
+  const confirmPatientEnd = async () => {
+    if (endingConsult) return;
+    setEndingConsult(true);
+    setEndError(null);
+    const result = await endConsultation("patient");
+    setEndingConsult(false);
+    if (!result.ok) {
+      setEndError(result.error || "상담 종료에 실패했어요");
+      return;
+    }
+    setShowEndConfirm(false);
+    // 로컬 state 도 즉시 갱신 (입력창 잠금 즉시 반영, /mypage 이동 전 깜빡임 방지)
+    setDbConsultation((prev) => (prev ? { ...prev, status: "completed" } : prev));
+    router.push("/mypage");
+  };
+
+  /* 종료 잠금 판정 — DB 모드에서 status가 completed/cancelled 면 입력 차단 */
+  const consultationLocked =
+    isDbConsultation &&
+    !!dbConsultation &&
+    (dbConsultation.status === "completed" || dbConsultation.status === "cancelled");
+
   const sendMessage = () => {
     const text = input.trim();
     if (!text) return;
+    if (consultationLocked) {
+      console.warn("[chat] consultation locked — cannot send");
+      return;
+    }
 
     // DB 모드: messages 테이블 INSERT (Realtime echo로 화면 반영)
     if (isDbConsultation) {
@@ -1025,6 +1113,27 @@ function ChatContent() {
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {/* 환자 측 상담 종료 버튼 — DB 상담이고 아직 잠금 안 된 상태에서만 노출 */}
+          {role === "patient" && isDbConsultation && !consultationLocked && (
+            <button
+              type="button"
+              onClick={handlePatientEndClick}
+              aria-label="상담 종료"
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: "4px 6px",
+                fontSize: 13,
+                color: "#5E7D6C",
+                textDecoration: "underline",
+                cursor: "pointer",
+                fontFamily: "'Noto Sans KR', sans-serif",
+                flexShrink: 0,
+              }}
+            >
+              상담 종료
+            </button>
+          )}
           {role === "pharmacist" && (
             <button
               type="button"
@@ -1689,23 +1798,53 @@ function ChatContent() {
         </div>
       )}
 
-      {/* Input — 최신 차수에서만 입력 가능 */}
+      {/* 종료된 상담 안내 — 입력란 위에 노출 */}
+      {consultationLocked && (
+        <div
+          role="status"
+          style={{
+            margin: "8px 16px 0",
+            padding: "10px 14px",
+            borderRadius: 10,
+            background: "#F4F6F3",
+            border: "1px solid rgba(94,125,108,0.18)",
+            color: "#3D4A42",
+            fontSize: 14,
+            lineHeight: 1.5,
+            textAlign: "center",
+          }}
+        >
+          이 상담은 종료되었습니다
+        </div>
+      )}
+
+      {/* Input — 최신 차수에서만 + 종료 안 된 상담에서만 입력 가능 */}
       <div className="chat-input-bar">
         <textarea
           ref={inputRef}
           className="chat-input"
-          placeholder={isLatestSession ? "메시지를 입력하세요..." : "이전 차수는 읽기 전용입니다"}
-          value={isLatestSession ? input : ""}
+          placeholder={
+            consultationLocked
+              ? "종료된 상담은 메시지를 보낼 수 없어요"
+              : isLatestSession
+                ? "메시지를 입력하세요..."
+                : "이전 차수는 읽기 전용입니다"
+          }
+          value={isLatestSession && !consultationLocked ? input : ""}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           rows={1}
-          disabled={!isLatestSession}
-          style={!isLatestSession ? { background: "#F4F5F3", cursor: "not-allowed" } : undefined}
+          disabled={!isLatestSession || consultationLocked}
+          style={
+            !isLatestSession || consultationLocked
+              ? { background: "#F4F5F3", cursor: "not-allowed" }
+              : undefined
+          }
         />
         <button
           className="chat-send-btn"
           onClick={sendMessage}
-          disabled={!isLatestSession || !input.trim()}
+          disabled={!isLatestSession || consultationLocked || !input.trim()}
           aria-label="전송"
         >
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -2964,6 +3103,75 @@ function ChatContent() {
           </div>
         );
       })()}
+
+      {/* 환자 측 상담 종료 확인 모달 */}
+      {showEndConfirm && (
+        <div
+          onClick={() => { if (!endingConsult) { setShowEndConfirm(false); setEndError(null); } }}
+          style={{
+            position: "fixed", inset: 0, zIndex: 300,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff", borderRadius: 16, padding: "28px 24px 24px",
+              maxWidth: 320, width: "100%", textAlign: "center",
+              boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}
+          >
+            <div style={{ fontSize: 28, marginBottom: 10 }}>👋</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: "#2C3630", marginBottom: 8 }}>
+              상담을 종료하시겠습니까?
+            </div>
+            <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.6, marginBottom: 18 }}>
+              종료 후에는 같은 약사와 새로 상담 요청해야 해요.
+            </div>
+            {endError && (
+              <div style={{
+                fontSize: 13, color: "#D02F2F", background: "#FFF3F3",
+                border: "1px solid #F5C8C8", padding: "8px 10px",
+                borderRadius: 8, marginBottom: 12, lineHeight: 1.5,
+              }}>
+                {endError}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => { if (!endingConsult) { setShowEndConfirm(false); setEndError(null); } }}
+                disabled={endingConsult}
+                style={{
+                  flex: 1, padding: "11px", borderRadius: 10, fontSize: 14, fontWeight: 600,
+                  background: "#F8F9F7", color: "#3D4A42",
+                  border: "1px solid rgba(94,125,108,0.14)",
+                  cursor: endingConsult ? "default" : "pointer",
+                  opacity: endingConsult ? 0.6 : 1,
+                }}
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={confirmPatientEnd}
+                disabled={endingConsult}
+                style={{
+                  flex: 1, padding: "11px", borderRadius: 10, fontSize: 14, fontWeight: 700,
+                  background: "#4A6355", color: "#fff", border: "none",
+                  cursor: endingConsult ? "default" : "pointer",
+                  opacity: endingConsult ? 0.7 : 1,
+                }}
+              >
+                {endingConsult ? "종료 중..." : "종료"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 추가 질문 세트 선택 모달 (약사 전용) */}
       {showQSetPicker && role === "pharmacist" && (
