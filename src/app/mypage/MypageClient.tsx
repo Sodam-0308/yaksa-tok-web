@@ -1102,8 +1102,10 @@ function MypageContent() {
               );
             }
 
+            // hcRows 는 created_at desc 정렬 → [0]=가장 최근, [last]=가장 처음
+            // first vs latest 비교 (직전 vs 최신이 아니라, 처음 기록 vs 최신 기록)
             const current = hcRows[0];
-            const previous = hcRows.length >= 2 ? hcRows[1] : null;
+            const previous = hcRows.length >= 2 ? hcRows[hcRows.length - 1] : null;
             const items = [
               { label: "에너지/활력", key: "energy_score" as const, lowerIsBetter: false },
               { label: "수면", key: "sleep_score" as const, lowerIsBetter: false },

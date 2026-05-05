@@ -118,6 +118,8 @@ function Content() {
    */
   const [loadedForUid, setLoadedForUid] = useState<string | null>(null);
   const [hasPharmacistProfile, setHasPharmacistProfile] = useState(false);
+  // 개선 확인 카운트 (improvement_confirmations 행 개수, pharmacist_id=본인)
+  const [improvementCount, setImprovementCount] = useState<number | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
   // license_name 이 DB 에 존재하면 "이름" 인풋을 잠금 (면허 인증 무결성 보호)
   const [licenseNameLocked, setLicenseNameLocked] = useState(false);
@@ -134,6 +136,7 @@ function Content() {
     address: string;
     expert_specialties: string[];
     available_specialties: string[];
+    pharmacy_photos: string[];
   }>) => {
     if (!user) return;
     type PpUpsert = {
@@ -142,6 +145,7 @@ function Content() {
       address?: string;
       expert_specialties?: string[];
       available_specialties?: string[];
+      pharmacy_photos?: string[];
       // license_name 은 의도적으로 제외 — 면허 인증 무결성 보호
     };
     const payload: PpUpsert = { id: user.id, ...fields };
@@ -193,25 +197,102 @@ function Content() {
   };
 
   /* ── 약국 사진 ── */
-  const [pharmacyPhotos, setPharmacyPhotos] = useState<{ file: File; url: string }[]>([]);
+  // url = Supabase Storage public URL (DB 에 저장된 값과 동일)
+  const [pharmacyPhotos, setPharmacyPhotos] = useState<{ url: string }[]>([]);
   const pGalleryRef = useRef<HTMLInputElement>(null);
   const pCameraRef = useRef<HTMLInputElement>(null);
   const PHARMACY_MAX_PHOTOS = 3;
-
-  const addPharmacyPhotos = (files: FileList | null) => {
-    if (!files) return;
-    const remaining = PHARMACY_MAX_PHOTOS - pharmacyPhotos.length;
-    const newPhotos = Array.from(files).slice(0, remaining).map((file) => ({
-      file,
-      url: URL.createObjectURL(file),
-    }));
-    setPharmacyPhotos((prev) => [...prev, ...newPhotos]);
+  const PHARMACY_BUCKET = "pharmacy-photos";
+  const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
+  const [photoUploading, setPhotoUploading] = useState(false);
+  const [photoToast, setPhotoToast] = useState<string | null>(null);
+  const photoToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showPhotoToast = (msg: string) => {
+    setPhotoToast(msg);
+    if (photoToastTimerRef.current) clearTimeout(photoToastTimerRef.current);
+    photoToastTimerRef.current = setTimeout(() => setPhotoToast(null), 2500);
   };
-  const removePharmacyPhoto = (idx: number) => {
-    setPharmacyPhotos((prev) => {
-      URL.revokeObjectURL(prev[idx].url);
-      return prev.filter((_, i) => i !== idx);
-    });
+
+  // Supabase Storage public URL 에서 bucket 내부 path 추출
+  // URL 예: https://xxx.supabase.co/storage/v1/object/public/pharmacy-photos/<uid>/<ts>.jpg
+  const extractStoragePath = (publicUrl: string, bucket: string): string | null => {
+    const marker = `/storage/v1/object/public/${bucket}/`;
+    const idx = publicUrl.indexOf(marker);
+    if (idx === -1) return null;
+    return publicUrl.slice(idx + marker.length);
+  };
+
+  const addPharmacyPhotos = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    if (!user) {
+      showPhotoToast("로그인이 필요해요");
+      return;
+    }
+    if (pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS) {
+      showPhotoToast(`최대 ${PHARMACY_MAX_PHOTOS}장까지 등록 가능합니다`);
+      return;
+    }
+
+    const remaining = PHARMACY_MAX_PHOTOS - pharmacyPhotos.length;
+    const incoming = Array.from(files).slice(0, remaining);
+    if (Array.from(files).length > remaining) {
+      showPhotoToast(`최대 ${PHARMACY_MAX_PHOTOS}장까지 등록 가능합니다`);
+    }
+
+    setPhotoUploading(true);
+    const newUrls: string[] = [];
+    for (let i = 0; i < incoming.length; i++) {
+      const file = incoming[i];
+      // 형식 검증
+      if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+        showPhotoToast("지원하지 않는 형식입니다 (jpg/png/webp)");
+        continue;
+      }
+      // 크기 검증
+      if (file.size > MAX_IMAGE_BYTES) {
+        showPhotoToast("파일 크기는 5MB 이하만 가능합니다");
+        continue;
+      }
+      const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+      const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+      const path = `${user.id}/${Date.now()}-${i}.${safeExt}`;
+      const { error: upErr } = await supabase.storage
+        .from(PHARMACY_BUCKET)
+        .upload(path, file, { upsert: false, cacheControl: "3600", contentType: file.type });
+      if (upErr) {
+        console.error("[ph-mypage] pharmacy-photos upload failed:", upErr);
+        showPhotoToast(`업로드 실패: ${upErr.message}`);
+        continue;
+      }
+      const { data: pub } = supabase.storage.from(PHARMACY_BUCKET).getPublicUrl(path);
+      if (pub?.publicUrl) newUrls.push(pub.publicUrl);
+    }
+
+    if (newUrls.length > 0) {
+      const next = [...pharmacyPhotos.map((p) => p.url), ...newUrls];
+      setPharmacyPhotos(next.map((url) => ({ url })));
+      await persistPharmacistFields({ pharmacy_photos: next });
+      showPhotoToast(`사진 ${newUrls.length}장 업로드 완료`);
+    }
+    setPhotoUploading(false);
+  };
+
+  const removePharmacyPhoto = async (idx: number) => {
+    const target = pharmacyPhotos[idx];
+    if (!target) return;
+    const next = pharmacyPhotos.filter((_, i) => i !== idx);
+    // 낙관적 업데이트 — 화면 즉시 반영
+    setPharmacyPhotos(next);
+    // Storage 삭제 (path 추출 가능한 경우만)
+    const path = extractStoragePath(target.url, PHARMACY_BUCKET);
+    if (path) {
+      const { error: delErr } = await supabase.storage.from(PHARMACY_BUCKET).remove([path]);
+      if (delErr) {
+        console.warn("[ph-mypage] storage remove failed (DB 는 갱신):", delErr);
+      }
+    }
+    await persistPharmacistFields({ pharmacy_photos: next.map((p) => p.url) });
   };
 
   /* ── 전문 분야 ── */
@@ -256,6 +337,21 @@ function Content() {
    */
   useEffect(() => {
     if (!user) return; // 비로그인 — derived 가 자동으로 적절한 값 (아래 참조)
+
+    // 개선 확인 카운트 — improvement_confirmations 의 본인 행 수
+    (async () => {
+      const { count, error } = await supabase
+        .from("improvement_confirmations")
+        .select("id", { count: "exact", head: true })
+        .eq("pharmacist_id", user.id);
+      if (error) {
+        console.error("[ph-mypage] improvement count failed:", error);
+        setImprovementCount(0);
+        return;
+      }
+      setImprovementCount(count ?? 0);
+    })();
+
     (async () => {
       const [profileRes, ppRes] = await Promise.all([
         supabase
@@ -265,7 +361,7 @@ function Content() {
           .maybeSingle<{ name: string }>(),
         supabase
           .from("pharmacist_profiles")
-          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name")
+          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name, pharmacy_photos")
           .eq("id", user.id)
           .maybeSingle<{
             pharmacy_name: string | null;
@@ -273,6 +369,7 @@ function Content() {
             expert_specialties: string[] | null;
             available_specialties: string[] | null;
             license_name: string | null;
+            pharmacy_photos: string[] | null;
           }>(),
       ]);
 
@@ -290,6 +387,9 @@ function Content() {
         if (pp.address) setPAddress(pp.address);
         if (Array.isArray(pp.expert_specialties)) setExpert(new Set(pp.expert_specialties));
         if (Array.isArray(pp.available_specialties)) setAvailable(new Set(pp.available_specialties));
+        if (Array.isArray(pp.pharmacy_photos)) {
+          setPharmacyPhotos(pp.pharmacy_photos.filter((u) => typeof u === "string" && u).map((url) => ({ url })));
+        }
         setSaved({
           name: displayName,
           pharmacy: pp.pharmacy_name ?? "",
@@ -500,14 +600,31 @@ function Content() {
           <div style={card}>
             <div style={secTitle}>약국 사진</div>
             <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 14 }}>
-              환자가 약국 분위기를 미리 볼 수 있어요 (최대 {PHARMACY_MAX_PHOTOS}장)
+              환자가 약국 분위기를 미리 볼 수 있어요 (최대 {PHARMACY_MAX_PHOTOS}장 · jpg/png/webp · 5MB 이하)
             </div>
+            {photoToast && (
+              <div
+                role="status"
+                style={{
+                  fontSize: 14,
+                  color: "#7A5300",
+                  background: "#FFF8E1",
+                  border: "1px solid #F5DCA0",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  marginBottom: 12,
+                  lineHeight: 1.5,
+                }}
+              >
+                {photoToast}
+              </div>
+            )}
 
             <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
               <button
                 type="button"
                 onClick={() => pGalleryRef.current?.click()}
-                disabled={pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS}
+                disabled={pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS || photoUploading}
                 style={{
                   flex: 1,
                   padding: "11px 0",
@@ -517,8 +634,12 @@ function Content() {
                   background: C.sagePale,
                   color: C.sageDeep,
                   border: "none",
-                  cursor: pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS ? "not-allowed" : "pointer",
-                  opacity: pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS ? 0.5 : 1,
+                  cursor:
+                    pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS || photoUploading
+                      ? "not-allowed"
+                      : "pointer",
+                  opacity:
+                    pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS || photoUploading ? 0.5 : 1,
                 }}
               >
                 🖼 갤러리
@@ -526,7 +647,7 @@ function Content() {
               <button
                 type="button"
                 onClick={() => pCameraRef.current?.click()}
-                disabled={pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS}
+                disabled={pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS || photoUploading}
                 style={{
                   flex: 1,
                   padding: "11px 0",
@@ -536,8 +657,12 @@ function Content() {
                   background: C.sagePale,
                   color: C.sageDeep,
                   border: "none",
-                  cursor: pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS ? "not-allowed" : "pointer",
-                  opacity: pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS ? 0.5 : 1,
+                  cursor:
+                    pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS || photoUploading
+                      ? "not-allowed"
+                      : "pointer",
+                  opacity:
+                    pharmacyPhotos.length >= PHARMACY_MAX_PHOTOS || photoUploading ? 0.5 : 1,
                 }}
               >
                 📸 카메라
@@ -586,7 +711,7 @@ function Content() {
             )}
 
             <div style={{ fontSize: 13, color: C.sageMid }}>
-              {pharmacyPhotos.length}/{PHARMACY_MAX_PHOTOS}장
+              {photoUploading ? "업로드 중..." : `${pharmacyPhotos.length}/${PHARMACY_MAX_PHOTOS}장`}
             </div>
           </div>
 
@@ -597,7 +722,11 @@ function Content() {
               <StatBox label="총 상담" value={`${STATS.total}건`} />
               <StatBox label="완료" value={`${STATS.completed}건`} />
               <StatBox label="평균 답변 시간" value={STATS.avgTime} />
-              <StatBox label="개선 확인" value={`${STATS.improved}건`} accent />
+              <StatBox
+                label="개선 확인"
+                value={improvementCount !== null ? `${improvementCount}건` : "—"}
+                accent
+              />
             </div>
             <div style={{ padding: "14px 16px", borderRadius: 12, background: `linear-gradient(135deg, ${C.terraPale} 0%, ${C.white} 100%)`, border: `1px solid ${C.terraLight}`, marginBottom: 10 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>

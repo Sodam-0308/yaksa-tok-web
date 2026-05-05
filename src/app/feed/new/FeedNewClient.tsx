@@ -2,6 +2,8 @@
 
 import { useState, useRef, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
 
 /* ══════════════════════════════════════════
    타입 & 상수
@@ -46,7 +48,15 @@ const SCORE_LABELS = ["에너지/활력", "수면의 질", "소화 상태", "기
 function FeedNewContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { user } = useAuth();
   const isPharmacist = searchParams.get("role") === "pharmacist";
+
+  // 업로드/등록 진행 상태 + 에러 토스트
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const CASE_BUCKET = "case-photos";
+  const ALLOWED_IMG = ["image/jpeg", "image/png", "image/webp"];
+  const MAX_BYTES = 5 * 1024 * 1024;
 
   /* 환자 기본 */
   const [gender, setGender] = useState<string>("");
@@ -89,11 +99,23 @@ function FeedNewContent() {
   const addPhotos = (files: FileList | null) => {
     if (!files) return;
     const remaining = MAX_PHOTOS - photos.length;
-    const newPhotos = Array.from(files).slice(0, remaining).map((file) => ({
-      file,
-      url: URL.createObjectURL(file),
-    }));
-    setPhotos((prev) => [...prev, ...newPhotos]);
+    const incoming = Array.from(files).slice(0, remaining);
+    const accepted: { file: File; url: string }[] = [];
+    for (const file of incoming) {
+      if (!ALLOWED_IMG.includes(file.type)) {
+        setSubmitError("지원하지 않는 형식입니다 (jpg/png/webp)");
+        continue;
+      }
+      if (file.size > MAX_BYTES) {
+        setSubmitError("파일 크기는 5MB 이하만 가능합니다");
+        continue;
+      }
+      accepted.push({ file, url: URL.createObjectURL(file) });
+    }
+    if (accepted.length > 0) {
+      setPhotos((prev) => [...prev, ...accepted]);
+      setSubmitError(null);
+    }
   };
   const removePhoto = (idx: number) => {
     setPhotos((prev) => {
@@ -129,9 +151,85 @@ function FeedNewContent() {
     setter((prev) => prev.map((v, i) => (i === idx ? val : v)));
   };
 
-  /* 등록 */
-  const handleSubmit = () => {
+  /* 등록 — Supabase Storage 업로드 + case_studies INSERT */
+  const handleSubmit = async () => {
+    if (submitting) return;
     setShowConfirm(false);
+    setSubmitError(null);
+
+    if (!user) {
+      setSubmitError("로그인이 필요해요");
+      return;
+    }
+
+    setSubmitting(true);
+
+    // 1) photos 업로드
+    const photoUrls: string[] = [];
+    for (let i = 0; i < photos.length; i++) {
+      const p = photos[i];
+      const ext = (p.file.name.split(".").pop() || "jpg").toLowerCase();
+      const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+      const path = `${user.id}/${Date.now()}-${i}.${safeExt}`;
+      const { error: upErr } = await supabase.storage
+        .from(CASE_BUCKET)
+        .upload(path, p.file, { upsert: false, cacheControl: "3600", contentType: p.file.type });
+      if (upErr) {
+        console.error("[feed-new] case-photos upload failed:", upErr);
+        setSubmitError(`사진 업로드 실패: ${upErr.message}`);
+        setSubmitting(false);
+        return;
+      }
+      const { data: pub } = supabase.storage.from(CASE_BUCKET).getPublicUrl(path);
+      if (pub?.publicUrl) photoUrls.push(pub.publicUrl);
+    }
+
+    // 2) case_studies INSERT
+    type CsInsert = {
+      author_id: string;
+      author_type: "pharmacist" | "patient";
+      pharmacist_id: string | null;
+      title: string;
+      symptoms: string[];
+      patient_age_group: string | null;
+      patient_gender: string | null;
+      description: string;
+      outcome: string | null;
+      duration_weeks: number | null;
+      photos: string[];
+      patient_consent_checked: boolean;
+      is_published: boolean;
+    };
+    // duration "2~4주" → 3 (대략 중앙값) 등 단순 매핑은 생략 — null 로 둠
+    const payload: CsInsert = {
+      author_id: user.id,
+      author_type: uploaderType,
+      pharmacist_id: uploaderType === "pharmacist" ? user.id : null,
+      title: title.trim() || "(제목 없음)",
+      symptoms: Array.from(symptoms),
+      patient_age_group: ageGroup || null,
+      patient_gender: gender || null,
+      description: (beforeDesc || "").trim() || "(내용 없음)",
+      outcome: (afterDesc || "").trim() || null,
+      duration_weeks: null,
+      photos: photoUrls,
+      patient_consent_checked: uploaderType === "pharmacist" ? consent : true,
+      is_published: true,
+    };
+    const { error: insErr } = await (supabase
+      .from("case_studies") as unknown as {
+        insert: (p: CsInsert) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(payload);
+    if (insErr) {
+      console.error("[feed-new] case_studies insert failed:", insErr);
+      setSubmitError(`등록 실패: ${insErr.message}`);
+      setSubmitting(false);
+      return;
+    }
+    console.log("[feed-new] case_studies created with photos:", photoUrls.length);
+
+    setSubmitting(false);
     setShowToast(true);
     setTimeout(() => {
       setShowToast(false);
@@ -432,6 +530,23 @@ function FeedNewContent() {
         {/* ── 사진 첨부 ── */}
         <section className="fn-section">
           <h2 className="fn-section-title">📷 사진 첨부</h2>
+          {submitError && (
+            <div
+              role="alert"
+              style={{
+                fontSize: 14,
+                color: "#D02F2F",
+                background: "#FFF3F3",
+                border: "1px solid #F5C8C8",
+                padding: "10px 12px",
+                borderRadius: 10,
+                marginBottom: 12,
+                lineHeight: 1.5,
+              }}
+            >
+              {submitError}
+            </div>
+          )}
           <p className="fn-field-hint">최대 {MAX_PHOTOS}장까지 첨부할 수 있어요 (선택)</p>
 
           {/* 업로더 유형 (약사만 선택 가능) */}
@@ -600,10 +715,17 @@ function FeedNewContent() {
               className="fn-btn primary"
               onClick={() => setShowConfirm(true)}
               type="button"
-              disabled={uploaderType === "pharmacist" && photos.length > 0 && !consent}
-              style={uploaderType === "pharmacist" && photos.length > 0 && !consent ? { opacity: 0.5, cursor: "not-allowed" } : {}}
+              disabled={
+                submitting ||
+                (uploaderType === "pharmacist" && photos.length > 0 && !consent)
+              }
+              style={
+                submitting || (uploaderType === "pharmacist" && photos.length > 0 && !consent)
+                  ? { opacity: 0.5, cursor: "not-allowed" }
+                  : {}
+              }
             >
-              등록하기
+              {submitting ? "등록 중..." : "등록하기"}
             </button>
           </div>
         </div>

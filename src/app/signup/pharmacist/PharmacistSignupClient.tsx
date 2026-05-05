@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback, Suspense } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -39,8 +39,12 @@ const C = {
 
 function PharmacistSignupContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { user } = useAuth();
-  const [step, setStep] = useState(1);
+  // ?step=license 로 진입하면 step 3(면허 인증)부터 시작
+  // — license_name 미입력 기존 약사 계정 콜백용
+  const initialStep = searchParams.get("step") === "license" ? 3 : 1;
+  const [step, setStep] = useState(initialStep);
   const [submitting, setSubmitting] = useState(false);
 
   /* ── Step 1: 본인 인증 ── */

@@ -1,8 +1,10 @@
 "use client";
 
-import { useState, useEffect, Suspense } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useState, useEffect, useRef, Suspense } from "react";
+import { useRouter, useSearchParams, useParams } from "next/navigation";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
+import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
 
 /* ══════════════════════════════════════════
    아이콘
@@ -180,6 +182,7 @@ interface VisitRecord {
   improvement?: string;
   pharmacistGuide?: string;
   pharmacistNote?: string;
+  photos: string[];
 }
 
 type ConsultationStatus = "completed" | "active" | "rejected";
@@ -284,6 +287,7 @@ const MOCK_VISITS: VisitRecord[] = [
     improvement: "소화 문제는 안정, 아침 속 편해짐",
     pharmacistGuide: "비타민B군 꾸준히, 마그네슘은 취침 30분 전 꼭 복용",
     pharmacistNote: "수면 쪽 집중 관리 필요. 카페인 줄이기 재차 안내. 2주 후 재방문 권고.",
+    photos: [],
   },
   {
     id: "visit-1",
@@ -297,6 +301,7 @@ const MOCK_VISITS: VisitRecord[] = [
     improvement: "",
     pharmacistGuide: "아침 공복 유산균, 식사 직전 소화효소 1알",
     pharmacistNote: "첫 방문. 스트레스성 소화장애 가능성. 2주 후 재방문 권고.",
+    photos: [],
   },
 ];
 
@@ -701,6 +706,159 @@ function ChartContent() {
   const [expandedVisits, setExpandedVisits] = useState<Set<string>>(
     new Set(sortedVisits.slice(0, 1).map((v) => v.id))
   );
+
+  /* ── visit_records DB 로드 (consultation_id 기준) ── */
+  const params = useParams();
+  const consultationId = typeof params?.id === "string" ? params.id : null;
+  const { user: authUser } = useAuth();
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const isUuid = (s: string | null | undefined): s is string => !!s && UUID_RE.test(s);
+
+  useEffect(() => {
+    if (!consultationId || !isUuid(consultationId)) return; // mock 차트(c1 등)는 DB 로드 스킵
+    if (!authUser) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("visit_records")
+        .select(
+          "id, visit_date, purchased_supplements, dosage_days, patient_complaint, patient_improvement, pharmacist_guide, pharmacist_opinion, pharmacist_photos",
+        )
+        .eq("consultation_id", consultationId)
+        .order("visit_date", { ascending: false });
+      if (cancelled) return;
+      if (error) {
+        console.error("[chart] visit_records load failed:", error);
+        return;
+      }
+      type VrRow = {
+        id: string;
+        visit_date: string;
+        purchased_supplements: SupplementItem[] | null;
+        dosage_days: number | null;
+        patient_complaint: string | null;
+        patient_improvement: string | null;
+        pharmacist_guide: string | null;
+        pharmacist_opinion: string | null;
+        pharmacist_photos: string[] | null;
+      };
+      const rows = ((data ?? []) as unknown) as VrRow[];
+      if (rows.length === 0) return; // mock 폴백 유지 (개발 편의)
+      const mapped: VisitRecord[] = rows.map((r) => ({
+        id: r.id,
+        date: r.visit_date,
+        products: Array.isArray(r.purchased_supplements) ? r.purchased_supplements : [],
+        durationDays: r.dosage_days ?? undefined,
+        complaint: r.patient_complaint ?? undefined,
+        improvement: r.patient_improvement ?? undefined,
+        pharmacistGuide: r.pharmacist_guide ?? undefined,
+        pharmacistNote: r.pharmacist_opinion ?? undefined,
+        photos: Array.isArray(r.pharmacist_photos)
+          ? r.pharmacist_photos.filter((u): u is string => typeof u === "string" && u.length > 0)
+          : [],
+      }));
+      setVisits(mapped);
+      console.log("[chart] visit_records loaded:", mapped.length);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consultationId, authUser]);
+
+  /* ── 차트 사진 업로드 (chart-photos 버킷) ── */
+  const CHART_BUCKET = "chart-photos";
+  const ALLOWED_IMG = ["image/jpeg", "image/png", "image/webp"];
+  const MAX_BYTES = 5 * 1024 * 1024;
+  const MAX_VISIT_PHOTOS = 4;
+  const [photoUploading, setPhotoUploading] = useState<string | null>(null); // visitId
+  const [photoToast, setPhotoToast] = useState<string | null>(null);
+  const photoToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showPhotoToast = (msg: string) => {
+    setPhotoToast(msg);
+    if (photoToastTimerRef.current) clearTimeout(photoToastTimerRef.current);
+    photoToastTimerRef.current = setTimeout(() => setPhotoToast(null), 2500);
+  };
+  const extractStoragePath = (publicUrl: string, bucket: string): string | null => {
+    const marker = `/storage/v1/object/public/${bucket}/`;
+    const idx = publicUrl.indexOf(marker);
+    if (idx === -1) return null;
+    return publicUrl.slice(idx + marker.length);
+  };
+  // visit.id 가 UUID 인 경우만 DB UPDATE 수행 (mock visit 은 로컬 state 만 갱신)
+  const persistVisitPhotos = async (visitId: string, photos: string[]) => {
+    if (!isUuid(visitId)) return;
+    type Vu = { pharmacist_photos: string[] };
+    const { error } = await (supabase
+      .from("visit_records") as unknown as {
+        update: (p: Vu) => { eq: (col: string, val: string) => Promise<{ error: { message: string } | null }> };
+      })
+      .update({ pharmacist_photos: photos })
+      .eq("id", visitId);
+    if (error) console.error("[chart] visit_records photos UPDATE failed:", error);
+  };
+  const addVisitPhotos = async (visitId: string, files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    if (!authUser) {
+      showPhotoToast("로그인이 필요해요");
+      return;
+    }
+    const target = visits.find((v) => v.id === visitId);
+    if (!target) return;
+    if (target.photos.length >= MAX_VISIT_PHOTOS) {
+      showPhotoToast(`방문당 최대 ${MAX_VISIT_PHOTOS}장까지 등록 가능합니다`);
+      return;
+    }
+    const remaining = MAX_VISIT_PHOTOS - target.photos.length;
+    const incoming = Array.from(files).slice(0, remaining);
+    if (Array.from(files).length > remaining) {
+      showPhotoToast(`방문당 최대 ${MAX_VISIT_PHOTOS}장까지 등록 가능합니다`);
+    }
+    setPhotoUploading(visitId);
+    const newUrls: string[] = [];
+    for (let i = 0; i < incoming.length; i++) {
+      const file = incoming[i];
+      if (!ALLOWED_IMG.includes(file.type)) {
+        showPhotoToast("지원하지 않는 형식입니다 (jpg/png/webp)");
+        continue;
+      }
+      if (file.size > MAX_BYTES) {
+        showPhotoToast("파일 크기는 5MB 이하만 가능합니다");
+        continue;
+      }
+      const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+      const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+      const consPart = consultationId || "no-cons";
+      const path = `${authUser.id}/${consPart}/${visitId}/${Date.now()}-${i}.${safeExt}`;
+      const { error: upErr } = await supabase.storage
+        .from(CHART_BUCKET)
+        .upload(path, file, { upsert: false, cacheControl: "3600", contentType: file.type });
+      if (upErr) {
+        console.error("[chart] chart-photos upload failed:", upErr);
+        showPhotoToast(`업로드 실패: ${upErr.message}`);
+        continue;
+      }
+      const { data: pub } = supabase.storage.from(CHART_BUCKET).getPublicUrl(path);
+      if (pub?.publicUrl) newUrls.push(pub.publicUrl);
+    }
+    if (newUrls.length > 0) {
+      const nextPhotos = [...target.photos, ...newUrls];
+      setVisits((prev) => prev.map((v) => (v.id === visitId ? { ...v, photos: nextPhotos } : v)));
+      await persistVisitPhotos(visitId, nextPhotos);
+      showPhotoToast(`사진 ${newUrls.length}장 업로드 완료`);
+    }
+    setPhotoUploading(null);
+  };
+  const removeVisitPhoto = async (visitId: string, photoUrl: string) => {
+    const target = visits.find((v) => v.id === visitId);
+    if (!target) return;
+    const nextPhotos = target.photos.filter((p) => p !== photoUrl);
+    setVisits((prev) => prev.map((v) => (v.id === visitId ? { ...v, photos: nextPhotos } : v)));
+    const path = extractStoragePath(photoUrl, CHART_BUCKET);
+    if (path) {
+      const { error: delErr } = await supabase.storage.from(CHART_BUCKET).remove([path]);
+      if (delErr) console.warn("[chart] chart-photos remove failed (DB 갱신은 진행):", delErr);
+    }
+    await persistVisitPhotos(visitId, nextPhotos);
+  };
   const toggleVisit = (id: string) => {
     setExpandedVisits((prev) => {
       const next = new Set(prev);
@@ -925,6 +1083,30 @@ function ChartContent() {
             환자 차트
           </div>
         </nav>
+
+        {/* 차트 사진 업로드 토스트 */}
+        {photoToast && (
+          <div
+            role="status"
+            style={{
+              position: "fixed",
+              top: 70,
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 200,
+              fontSize: 14,
+              color: "#7A5300",
+              background: "#FFF8E1",
+              border: "1px solid #F5DCA0",
+              padding: "10px 16px",
+              borderRadius: 10,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+              maxWidth: 360,
+            }}
+          >
+            {photoToast}
+          </div>
+        )}
 
         <div className="chart-container">
           {/* ── 1. 기본 정보 ── */}
@@ -1378,6 +1560,16 @@ function ChartContent() {
                                 onCancel={() => setEditingVisitField(null)} />
                             </>
                           )}
+
+                          {/* 차트 사진 업로드 */}
+                          <div style={dividerStyle} />
+                          <VisitPhotoBlock
+                            visit={v}
+                            uploading={photoUploading === v.id}
+                            maxCount={MAX_VISIT_PHOTOS}
+                            onAdd={(files) => addVisitPhotos(v.id, files)}
+                            onRemove={(url) => removeVisitPhoto(v.id, url)}
+                          />
 
                           {/* 빈 텍스트 필드 추가 진입점 */}
                           {(() => {
@@ -2040,6 +2232,115 @@ function VisitField({
           <EditBtn onClick={onStart} label={`${label} 편집`} />
         </div>
       )}
+    </div>
+  );
+}
+
+/* ── 차트 사진 업로드 블록 (각 방문 기록 카드 내부) ── */
+function VisitPhotoBlock({
+  visit,
+  uploading,
+  maxCount,
+  onAdd,
+  onRemove,
+}: {
+  visit: VisitRecord;
+  uploading: boolean;
+  maxCount: number;
+  onAdd: (files: FileList | null) => void;
+  onRemove: (url: string) => void;
+}) {
+  const galleryRef = useRef<HTMLInputElement>(null);
+  const cameraRef = useRef<HTMLInputElement>(null);
+  const reachedMax = visit.photos.length >= maxCount;
+  const btnStyle = (disabled: boolean): React.CSSProperties => ({
+    flex: 1,
+    padding: "9px 0",
+    borderRadius: 10,
+    fontSize: 13,
+    fontWeight: 600,
+    background: "#EDF4F0",
+    color: "#4A6355",
+    border: "none",
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.5 : 1,
+  });
+  return (
+    <div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 8 }}>
+        방문 사진 (방문당 최대 {maxCount}장 · jpg/png/webp · 5MB 이하)
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <button
+          type="button"
+          onClick={() => galleryRef.current?.click()}
+          disabled={reachedMax || uploading}
+          style={btnStyle(reachedMax || uploading)}
+        >
+          🖼 갤러리
+        </button>
+        <button
+          type="button"
+          onClick={() => cameraRef.current?.click()}
+          disabled={reachedMax || uploading}
+          style={btnStyle(reachedMax || uploading)}
+        >
+          📸 카메라
+        </button>
+      </div>
+      <input
+        ref={galleryRef}
+        type="file"
+        accept="image/*"
+        multiple
+        style={{ display: "none" }}
+        onChange={(e) => { onAdd(e.target.files); e.target.value = ""; }}
+      />
+      <input
+        ref={cameraRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        style={{ display: "none" }}
+        onChange={(e) => { onAdd(e.target.files); e.target.value = ""; }}
+      />
+      {visit.photos.length > 0 && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+          {visit.photos.map((url, i) => (
+            <div
+              key={url + i}
+              style={{
+                position: "relative",
+                width: 80,
+                height: 80,
+                borderRadius: 10,
+                overflow: "hidden",
+                border: "1px solid rgba(94,125,108,0.14)",
+              }}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={url} alt={`방문 사진 ${i + 1}`} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              <button
+                type="button"
+                onClick={() => onRemove(url)}
+                style={{
+                  position: "absolute", top: 3, right: 3,
+                  width: 20, height: 20, borderRadius: "50%",
+                  background: "rgba(0,0,0,0.55)", color: "#fff",
+                  border: "none", fontSize: 12, lineHeight: "20px",
+                  textAlign: "center", cursor: "pointer", padding: 0,
+                }}
+                aria-label={`방문 사진 ${i + 1} 삭제`}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ fontSize: 12, color: "#5E7D6C" }}>
+        {uploading ? "업로드 중..." : `${visit.photos.length}/${maxCount}장`}
+      </div>
     </div>
   );
 }

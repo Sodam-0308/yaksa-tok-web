@@ -1828,6 +1828,29 @@ function DashboardContent() {
     patient_profile: { birth_year: number | null; gender: string | null } | null;
   }
   const { user: authUser } = useAuth();
+
+  /* ── license_name 미등록 약사 가드 ──
+   * 직접 URL 로 /dashboard 에 접근한 약사 중 pharmacist_profiles.license_name 이
+   * NULL/빈값이면 면허증 이름 입력 단계로 보냄. (콜백 라우트와 동일한 정책)
+   */
+  useEffect(() => {
+    if (!authUser) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase
+        .from("pharmacist_profiles")
+        .select("license_name")
+        .eq("id", authUser.id)
+        .maybeSingle<{ license_name: string | null }>();
+      if (cancelled) return;
+      const ln = data?.license_name?.trim() || "";
+      if (!ln) {
+        router.replace("/signup/pharmacist?step=license");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [authUser, router]);
+
   const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
   const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
   const [dbPendingLoading, setDbPendingLoading] = useState(true);

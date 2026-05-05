@@ -230,9 +230,38 @@ function HealthCheckContent() {
       return true;
     }
     setSaving(true);
+
+    // 활성 consultation_id 조회 — calculate_improvement 트리거가 동작하려면 필수
+    // (NULL 이면 트리거가 IF cons_row.id IS NULL THEN RETURN 으로 빠짐)
+    const ACTIVE_STATUSES = [
+      "matched",
+      "accepted",
+      "chatting",
+      "visit_scheduled",
+      "visited",
+      "report_sent",
+    ];
+    let consultationId: string | null = null;
+    {
+      const { data: consData, error: consErr } = await supabase
+        .from("consultations")
+        .select("id")
+        .eq("patient_id", user.id)
+        .in("status", ACTIVE_STATUSES)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle<{ id: string }>();
+      if (consErr) {
+        console.error("[health-check] active consultation lookup failed:", consErr);
+      } else if (consData?.id) {
+        consultationId = consData.id;
+      }
+    }
+    console.log("[health-check] resolved consultation_id:", consultationId);
+
     const payload: HealthCheckInsert = {
       patient_id: user.id,
-      consultation_id: null,
+      consultation_id: consultationId,
       energy_score: scores.energy,
       sleep_score: scores.sleep,
       digestion_score: scores.digestion,
