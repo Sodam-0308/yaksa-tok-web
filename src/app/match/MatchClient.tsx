@@ -315,58 +315,119 @@ function MatchContent() {
     // 실제 DB 약사면 UUID 그대로 사용. Mock 약사면 pharmacist_id는 null.
     const realPharmacistId = PHARM_UUID_RE.test(pharmacist.id) ? pharmacist.id : null;
 
-    const payload: ConsultationInsert = {
-      patient_id: user.id,
-      pharmacist_id: realPharmacistId,
-      questionnaire_id: questionnaireId,
-      consultation_type: "local",
-      status: "pending",
-      matching_source: "ai_questionnaire",
+    const finishWithError = (msg: string) => {
+      setRequestToast(msg);
+      setRequestingNames((prev) => {
+        const next = new Set(prev);
+        next.delete(pharmacistName);
+        return next;
+      });
+      setTimeout(() => setRequestToast(null), 2500);
     };
 
-    console.log("[match] consultations insert payload:", payload);
-
     try {
-      const { data, error } = await (supabase
-        .from("consultations") as unknown as {
-          insert: (p: ConsultationInsert) => {
-            select: (cols: string) => {
-              maybeSingle: () => Promise<{
-                data: { id: string } | null;
-                error: { message: string; code?: string; details?: string; hint?: string } | null;
-              }>;
-            };
-          };
-        })
-        .insert(payload)
-        .select("id")
-        .maybeSingle();
-
-      if (error) {
-        console.error("[match] consultation create FAILED:", {
-          message: error.message,
-          code: error.code,
-          details: error.details,
-          hint: error.hint,
-        });
-        setRequestToast("상담 요청을 보내지 못했어요. 잠시 후 다시 시도해주세요.");
-        setRequestingNames((prev) => {
-          const next = new Set(prev);
-          next.delete(pharmacistName);
-          return next;
-        });
-        setTimeout(() => setRequestToast(null), 2500);
-        return;
+      // ── 1단계: 같은 (patient_id, pharmacist_id) 페어로 기존 consultation 조회 ──
+      // 차수 모델에 따라 같은 환자·약사 페어는 하나의 채팅방을 공유. 종료(completed)된
+      // 상담이라도 새 차수로 재활성화.
+      let consultationId: string | null = null;
+      let isNewConsultation = false;
+      if (realPharmacistId) {
+        const existResp = await supabase
+          .from("consultations")
+          .select("id, status")
+          .eq("patient_id", user.id)
+          .eq("pharmacist_id", realPharmacistId)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle<{ id: string; status: string | null }>();
+        if (existResp.error) {
+          console.error("[match] existing consultation lookup failed:", existResp.error);
+        } else if (existResp.data?.id) {
+          consultationId = existResp.data.id;
+          console.log("[match] reusing existing consultation — id:", consultationId, "prev status:", existResp.data.status);
+        }
       }
 
-      console.log("[match] consultation created — id:", data?.id);
+      // ── 2단계: 신규 분기 — consultations INSERT ──
+      if (!consultationId) {
+        const payload: ConsultationInsert = {
+          patient_id: user.id,
+          pharmacist_id: realPharmacistId,
+          questionnaire_id: questionnaireId,
+          consultation_type: "local",
+          status: "pending",
+          matching_source: "ai_questionnaire",
+        };
+        console.log("[match] consultations insert payload (new):", payload);
+        const insResp = await (supabase
+          .from("consultations") as unknown as {
+            insert: (p: ConsultationInsert) => {
+              select: (cols: string) => {
+                maybeSingle: () => Promise<{
+                  data: { id: string } | null;
+                  error: { message: string; code?: string; details?: string; hint?: string } | null;
+                }>;
+              };
+            };
+          })
+          .insert(payload)
+          .select("id")
+          .maybeSingle();
+        if (insResp.error || !insResp.data?.id) {
+          console.error("[match] consultation create FAILED:", insResp.error);
+          finishWithError("상담 요청을 보내지 못했어요. 잠시 후 다시 시도해주세요.");
+          return;
+        }
+        consultationId = insResp.data.id;
+        isNewConsultation = true;
+        console.log("[match] consultation created — id:", consultationId);
+      } else {
+        // ── 2단계 대안: 재사용 분기 — status='pending' 으로 재활성화 + completed_at NULL ──
+        type ConsUpdate = {
+          status: string;
+          completed_at: string | null;
+          questionnaire_id?: string | null;
+        };
+        const upPayload: ConsUpdate = {
+          status: "pending",
+          completed_at: null,
+          // 새 차수의 문답이 있으면 consultations.questionnaire_id 도 갱신해 가장 최근 문답을 노출
+          ...(questionnaireId ? { questionnaire_id: questionnaireId } : {}),
+        };
+        const upResp = await (supabase
+          .from("consultations") as unknown as {
+            update: (p: ConsUpdate) => {
+              eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+            };
+          })
+          .update(upPayload)
+          .eq("id", consultationId);
+        if (upResp.error) {
+          console.error("[match] consultation reactivate FAILED:", upResp.error);
+          finishWithError("상담 요청을 보내지 못했어요. 잠시 후 다시 시도해주세요.");
+          return;
+        }
+        console.log("[match] consultation reactivated — id:", consultationId);
+      }
+
+      // ── consultation_rounds INSERT 는 약사 수락 시점으로 이동 ──
+      // (DashboardClient.updatePendingStatus 에서 status='accepted' 직후 INSERT.)
+      // 매칭 요청 시점에는 round 가 없는 상태(pending)로만 두고, 수락된 시점에만
+      // 실제 회차가 시작된 것으로 본다. 이전엔 요청 시점 INSERT 였는데 회차 종료
+      // 시 status UPDATE 가 빠져 있어 직전 회차가 'active' 그대로 남았고, 다음
+      // 매칭 요청 시 새 round 생성이 (조용히) 실패하는 원인이 됐다.
+
       setRequestedNames((prev) => new Set(prev).add(pharmacistName));
       setRequestingNames((prev) => {
         const next = new Set(prev);
         next.delete(pharmacistName);
         return next;
       });
-      setRequestToast(`${pharmacistName}에게 상담 요청을 보냈어요!`);
+      setRequestToast(
+        isNewConsultation
+          ? `${pharmacistName}에게 상담 요청을 보냈어요!`
+          : `${pharmacistName}에게 새 차수 상담 요청을 보냈어요!`,
+      );
       setTimeout(() => setRequestToast(null), 2500);
     } catch (err) {
       console.error("[match] consultation create threw:", err);

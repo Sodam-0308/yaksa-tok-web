@@ -23,6 +23,16 @@ interface DbMessageRow {
   message_type: string;
   is_read: boolean;
   created_at: string;
+  round_id: string | null;
+}
+
+interface DbRound {
+  id: string;
+  round_number: number;
+  questionnaire_id: string | null;
+  started_at: string;
+  ended_at: string | null;
+  status: string | null;
 }
 
 function fmtChatTime(iso: string): string {
@@ -42,6 +52,13 @@ interface Message {
   isRead: boolean;
   sessionId?: string;
   pharmacistOnly?: boolean;
+  // DB 모드 차수 분리용 (consultation_rounds.id). null 이면 옛 메시지 → 첫 round 에 포함시켜 표시
+  round_id?: string | null;
+  // DB 모드 messages.message_type 보존 — 'system' 이면 시스템 메시지 렌더 분기.
+  // mock 모드에서는 미설정 → "[시스템]" prefix 폴백 사용.
+  message_type?: string;
+  // DB 모드 messages.created_at 보존 — 회차 구분자 라벨에 날짜 표시용.
+  created_at?: string;
 }
 
 const DEMO_MESSAGES: Message[] = [
@@ -115,7 +132,6 @@ const PHARMACIST_INFO = {
   name: "김서연 약사",
   pharmacy: "초록숲 약국",
   avatar: "👩‍⚕️",
-  status: "online" as const,
 };
 
 
@@ -344,6 +360,24 @@ function ChatContent() {
     pharmacist_id: string | null;
     status: string | null;
   } | null>(null);
+  // 차수 목록 + 활성 차수 (DB 모드 전용; mock 모드에선 빈 배열 + null)
+  const [rounds, setRounds] = useState<DbRound[]>([]);
+  const [activeRoundId, setActiveRoundId] = useState<string | null>(null);
+  // 차수별 questionnaire 콘텐츠 — DB 모드 박스 렌더에 사용
+  interface QuestionnaireContent {
+    symptoms: string[] | null;
+    ai_summary: string | null;
+    free_text: string | null;
+    completed_at: string | null;
+  }
+  const [questionnaireById, setQuestionnaireById] = useState<Map<string, QuestionnaireContent>>(
+    new Map(),
+  );
+  // 상대방 표시 이름 (DB 모드) — 환자 측에선 약사 license_name + 약국, 약사 측에선 환자 profiles.name
+  const [dbCounterpartName, setDbCounterpartName] = useState<string | null>(null);
+  const [dbCounterpartPharmacy, setDbCounterpartPharmacy] = useState<string | null>(null);
+  const [dbCounterpartLicenseName, setDbCounterpartLicenseName] = useState<string | null>(null);
+  const [dbCounterpartAvatarUrl, setDbCounterpartAvatarUrl] = useState<string | null>(null);
   const [dbLoading, setDbLoading] = useState(isDbConsultation);
   const [dbError, setDbError] = useState<string | null>(null);
   // 종료 액션 상태 (환자 측 "상담 종료" 버튼 → 모달 → UPDATE)
@@ -722,18 +756,147 @@ function ChatContent() {
       const cons = consResp.data;
       setDbConsultation(cons);
 
+      // 1.2) 상대방 식별 — 내가 patient 면 약사가 상대, 내가 pharmacist 면 환자가 상대
+      // 상대방 profiles.name 조회. role==='patient' 인 경우 pharmacist_profiles.license_name + pharmacy_name 도 같이.
+      if (user) {
+        const counterpartId =
+          user.id === cons.patient_id ? cons.pharmacist_id : cons.patient_id;
+        const counterpartIsPharmacist = user.id === cons.patient_id;
+        if (counterpartId) {
+          const profResp = await supabase
+            .from("profiles")
+            .select("name, avatar_url")
+            .eq("id", counterpartId)
+            .maybeSingle<{ name: string | null; avatar_url: string | null }>();
+          if (!cancelled) {
+            const n = profResp.data?.name?.trim() || null;
+            const av = profResp.data?.avatar_url?.trim() || null;
+            setDbCounterpartName(n);
+            setDbCounterpartAvatarUrl(av);
+            if (profResp.error) {
+              console.error("[chat] counterpart profiles fetch failed:", profResp.error);
+            }
+          }
+          if (counterpartIsPharmacist) {
+            const ppResp = await supabase
+              .from("pharmacist_profiles")
+              .select("license_name, pharmacy_name")
+              .eq("id", counterpartId)
+              .maybeSingle<{ license_name: string | null; pharmacy_name: string | null }>();
+            if (!cancelled) {
+              if (ppResp.error) {
+                console.error("[chat] counterpart pharmacist_profiles fetch failed:", ppResp.error);
+              }
+              setDbCounterpartLicenseName(ppResp.data?.license_name?.trim() || null);
+              setDbCounterpartPharmacy(ppResp.data?.pharmacy_name?.trim() || null);
+            }
+          }
+        }
+      }
+
+      // 1.5) consultation_rounds 로드 — 차수 탭 + 메시지 필터용
+      const roundsResp = await supabase
+        .from("consultation_rounds")
+        .select("id, round_number, questionnaire_id, started_at, ended_at, status")
+        .eq("consultation_id", chatId)
+        .order("round_number", { ascending: true });
+      if (cancelled) return;
+      let loadedRounds: DbRound[] = [];
+      if (roundsResp.error) {
+        console.error("[chat] consultation_rounds load failed:", roundsResp.error);
+      } else {
+        loadedRounds = ((roundsResp.data ?? []) as unknown) as DbRound[];
+      }
+      setRounds(loadedRounds);
+      // 활성 차수 기본값 = 가장 최근 round (round_number 가 가장 큼). rounds 가 빈 배열이면 null → 통합 뷰 폴백
+      const latestRoundId = loadedRounds.length > 0 ? loadedRounds[loadedRounds.length - 1].id : null;
+      setActiveRoundId(latestRoundId);
+      console.log("[chat] rounds loaded:", loadedRounds.length, "active:", latestRoundId);
+
+      // 1.6) ai_questionnaires 콘텐츠 IN 쿼리 — 차수별 박스 렌더용
+      const qIds = Array.from(
+        new Set(
+          loadedRounds
+            .map((r) => r.questionnaire_id)
+            .filter((id): id is string => !!id),
+        ),
+      );
+      if (qIds.length > 0) {
+        const qResp = await supabase
+          .from("ai_questionnaires")
+          .select("id, symptoms, ai_summary, free_text, completed_at")
+          .in("id", qIds);
+        if (!cancelled) {
+          if (qResp.error) {
+            // RLS 에러 가능성 — ai_questionnaires SELECT 정책이 환자/약사 본인 row 허용하는지 확인 필요
+            console.error("[chat] ai_questionnaires load failed:", qResp.error);
+          } else {
+            const map = new Map<string, QuestionnaireContent>();
+            for (const q of (qResp.data ?? []) as Array<
+              { id: string } & QuestionnaireContent
+            >) {
+              map.set(q.id, {
+                symptoms: q.symptoms,
+                ai_summary: q.ai_summary,
+                free_text: q.free_text,
+                completed_at: q.completed_at,
+              });
+            }
+            setQuestionnaireById(map);
+            console.log("[chat] ai_questionnaires loaded:", map.size);
+          }
+        }
+      }
+
       const mapRow = (row: DbMessageRow): Message => ({
         id: row.id,
         sender: row.sender_id === cons.patient_id ? "patient" : "pharmacist",
         content: row.content,
         time: fmtChatTime(row.created_at),
         isRead: row.is_read,
+        round_id: row.round_id ?? null,
+        message_type: row.message_type,
+        created_at: row.created_at,
       });
 
-      // 2) 기존 메시지 로드
+      // 상대방이 보낸 미읽음 메시지 일괄 읽음 처리
+      //  - DB: messages.is_read=true, read_at=NOW()
+      //  - 로컬 state: 상대방 sender 의 isRead 를 true 로 동기화 (채팅 목록 unread 배지 즉시 0)
+      //  - 에러는 console.error 만 (사용자 노출 X)
+      const markCounterpartRead = async (): Promise<void> => {
+        if (!user) return;
+        const upResp = await (supabase
+          .from("messages") as unknown as {
+            update: (p: { is_read: boolean; read_at: string }) => {
+              eq: (col: string, val: string) => {
+                neq: (col: string, val: string) => {
+                  eq: (col: string, val: boolean) => Promise<{ error: { message: string } | null }>;
+                };
+              };
+            };
+          })
+          .update({ is_read: true, read_at: new Date().toISOString() })
+          .eq("consultation_id", chatId)
+          .neq("sender_id", user.id)
+          .eq("is_read", false);
+        if (upResp.error) {
+          console.error("[chat] mark-read UPDATE failed:", upResp.error);
+          return;
+        }
+        if (cancelled) return;
+        const counterpartRole: "patient" | "pharmacist" =
+          user.id === cons.patient_id ? "pharmacist" : "patient";
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.sender === counterpartRole && !m.isRead ? { ...m, isRead: true } : m,
+          ),
+        );
+      };
+
+      // 2) 기존 메시지 로드 (round_id 포함)
       const msgResp = await supabase
         .from("messages")
-        .select("id, consultation_id, sender_id, content, message_type, is_read, created_at")
+        .select("id, consultation_id, sender_id, content, message_type, is_read, created_at, round_id")
         .eq("consultation_id", chatId)
         .order("created_at", { ascending: true });
       if (cancelled) return;
@@ -747,6 +910,9 @@ function ChatContent() {
       setMessages(rows.map(mapRow));
       setDbLoading(false);
       console.log("[chat] loaded messages:", rows.length);
+
+      // 2.5) 진입 시점에 상대방 미읽음 메시지 읽음 처리
+      void markCounterpartRead();
 
       // 3) Realtime 구독
       channel = supabase
@@ -765,6 +931,10 @@ function ChatContent() {
               if (prev.some((m) => m.id === row.id)) return prev; // 옵티미스틱 중복 방지
               return [...prev, mapRow(row)];
             });
+            // 상대방이 보낸 메시지면 즉시 읽음 처리 (채팅방 열려있는 동안 배지 누적 방지)
+            if (user && row.sender_id !== user.id) {
+              void markCounterpartRead();
+            }
           },
         )
         .subscribe((status) => {
@@ -812,23 +982,86 @@ function ChatContent() {
       console.error("[chat] end-consultation UPDATE failed:", upResp.error);
       return { ok: false, error: upResp.error.message };
     }
-    // 시스템 메시지 — 실패해도 상담 종료 자체는 성공이므로 best-effort
-    const sysPayload: MessageInsert = {
-      consultation_id: chatId,
-      sender_id: user.id,
-      content:
-        actorRole === "patient"
-          ? "환자가 상담을 종료했습니다."
-          : "약사가 상담을 종료했습니다.",
-      message_type: "system",
-    };
-    const msgResp = await (supabase
-      .from("messages") as unknown as {
-        insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
-      })
-      .insert(sysPayload);
-    if (msgResp.error) {
-      console.warn("[chat] end-consultation system message INSERT failed (UPDATE 는 성공):", msgResp.error);
+    // 1) 종료 안내 메시지 INSERT 먼저 (작별 인사/시스템 알림이 위에, 회차 종료 구분자가 아래에 표시되도록).
+    //    actorRole 별로 의미가 달라 분기:
+    //      환자 종료 → 시스템 알림 (가운데 박스, is_read=true)
+    //      약사 종료 → 환자에게 보내는 작별 인사 (약사 메시지 버블, is_read=false 로 환자 목록 unread 표시)
+    if (actorRole === "patient") {
+      const sysPayload: MessageInsert = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content: "환자가 상담을 종료했습니다",
+        message_type: "system",
+        round_id: activeRoundId,
+        is_read: true,
+      };
+      const msgResp = await (supabase
+        .from("messages") as unknown as {
+          insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(sysPayload);
+      if (msgResp.error) {
+        console.warn("[chat] end-consultation system message INSERT failed (UPDATE 는 성공):", msgResp.error);
+      }
+    } else {
+      const farewellPayload: MessageInsert = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content:
+          "이번 상담은 여기서 마무리할게요. 또 궁금한 점이 생기면 언제든 상담 요청 해주세요 :)",
+        message_type: "text",
+        round_id: activeRoundId,
+        is_read: false,
+      };
+      const msgResp = await (supabase
+        .from("messages") as unknown as {
+          insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(farewellPayload);
+      if (msgResp.error) {
+        console.warn("[chat] end-consultation farewell INSERT failed (UPDATE 는 성공):", msgResp.error);
+      }
+    }
+    // 2) 회차 종료 구분자 시스템 메시지 — [ROUND_END] 마커. is_read=true 로 unread 제외.
+    //    위 작별 인사/시스템 알림이 먼저 INSERT 됐으므로 created_at 순서상 구분자가 마지막에 표시됨.
+    if (activeRoundId) {
+      const dividerPayload: MessageInsert = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content: "[ROUND_END]",
+        message_type: "system",
+        round_id: activeRoundId,
+        is_read: true,
+      };
+      const dividerResp = await (supabase
+        .from("messages") as unknown as {
+          insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(dividerPayload);
+      if (dividerResp.error) {
+        console.warn("[chat] end-consultation round divider INSERT failed:", dividerResp.error);
+      }
+    }
+    // 3) consultation_rounds.status='completed' + ended_at=NOW() UPDATE.
+    //    이 호출이 빠져 있으면 다음 매칭 시 새 round 생성이 (DB 제약/스키마에 따라) 실패할 수 있음.
+    //    activeRoundId 가 없으면 (옛 데이터) 스킵 — 멱등성 유지.
+    if (activeRoundId) {
+      type RoundUpdate = { status: string; ended_at: string };
+      const roundUpPayload: RoundUpdate = {
+        status: "completed",
+        ended_at: new Date().toISOString(),
+      };
+      const roundUpResp = await (supabase
+        .from("consultation_rounds") as unknown as {
+          update: (p: RoundUpdate) => {
+            eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+          };
+        })
+        .update(roundUpPayload)
+        .eq("id", activeRoundId);
+      if (roundUpResp.error) {
+        console.warn("[chat] consultation_rounds end UPDATE failed:", roundUpResp.error);
+      }
     }
     return { ok: true };
   };
@@ -851,6 +1084,29 @@ function ChatContent() {
     // 로컬 state 도 즉시 갱신 (입력창 잠금 즉시 반영, /mypage 이동 전 깜빡임 방지)
     setDbConsultation((prev) => (prev ? { ...prev, status: "completed" } : prev));
     router.push("/mypage");
+  };
+
+  /* ── 약사 측 상담 종료 ──
+   * 환자 측 핸들러와 동일 모달(showEndConfirm) 재사용.
+   * endConsultation 헬퍼 호출, 종료 후 /dashboard 로 라우팅.
+   */
+  const handlePharmacistEndClick = () => {
+    setEndError(null);
+    setShowEndConfirm(true);
+  };
+  const confirmPharmacistEnd = async () => {
+    if (endingConsult) return;
+    setEndingConsult(true);
+    setEndError(null);
+    const result = await endConsultation("pharmacist");
+    setEndingConsult(false);
+    if (!result.ok) {
+      setEndError(result.error || "상담 종료에 실패했어요");
+      return;
+    }
+    setShowEndConfirm(false);
+    setDbConsultation((prev) => (prev ? { ...prev, status: "completed" } : prev));
+    router.push("/dashboard");
   };
 
   /* 종료 잠금 판정 — DB 모드에서 status가 completed/cancelled 면 입력 차단 */
@@ -882,6 +1138,8 @@ function ChatContent() {
         sender_id: user.id,
         content: text,
         message_type: "text",
+        // 활성 차수가 있으면 그 차수에 귀속, 없으면 null (통합 뷰 폴백)
+        round_id: activeRoundId,
       };
       console.log("[chat] sending message:", payload);
       setInput("");
@@ -969,12 +1227,6 @@ function ChatContent() {
     }
   };
 
-  const toggleRole = () => {
-    const newRole = role === "patient" ? "pharmacist" : "patient";
-    router.replace(`/chat/${chatId}?role=${newRole}`);
-  };
-
-  const hasUnreadByPharmacist = messages.some((m) => m.sender === "patient" && !m.isRead);
 
   /* ── 검색 ── */
   const [showSearch, setShowSearch] = useState(false);
@@ -1102,14 +1354,82 @@ function ChatContent() {
           ←
         </button>
         <div className="chat-nav-center">
-          <div className="chat-avatar">{PHARMACIST_INFO.avatar}</div>
-          <div className="chat-nav-info">
-            <div className="chat-nav-name">
-              {role === "patient" ? PHARMACIST_INFO.name : "홍길동 님"}
+          <div className="chat-avatar">
+            {(() => {
+              // 아바타 결정: role==='patient' 이면 약사 아바타, role==='pharmacist' 이면 환자 아바타
+              // DB 모드 + avatar_url 있으면 <img>, 없으면 폴백:
+              //   - 환자가 보는 화면(role=patient): 약사 이모지 👩‍⚕️
+              //   - 약사가 보는 화면(role=pharmacist): 환자 SVG (sage-mid 톤, 검은 이모지 회피)
+              if (isDbConsultation && dbCounterpartAvatarUrl) {
+                // eslint-disable-next-line @next/next/no-img-element
+                return (
+                  <img
+                    src={dbCounterpartAvatarUrl}
+                    alt=""
+                    style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "50%" }}
+                  />
+                );
+              }
+              if (role === "patient") return "👩‍⚕️";
+              // 약사 측 폴백: sage-mid 색상의 사용자 SVG (이모지 검정 실루엣 회피)
+              return (
+                <svg
+                  width="22"
+                  height="22"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#5E7D6C"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <circle cx="12" cy="8" r="4" />
+                  <path d="M4 21c0-3.3 3.6-6 8-6s8 2.7 8 6" />
+                </svg>
+              );
+            })()}
+          </div>
+          <div
+            className="chat-nav-info"
+            style={{
+              // height/flex 강제 제거 — 자연 높이로 두고 부모 .chat-nav-center 의
+              // align-items: center 가 avatar 와 가운데 정렬하게 둠.
+              minWidth: 0,
+            }}
+          >
+            <div
+              className="chat-nav-name"
+              // 빈 상태에서도 라인 높이 유지 — NBSP + minHeight 이중 안전장치
+              style={{ minHeight: "1.4em" }}
+            >
+              {(() => {
+                if (isDbConsultation) {
+                  // DB 모드 — 로드 전엔 폴백 텍스트("약사"/"환자") 절대 노출 금지.
+                  // 빈 영역이 layout shift 를 일으키지 않도록 NBSP 로 라인 높이 유지.
+                  if (role === "patient") {
+                    const base = dbCounterpartLicenseName || dbCounterpartName || "";
+                    return base ? `${base} 약사` : " ";
+                  }
+                  return dbCounterpartName ? `${dbCounterpartName} 님` : " ";
+                }
+                return role === "patient" ? PHARMACIST_INFO.name : "홍길동 님";
+              })()}
             </div>
-            <div className="chat-nav-pharmacy">
-              {role === "patient" ? PHARMACIST_INFO.pharmacy : "만성피로 · 소화불량"}
+            {!(isDbConsultation && role === "pharmacist") && (
+            <div
+              className="chat-nav-pharmacy"
+              style={{ minHeight: "1.3em" }}
+            >
+              {isDbConsultation
+                ? role === "patient"
+                  ? (dbCounterpartPharmacy || " ")
+                  : " " /* 약사 측: 환자 증상 라벨 별도 데이터원 필요 — 일단 NBSP 로 영역 유지 */
+                : role === "patient"
+                  ? PHARMACIST_INFO.pharmacy
+                  : "만성피로 · 소화불량"}
             </div>
+            )}
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1118,6 +1438,27 @@ function ChatContent() {
             <button
               type="button"
               onClick={handlePatientEndClick}
+              aria-label="상담 종료"
+              style={{
+                background: "transparent",
+                border: "none",
+                padding: "4px 6px",
+                fontSize: 13,
+                color: "#5E7D6C",
+                textDecoration: "underline",
+                cursor: "pointer",
+                fontFamily: "'Noto Sans KR', sans-serif",
+                flexShrink: 0,
+              }}
+            >
+              상담 종료
+            </button>
+          )}
+          {/* 약사 측 상담 종료 버튼 — DB 상담이고 잠금 안 된 상태에서만 노출 */}
+          {role === "pharmacist" && isDbConsultation && !consultationLocked && (
+            <button
+              type="button"
+              onClick={handlePharmacistEndClick}
               aria-label="상담 종료"
               style={{
                 background: "transparent",
@@ -1166,10 +1507,6 @@ function ChatContent() {
               <line x1="21" y1="21" x2="16.65" y2="16.65" />
             </svg>
           </button>
-          <div className="chat-nav-status">
-            <span className="status-dot online" />
-            <span className="status-label">접속 중</span>
-          </div>
         </div>
       </nav>
 
@@ -1228,75 +1565,153 @@ function ChatContent() {
         </div>
       )}
 
-      {/* Role toggle (demo) */}
-      <div className="chat-role-toggle">
-        <button
-          className={`role-btn${role === "patient" ? " active" : ""}`}
-          onClick={() => role !== "patient" && toggleRole()}
-        >
-          환자 화면
-        </button>
-        <button
-          className={`role-btn${role === "pharmacist" ? " active" : ""}`}
-          onClick={() => role !== "pharmacist" && toggleRole()}
-        >
-          약사 화면
-        </button>
-      </div>
-
-      {/* Status banner */}
+      {/* 환자 측 안내 박스 — 항상 노출 (read-receipt 형태 X). 베이지/살구 톤 */}
       {role === "patient" && (
-        <div className={`chat-status-banner${hasUnreadByPharmacist ? " waiting" : " read"}`}>
-          {hasUnreadByPharmacist
-            ? "약사가 확인 중입니다"
-            : "약사가 읽었습니다"}
-          {hasUnreadByPharmacist && (
-            <p style={{ color: "var(--text-mid)", fontSize: "14px", textAlign: "center", margin: "6px 0 0" }}>
-              약사 선생님은 약국 근무 중이라 답변에 시간이 걸릴 수 있어요. 보통 24시간 이내에 답변드려요.
-            </p>
-          )}
+        <div
+          className="chat-status-banner waiting"
+          style={{ padding: "12px 16px" }}
+        >
+          <div style={{ fontSize: 15, fontWeight: 700, lineHeight: 1.4 }}>
+            약사님이 확인 중입니다
+          </div>
+          <div
+            style={{
+              fontSize: 14,
+              fontWeight: 400,
+              marginTop: 4,
+              lineHeight: 1.5,
+              color: "var(--color-text-mid)",
+            }}
+          >
+            약사님은 약국 근무중이라 답변에 시간이 걸릴 수 있어요.
+          </div>
         </div>
       )}
-      {/* 차수별 AI 문답 요약 카드 (활성 차수) */}
-      {activeSessionData && (
-        <div style={{
-          margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
-          padding: "12px 14px",
-          background: isLatestSession ? "#EDF4F0" : "#F4F5F3",
-          border: `1px solid ${isLatestSession ? "#B3CCBE" : "rgba(94,125,108,0.18)"}`,
-          borderRadius: 12,
-          flexShrink: 0,
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 100, background: isLatestSession ? "#4A6355" : "#D1D5D3", color: "#fff" }}>
-              {isLatestSession ? "현재 차수" : "지난 차수"}
-            </span>
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#4A6355" }}>
-              {activeSessionData.startDate}~ 상담
-            </span>
-            {activeSessionData.symptomTags.map((t) => (
-              <span key={t} style={{
-                fontSize: 12, fontWeight: 600,
-                padding: "2px 8px", borderRadius: 100,
-                background: "#fff", color: "#4A6355",
-                border: "1px solid rgba(94,125,108,0.14)",
-              }}>
-                {t}
-              </span>
-            ))}
-          </div>
-          <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.55, fontWeight: 500 }}>
-            📋 {activeSessionData.aiSummary}
-          </div>
-          {!isLatestSession && (
-            <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 6, fontWeight: 600 }}>
-              지난 상담 기록입니다. 메시지 전송은 현재 차수에서만 가능합니다.
+      {/* 차수별 AI 문답 요약 카드 (활성 차수)
+       *  DB 모드: rounds + ai_questionnaires 콘텐츠 기반
+       *  mock 모드: CONSULT_SESSIONS 기존 그대로
+       */}
+      {(() => {
+        // ── DB 모드 분기 — 박스 자체는 항상 노출, 내부 콘텐츠만 데이터 유무에 따라 분기 ──
+        if (isDbConsultation) {
+          const activeRound = activeRoundId
+            ? rounds.find((r) => r.id === activeRoundId)
+            : null;
+          // rounds 가 없거나 활성 차수 없으면 "현재 차수" 라벨만 표시 (레거시 consultation 안전 처리)
+          const isLatestRound = activeRound
+            ? rounds[rounds.length - 1]?.id === activeRoundId
+            : true;
+          const fmtMD = (iso: string | null | undefined): string => {
+            if (!iso) return "";
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return "";
+            return `${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+          };
+          const startLabel = activeRound ? fmtMD(activeRound.started_at) : "";
+          const q = activeRound?.questionnaire_id
+            ? questionnaireById.get(activeRound.questionnaire_id)
+            : null;
+          const symptoms = Array.isArray(q?.symptoms)
+            ? (q!.symptoms as string[]).filter((s) => typeof s === "string" && s.trim())
+            : [];
+          const summary: string | null = (() => {
+            if (q?.ai_summary && q.ai_summary.trim()) return q.ai_summary.trim();
+            if (q?.free_text && q.free_text.trim()) {
+              const txt = q.free_text.trim();
+              return txt.length > 80 ? `${txt.slice(0, 80)}...` : txt;
+            }
+            return null;
+          })();
+          // [임시 디버그] — 사용자 확인 후 제거 예정
+          console.log("[round-box] activeRoundId:", activeRoundId);
+          console.log("[round-box] rounds:", rounds);
+          console.log("[round-box] activeRound:", activeRound);
+          console.log("[round-box] questionnaire:", q, "symptoms:", symptoms, "summary:", summary);
+          return (
+            <div style={{
+              margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
+              padding: "12px 14px",
+              background: isLatestRound ? "#EDF4F0" : "#F4F5F3",
+              border: `1px solid ${isLatestRound ? "#B3CCBE" : "rgba(94,125,108,0.18)"}`,
+              borderRadius: 12,
+              flexShrink: 0,
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 100, background: isLatestRound ? "#4A6355" : "#D1D5D3", color: "#fff" }}>
+                  {isLatestRound ? "현재 차수" : "지난 차수"}
+                </span>
+                {startLabel && (
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#4A6355" }}>
+                    {startLabel}~ 상담
+                  </span>
+                )}
+                {symptoms.length > 0 && symptoms.map((t) => (
+                  <span key={t} style={{
+                    fontSize: 12, fontWeight: 600,
+                    padding: "2px 8px", borderRadius: 100,
+                    background: "#fff", color: "#4A6355",
+                    border: "1px solid rgba(94,125,108,0.14)",
+                  }}>
+                    {t}
+                  </span>
+                ))}
+              </div>
+              {summary && (
+                <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.55, fontWeight: 500 }}>
+                  📋 {summary}
+                </div>
+              )}
+              {!isLatestRound && (
+                <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 6, fontWeight: 600 }}>
+                  지난 상담 기록입니다. 메시지 전송은 현재 차수에서만 가능합니다.
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      )}
+          );
+        }
+        // ── mock 모드 분기 (기존 그대로) ──
+        if (!activeSessionData) return null;
+        return (
+          <div style={{
+            margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
+            padding: "12px 14px",
+            background: isLatestSession ? "#EDF4F0" : "#F4F5F3",
+            border: `1px solid ${isLatestSession ? "#B3CCBE" : "rgba(94,125,108,0.18)"}`,
+            borderRadius: 12,
+            flexShrink: 0,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 100, background: isLatestSession ? "#4A6355" : "#D1D5D3", color: "#fff" }}>
+                {isLatestSession ? "현재 차수" : "지난 차수"}
+              </span>
+              <span style={{ fontSize: 13, fontWeight: 600, color: "#4A6355" }}>
+                {activeSessionData.startDate}~ 상담
+              </span>
+              {activeSessionData.symptomTags.map((t) => (
+                <span key={t} style={{
+                  fontSize: 12, fontWeight: 600,
+                  padding: "2px 8px", borderRadius: 100,
+                  background: "#fff", color: "#4A6355",
+                  border: "1px solid rgba(94,125,108,0.14)",
+                }}>
+                  {t}
+                </span>
+              ))}
+            </div>
+            <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.55, fontWeight: 500 }}>
+              📋 {activeSessionData.aiSummary}
+            </div>
+            {!isLatestSession && (
+              <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 6, fontWeight: 600 }}>
+                지난 상담 기록입니다. 메시지 전송은 현재 차수에서만 가능합니다.
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
-      {/* 상담 차수 탭 (책갈피) */}
+      {/* 상담 차수 탭 (책갈피) — mock 모드 전용. DB 모드는 통합 채팅창(탭 없음). */}
+      {!isDbConsultation && (
       <div
         ref={sessionTabRef}
         className="chat-session-tabs"
@@ -1342,6 +1757,7 @@ function ChatContent() {
           );
         })}
       </div>
+      )}
 
       {/* 팔로업 예정 배너 */}
       {role === "pharmacist" && followUp && (
@@ -1377,14 +1793,32 @@ function ChatContent() {
             <span>{activeSession === "s1" ? "오늘" : "2026년 4월 11일"}</span>
           </div>
         )}
-        {messages.filter((m) =>
-          !(m.pharmacistOnly && role !== "pharmacist") &&
-          (isDbConsultation || m.sessionId === activeSession),
-        ).map((msg) => {
-          const isSystem = msg.content.startsWith("[시스템]");
+        {messages.filter((m) => {
+          if (m.pharmacistOnly && role !== "pharmacist") return false;
+          // mock 모드: 기존 sessionId 필터 보존
+          if (!isDbConsultation) return m.sessionId === activeSession;
+          // DB 모드: 회차 무관 통합 뷰 — 모든 메시지 시간순 노출
+          return true;
+        }).map((msg) => {
+          // 시스템 메시지 판정:
+          //   DB 모드 → message_type === 'system'
+          //   mock 모드 → "[시스템]" prefix 폴백 (mock 메시지에 message_type 미설정)
+          const isSystem =
+            msg.message_type === "system" || msg.content.startsWith("[시스템]");
           const isVisitCard = msg.content.startsWith("[방문안내]");
           const isQSetCard = msg.content.startsWith("[추가질문]") && !msg.content.startsWith("[추가질문답변]");
           const isQAnsCard = msg.content.startsWith("[추가질문답변]");
+          // 회차 구분자:
+          //   신규 형식 → "[ROUND_START]" / "[ROUND_END]"
+          //   레거시 형식 → "--- N차 상담 시작/종료 ---" (이전 데이터 보존용 호환)
+          //   .startsWith 로는 끝까지 일치 보장 못 하므로 정규식으로 정확히 매칭.
+          const isRoundStart =
+            msg.content === "[ROUND_START]" ||
+            /^--- \d+차 상담 시작 ---$/.test(msg.content);
+          const isRoundEnd =
+            msg.content === "[ROUND_END]" ||
+            /^--- \d+차 상담 종료 ---$/.test(msg.content);
+          const isRoundDivider = isRoundStart || isRoundEnd;
 
           if (isQSetCard) {
             const setId = msg.content.replace("[추가질문] ", "").trim();
@@ -1552,6 +1986,51 @@ function ChatContent() {
           }
 
           if (isSystem) {
+            // 회차 구분자: 가운데 라벨 + 양쪽 가로줄, sage 배경 (시각적으로 두드러짐).
+            // 라벨은 role + 날짜 기반 — DB content (마커) 자체는 사용자에게 노출되지 않음.
+            if (isRoundDivider) {
+              const dateLabel = (() => {
+                const iso = msg.created_at;
+                if (!iso) return "";
+                const d = new Date(iso);
+                if (Number.isNaN(d.getTime())) return "";
+                const y = d.getFullYear();
+                const m = String(d.getMonth() + 1).padStart(2, "0");
+                const dd = String(d.getDate()).padStart(2, "0");
+                return `${y}.${m}.${dd}`;
+              })();
+              const baseLabel = isRoundStart
+                ? role === "patient"
+                  ? "상담이 수락되었습니다"
+                  : "상담 시작"
+                : "상담 종료";
+              const label = dateLabel ? `${baseLabel} · ${dateLabel}` : baseLabel;
+              return (
+                <div
+                  key={msg.id}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 12,
+                    padding: "18px 16px",
+                  }}
+                >
+                  <div style={{ flex: 1, height: 1, background: "#B3CCBE" }} />
+                  <span
+                    style={{
+                      padding: "6px 16px", borderRadius: 999,
+                      background: "#EDF4F0", color: "#2C3630",
+                      fontSize: 15, fontWeight: 700,
+                      whiteSpace: "nowrap",
+                      border: "1px solid #B3CCBE",
+                      fontFamily: "'Gothic A1', sans-serif",
+                    }}
+                  >
+                    {label}
+                  </span>
+                  <div style={{ flex: 1, height: 1, background: "#B3CCBE" }} />
+                </div>
+              );
+            }
+            // 일반 시스템 메시지: 회색 알약 (회차 구분자보다 약하게)
             return (
               <div key={msg.id} style={{
                 display: "flex", flexDirection: "column", alignItems: "center",
@@ -1559,12 +2038,13 @@ function ChatContent() {
               }}>
                 <div style={{
                   display: "inline-flex", alignItems: "center", gap: 6,
-                  padding: "6px 16px", borderRadius: 100,
-                  background: "#EDF4F0", border: "1px solid #B3CCBE",
-                  fontSize: 13, color: "#4A6355", fontWeight: 600,
+                  padding: "7px 18px", borderRadius: 100,
+                  background: "#F4F5F3",
+                  border: "1px solid rgba(94, 125, 108, 0.14)",
+                  fontSize: 15, color: "#3D4A42", fontWeight: 600,
                 }}>
                   {role === "pharmacist" && msg.pharmacistOnly && (
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4A6355" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#3D4A42" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                       <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                       <path d="M7 11V7a5 5 0 0110 0v4" />
                     </svg>
@@ -1663,13 +2143,50 @@ function ChatContent() {
             >
               {!isMine && (
                 <div className="bubble-avatar">
-                  {role === "patient" ? PHARMACIST_INFO.avatar : "🙂"}
+                  {(() => {
+                    if (isDbConsultation && dbCounterpartAvatarUrl) {
+                      // eslint-disable-next-line @next/next/no-img-element
+                      return (
+                        <img
+                          src={dbCounterpartAvatarUrl}
+                          alt=""
+                          style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "50%" }}
+                        />
+                      );
+                    }
+                    if (role === "patient") return "👩‍⚕️";
+                    return (
+                      <svg
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="#5E7D6C"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <circle cx="12" cy="8" r="4" />
+                        <path d="M4 21c0-3.3 3.6-6 8-6s8 2.7 8 6" />
+                      </svg>
+                    );
+                  })()}
                 </div>
               )}
               <div className="bubble-col">
                 {!isMine && (
                   <div className="bubble-name">
-                    {role === "patient" ? PHARMACIST_INFO.name : "홍길동"}
+                    {(() => {
+                      if (isDbConsultation) {
+                        if (role === "patient") {
+                          const base = dbCounterpartLicenseName || dbCounterpartName || "";
+                          return base ? `${base} 약사` : " ";
+                        }
+                        return dbCounterpartName || " ";
+                      }
+                      return role === "patient" ? PHARMACIST_INFO.name : "홍길동";
+                    })()}
                   </div>
                 )}
                 <div className="bubble-row">
@@ -1804,12 +2321,12 @@ function ChatContent() {
           role="status"
           style={{
             margin: "8px 16px 0",
-            padding: "10px 14px",
+            padding: "12px 16px",
             borderRadius: 10,
             background: "#F4F6F3",
             border: "1px solid rgba(94,125,108,0.18)",
             color: "#3D4A42",
-            fontSize: 14,
+            fontSize: 15,
             lineHeight: 1.5,
             textAlign: "center",
           }}
@@ -3104,10 +3621,14 @@ function ChatContent() {
         );
       })()}
 
-      {/* 환자 측 상담 종료 확인 모달 */}
+      {/* 상담 종료 확인 모달 (환자/약사 공용 — role 로 본문/액션 분기) */}
       {showEndConfirm && (
         <div
-          onClick={() => { if (!endingConsult) { setShowEndConfirm(false); setEndError(null); } }}
+          onClick={() => {
+            // 약사 모드: 외부 클릭으로 닫히지 않음 (실수 방지)
+            if (role === "pharmacist") return;
+            if (!endingConsult) { setShowEndConfirm(false); setEndError(null); }
+          }}
           style={{
             position: "fixed", inset: 0, zIndex: 300,
             background: "rgba(0,0,0,0.4)",
@@ -3129,7 +3650,9 @@ function ChatContent() {
               상담을 종료하시겠습니까?
             </div>
             <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.6, marginBottom: 18 }}>
-              종료 후에는 같은 약사와 새로 상담 요청해야 해요.
+              {role === "pharmacist"
+                ? "환자에게는 시스템 메시지로 종료 안내가 표시됩니다."
+                : "종료 후에는 같은 약사와 새로 상담 요청해야 해요."}
             </div>
             {endError && (
               <div style={{
@@ -3157,7 +3680,7 @@ function ChatContent() {
               </button>
               <button
                 type="button"
-                onClick={confirmPatientEnd}
+                onClick={role === "pharmacist" ? confirmPharmacistEnd : confirmPatientEnd}
                 disabled={endingConsult}
                 style={{
                   flex: 1, padding: "11px", borderRadius: 10, fontSize: 14, fontWeight: 700,

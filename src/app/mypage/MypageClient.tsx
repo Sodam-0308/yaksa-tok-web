@@ -208,6 +208,18 @@ function MypageContent() {
   /* health_checks 로드 (가장 최신 2건이 변화 비교에 사용) */
   const [hcRows, setHcRows] = useState<HealthCheckRow[] | null>(null);
 
+  /* consultations 로드 — 환자 본인의 모든 상담 (활성/종료) */
+  const [dbConsults, setDbConsults] = useState<ConsultItem[] | null>(null);
+  // 활성/종료 status 분류
+  const ACTIVE_CONSULT_STATUSES = new Set([
+    "pending", "matched", "accepted", "chatting",
+    "visit_scheduled", "visited", "report_sent",
+    "requested", "managing",
+  ]);
+  const CLOSED_CONSULT_STATUSES = new Set([
+    "completed", "inactive", "cancelled", "rejected",
+  ]);
+
   useEffect(() => {
     if (!user) {
       setHcRows([]);
@@ -229,6 +241,111 @@ function MypageContent() {
       }
       setHcRows((data ?? []) as unknown as HealthCheckRow[]);
     })();
+  }, [user]);
+
+  /* consultations DB 로드 — 환자 본인의 상담 카드 (활성/종료) */
+  useEffect(() => {
+    if (!user) {
+      setDbConsults(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      // 1) 본인이 patient_id 인 모든 consultation
+      const { data: consData, error: consErr } = await supabase
+        .from("consultations")
+        .select("id, pharmacist_id, status, last_message_at, completed_at, created_at")
+        .eq("patient_id", user.id)
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (consErr) {
+        console.error("[mypage] consultations load failed:", consErr);
+        setDbConsults([]);
+        return;
+      }
+      type ConsRow = {
+        id: string;
+        pharmacist_id: string | null;
+        status: string;
+        last_message_at: string | null;
+        completed_at: string | null;
+        created_at: string;
+      };
+      const rows = ((consData ?? []) as unknown) as ConsRow[];
+
+      // 2) pharmacist_profiles IN 쿼리로 license_name + pharmacy_name 한꺼번에 조회
+      const pharmIds = Array.from(
+        new Set(rows.map((r) => r.pharmacist_id).filter((id): id is string => !!id)),
+      );
+      const pharmInfoById = new Map<string, { license_name: string | null; pharmacy_name: string | null }>();
+      if (pharmIds.length > 0) {
+        const { data: ppData, error: ppErr } = await supabase
+          .from("pharmacist_profiles")
+          .select("id, license_name, pharmacy_name")
+          .in("id", pharmIds);
+        if (cancelled) return;
+        if (ppErr) {
+          console.error("[mypage] pharmacist_profiles load failed:", ppErr);
+        } else {
+          for (const pp of (ppData ?? []) as { id: string; license_name: string | null; pharmacy_name: string | null }[]) {
+            pharmInfoById.set(pp.id, {
+              license_name: pp.license_name,
+              pharmacy_name: pp.pharmacy_name,
+            });
+          }
+        }
+      }
+
+      // 2.5) 약사 fallback 이름 — license_name 없으면 profiles.name
+      const profileNameById = new Map<string, string>();
+      if (pharmIds.length > 0) {
+        const { data: profData, error: profErr } = await supabase
+          .from("profiles")
+          .select("id, name")
+          .in("id", pharmIds);
+        if (cancelled) return;
+        if (profErr) {
+          console.error("[mypage] pharmacist profiles fetch failed:", profErr);
+        } else {
+          for (const p of (profData ?? []) as { id: string; name: string | null }[]) {
+            if (p.name && p.name.trim()) profileNameById.set(p.id, p.name.trim());
+          }
+        }
+      }
+
+      // 3) ConsultItem 형태로 매핑
+      const fmtDate = (iso: string) => {
+        const d = new Date(iso);
+        return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+      };
+      const built: ConsultItem[] = rows
+        .map((r) => {
+          const isActive = ACTIVE_CONSULT_STATUSES.has(r.status);
+          const isClosed = CLOSED_CONSULT_STATUSES.has(r.status);
+          if (!isActive && !isClosed) return null; // 미지의 status 는 표시 안 함
+          const ppInfo = r.pharmacist_id ? pharmInfoById.get(r.pharmacist_id) : null;
+          const profName = r.pharmacist_id ? profileNameById.get(r.pharmacist_id) : null;
+          const baseName =
+            ppInfo?.license_name?.trim() || profName || "약사";
+          const pharmacistLabel = baseName === "약사" ? "약사" : `${baseName} 약사`;
+          const pharmacy = ppInfo?.pharmacy_name?.trim() || "";
+          const dateIso = r.last_message_at || r.completed_at || r.created_at;
+          return {
+            id: r.id,
+            pharmacist: pharmacistLabel,
+            pharmacy,
+            date: fmtDate(dateIso),
+            symptoms: [], // 차수별 ai_questionnaires 조인은 별도 작업으로 보류
+            status: isActive ? "active" : "completed",
+          } as ConsultItem;
+        })
+        .filter((x): x is ConsultItem => x !== null);
+
+      setDbConsults(built);
+      console.log("[mypage] consultations loaded:", built.length);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
   /* DB에서 프로필 로드 */
@@ -1179,8 +1296,11 @@ function MypageContent() {
             </div>
           ) : (
           <>
-          {/* 진행 중 */}
-          {CONSULTS.filter((c) => c.status === "active").map((c) => (
+          {/* 진행 중 — 로그인 사용자는 DB 결과, 비로그인은 mock 폴백 */}
+          {(() => {
+            const useDb = !!user && dbConsults !== null;
+            const sourceList = useDb ? dbConsults! : CONSULTS;
+            return sourceList.filter((c) => c.status === "active").map((c) => (
             <Link
               key={c.id}
               href={`/chat/${c.id}`}
@@ -1194,24 +1314,29 @@ function MypageContent() {
             >
               <div className="my-consult-top">
                 <span className="my-consult-pharm">
-                  {c.pharmacist} · {c.pharmacy}
+                  {c.pharmacist}{c.pharmacy ? ` · ${c.pharmacy}` : ""}
                 </span>
                 <span className="my-consult-status active">상담 중</span>
               </div>
-              <div className="my-consult-tags">
-                {c.symptoms.map((s) => (
-                  <span key={s.label} className={`my-tag ${TAG_CLASS[s.category]}`}>
-                    {s.label}
-                  </span>
-                ))}
-              </div>
+              {c.symptoms.length > 0 && (
+                <div className="my-consult-tags">
+                  {c.symptoms.map((s) => (
+                    <span key={s.label} className={`my-tag ${TAG_CLASS[s.category]}`}>
+                      {s.label}
+                    </span>
+                  ))}
+                </div>
+              )}
             </Link>
-          ))}
+            ));
+          })()}
 
           {/* 지난 상담 */}
           <div className="my-consult-past-label">지난 상담</div>
           {(() => {
-            const past = CONSULTS.filter((c) => c.status === "completed");
+            const useDb = !!user && dbConsults !== null;
+            const sourceList = useDb ? dbConsults! : CONSULTS;
+            const past = sourceList.filter((c) => c.status === "completed");
             // 로그인 사용자가 DB 로드 완료 후, mock 상담도 비어있고 doseStatus 도 비어있으면 빈 상태
             if (past.length === 0 && doseLoaded && Object.keys(doseStatus).length === 0) {
               return (

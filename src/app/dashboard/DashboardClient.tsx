@@ -2162,6 +2162,130 @@ function DashboardContent() {
       return;
     }
     console.log(`[dashboard] consultation ${nextStatus} success — id:`, id);
+
+    // 수락 시: 회차(round) 부트스트랩.
+    //   1) 기존 'active' round 가 남아있으면 먼저 'completed' 로 UPDATE (정합성 보장 —
+    //      DB 에 (consultation_id) WHERE status='active' 부분 unique 제약이 있어도 통과).
+    //   2) max(round_number)+1 으로 새 round INSERT (status='active').
+    //   3) [ROUND_START] 시스템 메시지 INSERT (message_type='system', is_read=true).
+    //   부분 실패해도 수락 자체는 성공으로 간주 — console.error 로 명확히 로깅.
+    if (nextStatus === "accepted" && authUser) {
+      console.log("[ACCEPT] round bootstrap start — consultation:", id);
+      try {
+        // (a) 기존 active round 가 있으면 닫기 (legacy 데이터 정합성 보호용).
+        //     ended_at 도 같이 채워서 통계 일관성 유지. 실패해도 다음 단계 진행.
+        type RoundUpdate = { status: string; ended_at: string };
+        const closePrevResp = await (supabase
+          .from("consultation_rounds") as unknown as {
+            update: (p: RoundUpdate) => {
+              eq: (col: string, val: string) => {
+                eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+              };
+            };
+          })
+          .update({ status: "completed", ended_at: new Date().toISOString() })
+          .eq("consultation_id", id)
+          .eq("status", "active");
+        if (closePrevResp.error) {
+          console.error("[ACCEPT] close previous active rounds failed:", closePrevResp.error);
+        } else {
+          console.log("[ACCEPT] previous active rounds closed (if any) for consultation:", id);
+        }
+
+        // (b) 다음 round_number 계산
+        const maxResp = await supabase
+          .from("consultation_rounds")
+          .select("round_number")
+          .eq("consultation_id", id)
+          .order("round_number", { ascending: false })
+          .limit(1)
+          .maybeSingle<{ round_number: number }>();
+        if (maxResp.error) {
+          console.error("[ACCEPT] max round_number lookup failed:", maxResp.error);
+        }
+        const nextRoundNumber =
+          typeof maxResp.data?.round_number === "number"
+            ? maxResp.data.round_number + 1
+            : 1;
+        console.log("[ACCEPT] next round_number:", nextRoundNumber);
+
+        // (c) consultations.questionnaire_id 조회 — round 의 questionnaire_id 로 사용
+        const consResp = await supabase
+          .from("consultations")
+          .select("questionnaire_id")
+          .eq("id", id)
+          .maybeSingle<{ questionnaire_id: string | null }>();
+        if (consResp.error) {
+          console.error("[ACCEPT] consultation questionnaire_id lookup failed:", consResp.error);
+        }
+        const qId = consResp.data?.questionnaire_id ?? null;
+
+        // (d) consultation_rounds INSERT
+        type RoundInsert = {
+          consultation_id: string;
+          round_number: number;
+          questionnaire_id: string | null;
+          status: string;
+        };
+        const roundPayload: RoundInsert = {
+          consultation_id: id,
+          round_number: nextRoundNumber,
+          questionnaire_id: qId,
+          status: "active",
+        };
+        console.log("[ACCEPT] round INSERT payload:", roundPayload);
+        const roundResp = await (supabase
+          .from("consultation_rounds") as unknown as {
+            insert: (p: RoundInsert) => {
+              select: (cols: string) => {
+                maybeSingle: () => Promise<{
+                  data: { id: string } | null;
+                  error: { message: string } | null;
+                }>;
+              };
+            };
+          })
+          .insert(roundPayload)
+          .select("id")
+          .maybeSingle();
+
+        if (roundResp.error || !roundResp.data?.id) {
+          console.error("[ACCEPT] round insert failed:", roundResp.error);
+        } else {
+          console.log("[ACCEPT] round INSERT success — round_id:", roundResp.data.id);
+          // (e) 회차 시작 시스템 메시지 INSERT
+          type SysMsgInsert = {
+            consultation_id: string;
+            round_id: string;
+            sender_id: string;
+            content: string;
+            message_type: string;
+            is_read: boolean;
+          };
+          const sysPayload: SysMsgInsert = {
+            consultation_id: id,
+            round_id: roundResp.data.id,
+            sender_id: authUser.id,
+            content: "[ROUND_START]",
+            message_type: "system",
+            is_read: true,
+          };
+          const sysResp = await (supabase
+            .from("messages") as unknown as {
+              insert: (p: SysMsgInsert) => Promise<{ error: { message: string } | null }>;
+            })
+            .insert(sysPayload);
+          if (sysResp.error) {
+            console.error("[ACCEPT] round-start system message INSERT failed:", sysResp.error);
+          } else {
+            console.log("[ACCEPT] [ROUND_START] message INSERT success");
+          }
+        }
+      } catch (roundErr) {
+        console.error("[ACCEPT] round bootstrap threw:", roundErr);
+      }
+    }
+
     setActingId(null);
     // 목록에서 즉시 제거
     setDbPendingList((prev) => prev?.filter((r) => r.id !== id) ?? null);

@@ -14,7 +14,7 @@ interface Tab {
 const PATIENT_TABS: Tab[] = [
   { label: "홈", href: "/" },
   { label: "피드", href: "/feed" },
-  { label: "채팅", href: "/chat/1" },
+  { label: "채팅", href: "/chat" },
   { label: "내 정보", href: "/mypage" },
 ];
 

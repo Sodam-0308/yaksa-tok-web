@@ -38,7 +38,7 @@ interface ChatRoom {
   initial: string;
   /** 증상 태그 */
   symptoms: { label: string; bg: string; color: string }[];
-  /** 마지막 메시지 미리보기 */
+  /** 마지막 메시지 미리보기 (마커는 변환 후 저장) */
   lastMessage: string;
   /** 마지막 메시지 시각 (ISO) */
   lastMessageAt: string;
@@ -46,6 +46,50 @@ interface ChatRoom {
   unreadCount: number;
   /** ⚠️ 거절 이력 있는 환자 (재요청) — 약사 뷰 전용 */
   hasPrevRejection: boolean;
+  /** consultations.status — 카드 배지 ("상담 종료"/"상담 진행 중" 등) */
+  status?: string;
+}
+
+/** 회차 마커/legacy 패턴을 사용자에게 보여줄 미리보기 텍스트로 변환.
+ *  마커가 아니면 content 그대로 반환. */
+function formatPreview(content: string, myRole: "patient" | "pharmacist"): string {
+  // 신규 마커
+  if (content === "[ROUND_START]") {
+    return myRole === "patient" ? "상담이 수락되었습니다" : "상담 시작";
+  }
+  if (content === "[ROUND_END]") return "상담 종료";
+  // Legacy 형식 ("--- N차 상담 시작 ---" / "--- N차 상담 종료 ---")
+  if (/^--- \d+차 상담 시작 ---$/.test(content)) {
+    return myRole === "patient" ? "상담이 수락되었습니다" : "상담 시작";
+  }
+  if (/^--- \d+차 상담 종료 ---$/.test(content)) return "상담 종료";
+  return content;
+}
+
+/** consultations.status → 카드 배지 라벨. 미해당이면 null (배지 미노출). */
+function statusBadgeLabel(status: string | undefined): string | null {
+  if (!status) return null;
+  if (status === "completed" || status === "cancelled") return "상담 종료";
+  if (status === "pending") return "상담 요청 중";
+  if (
+    status === "accepted" ||
+    status === "chatting" ||
+    status === "matched" ||
+    status === "active" ||
+    status === "in_progress" ||
+    status === "visit_scheduled"
+  ) {
+    return "상담 진행 중";
+  }
+  return null;
+}
+
+/** 환자가 보는 약사 표시 이름에 " 약사" 접미사. 이미 "약사"로 끝나면 그대로. */
+function withPharmacistSuffix(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.endsWith("약사")) return trimmed;
+  return `${trimmed} 약사`;
 }
 
 const MOCK_NOW_ISO = "2026-04-21T10:00:00+09:00";
@@ -262,25 +306,54 @@ function Content() {
         }
       }
 
-      // 4) ChatRoom 매핑
-      const built: ChatRoom[] = rows.map((r) => {
+      // 3.5) (patient_id, pharmacist_id) 페어 묶기 — 옛 데이터에 같은 페어로 row 가 여러 개
+      //      남아있을 수 있어 클라이언트 측에서 합침. 페어 내에서 last_message_at 가 가장
+      //      최근인 row 만 살림. pharmacist_id 가 NULL 인 row(미할당 pending 등)는 묶지
+      //      않고 각각 별도 카드로 유지.
+      const tsOf = (r: DbConsultationRow): number => {
+        const lm = lastByCons.get(r.id)?.created_at;
+        const iso = lm ?? r.created_at;
+        const t = new Date(iso).getTime();
+        return Number.isFinite(t) ? t : 0;
+      };
+      const pairWinners = new Map<string, DbConsultationRow>();
+      for (const r of rows) {
+        const groupKey = r.pharmacist_id
+          ? `${r.patient_id}|${r.pharmacist_id}`
+          : `null|${r.id}`; // null pharmacist 는 묶지 않음 (자기 자신만의 그룹)
+        const prev = pairWinners.get(groupKey);
+        if (!prev || tsOf(r) > tsOf(prev)) {
+          pairWinners.set(groupKey, r);
+        }
+      }
+      const survivors = Array.from(pairWinners.values());
+      console.log("[chat-list] pair-grouped:", rows.length, "→", survivors.length);
+
+      // 4) ChatRoom 매핑 (살아남은 row 만)
+      const built: ChatRoom[] = survivors.map((r) => {
         const isPatient = r.patient_id === user.id;
         const myRole: "patient" | "pharmacist" = isPatient ? "patient" : "pharmacist";
         const counterpart = isPatient ? r.pharmacist : r.patient;
-        // 환자가 보는 약사 이름은 license_name 우선, 없으면 profiles.name 폴백
+        // 환자가 보는 약사 이름은 license_name 우선, 없으면 profiles.name 폴백.
+        // 환자 측에서는 " 약사" 접미사 추가 (이미 끝에 "약사"면 그대로).
         const pharmLicense = isPatient && r.pharmacist_id
           ? licenseNameByPharmId.get(r.pharmacist_id)
           : undefined;
-        const counterpartName =
+        const rawCounterpart =
           pharmLicense ?? counterpart?.name ?? (isPatient ? "약사" : "환자");
-        const initial = counterpartName.trim().charAt(0) || "?";
+        const counterpartName = isPatient
+          ? withPharmacistSuffix(rawCounterpart)
+          : rawCounterpart;
+        // 이니셜은 접미사 빼고 원본 이름 첫 글자로
+        const initial = rawCounterpart.trim().charAt(0) || "?";
 
         const symptoms = (r.questionnaire?.symptoms ?? [])
           .slice(0, 2)
           .map((label) => symptomTagStyle(label));
 
         const lastMsg = lastByCons.get(r.id);
-        const lastMessage = lastMsg?.content ?? "아직 메시지가 없어요";
+        const rawLastMessage = lastMsg?.content ?? "아직 메시지가 없어요";
+        const lastMessage = formatPreview(rawLastMessage, myRole);
         const lastMessageAt = lastMsg?.created_at ?? r.created_at;
         const unreadCount = unreadByCons.get(r.id) ?? 0;
 
@@ -294,6 +367,7 @@ function Content() {
           lastMessageAt,
           unreadCount,
           hasPrevRejection: false,
+          status: r.status,
         };
       });
 
@@ -496,6 +570,32 @@ function Content() {
                           ⚠️
                         </span>
                       )}
+                      {/* 상태 배지 — consultations.status 기반.
+                          'completed'/'cancelled' → "상담 종료" (중성 회색),
+                          'pending' → "상담 요청 중" (sage 톤),
+                          'accepted'/'chatting'/'matched'/'active'/'in_progress'/'visit_scheduled' → "상담 진행 중" (sage 톤). */}
+                      {(() => {
+                        const label = statusBadgeLabel(room.status);
+                        if (!label) return null;
+                        const isEnded = label === "상담 종료";
+                        return (
+                          <span
+                            aria-label={label}
+                            style={{
+                              display: "inline-block",
+                              padding: "2px 8px", borderRadius: 6,
+                              fontSize: 12, fontWeight: 600,
+                              background: isEnded ? "#F4F5F3" : C.sagePale,
+                              color: isEnded ? "#3D4A42" : C.sageDeep,
+                              border: `1px solid ${isEnded ? "rgba(94,125,108,0.18)" : C.sageLight}`,
+                              whiteSpace: "nowrap", flexShrink: 0,
+                              fontFamily: "'Noto Sans KR', sans-serif",
+                            }}
+                          >
+                            {label}
+                          </span>
+                        );
+                      })()}
                       {room.symptoms.slice(0, 2).map((s) => (
                         <span key={s.label} style={{
                           display: "inline-block",
