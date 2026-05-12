@@ -169,7 +169,8 @@ const EXTRA_SYMPTOM_LABELS = [
 
 type Answers = Record<string, unknown>;
 
-const STORAGE_KEY_ANSWERS = "yaksa-tok-answers";
+// 다른 클라이언트(요약 페이지 등)에서 동일 key 참조 가능하도록 export.
+export const STORAGE_KEY_ANSWERS = "yaksa-tok-answers";
 const STORAGE_KEY_IDX = "yaksa-tok-question-idx";
 
 function getOptionText(opt: string | OptionItem): string {
@@ -223,6 +224,9 @@ function QuestionnaireContent() {
   const [restored, setRestored] = useState(false);
   const [showMoreSymptoms, setShowMoreSymptoms] = useState(false);
   const [customSymptomInput, setCustomSymptomInput] = useState("");
+  // ?step=N 으로 진입한 단일 항목 수정 모드. [다음] 누르면 다음 문항이 아닌
+  // /questionnaire-summary 로 복귀. [이전] 누르면 일반 흐름으로 전환(해제).
+  const [singleEditMode, setSingleEditMode] = useState(false);
   const answersRef = useRef(answers);
   const idxRef = useRef(currentIdx);
 
@@ -237,6 +241,10 @@ function QuestionnaireContent() {
     const gender = searchParams.get("gender");
     const resetParam = searchParams.get("reset");
     const fromStart = searchParams.get("from") === "start";
+    // ?step=N — 특정 문항으로 직진 (요약/항목별 [수정] 진입용)
+    const stepParam = searchParams.get("step");
+    const stepNumRaw = stepParam !== null ? parseInt(stepParam, 10) : NaN;
+    const stepNum = Number.isInteger(stepNumRaw) ? stepNumRaw : null;
 
     const knownLabels = new Set([
       ...MAIN_SYMPTOM_ICONS.map((s) => s.id),
@@ -272,7 +280,31 @@ function QuestionnaireContent() {
       if (parsed) merged.symptoms = parsed;
       if (gender) merged.gender = gender;
       setAnswers(merged);
-      setCurrentIdx(fromStart ? 0 : saved.idx);
+      // flow 는 answers 에 의존하는 동적 배열이라 마운트 시점에 직접 계산.
+      //   step 점프 범위 검사를 정확히 하려면 questions.filter 결과 길이 기준이어야 함.
+      const flowAtMount = questions.filter(
+        (q) => !q.condition || q.condition(merged),
+      );
+      const hasSavedAnswers = Object.keys(merged).length > 0;
+      // step 우선순위: 유효 정수 + 저장된 답변 존재 + 범위 내일 때만 채택.
+      //   미충족 시 기존 로직 (fromStart ? 0 : saved.idx) 유지.
+      let nextIdx: number;
+      let activateSingleEdit = false;
+      if (
+        stepNum !== null &&
+        hasSavedAnswers &&
+        stepNum >= 0 &&
+        stepNum < flowAtMount.length
+      ) {
+        nextIdx = stepNum;
+        activateSingleEdit = true;
+      } else {
+        nextIdx = fromStart ? 0 : saved.idx;
+      }
+      if (activateSingleEdit) {
+        setSingleEditMode(true);
+      }
+      setCurrentIdx(nextIdx);
     } else {
       const initial: Answers = {};
       const parsed = applySymptomParams(symptom);
@@ -298,6 +330,24 @@ function QuestionnaireContent() {
   const q = flow[currentIdx] as Question | undefined;
   const isComplete = currentIdx >= flow.length;
   const isLast = currentIdx === flow.length - 1;
+
+  /* ── slider 기본값 자동 저장 ──
+   * slider 문항은 사용자가 손잡이를 한 번도 안 움직이면 onChange 가 발동 안 해
+   * answers[q.id] 가 undefined 로 남음 → /questionnaire-summary 에서 "(답변 없음)"
+   * 처리되는 버그가 있었음. 진입(렌더링) 시점에 키가 없으면 q.value(없으면 q.min ?? 5)
+   * 로 1회 저장. 사용자가 이전에 설정한 값(혹은 다른 슬라이더 답변)은 손대지 않음.
+   * 의존성: q (질문 변경) + answers — answers 가 setAnswers 로 갱신되면 effect 재실행되지만
+   * `answers[q.id] !== undefined` 가드로 무한루프 방지.
+   */
+  useEffect(() => {
+    if (!q || q.type !== "slider") return;
+    if (answers[q.id] !== undefined) return;
+    const def = typeof q.value === "number" ? q.value : (q.min ?? 5);
+    setAnswers((prev) => {
+      if (prev[q.id] !== undefined) return prev; // 동시 갱신 가드
+      return { ...prev, [q.id]: def };
+    });
+  }, [q, answers]);
 
   /* ── 완료 시 ai_questionnaires 저장 (1회) ── */
   const { user, loading: authLoading } = useAuth();
@@ -467,12 +517,21 @@ function QuestionnaireContent() {
 
   const goNext = () => {
     if (!isValid) return;
+    if (singleEditMode) {
+      // 단일 항목 수정 모드: 다음 문항으로 가지 않고 요약 페이지로 복귀.
+      //   현재 answers 를 명시적으로 sessionStorage 에 저장(자동 저장 effect 와 race 방지).
+      saveToSession(answersRef.current, idxRef.current);
+      router.push("/questionnaire-summary");
+      return;
+    }
     setCurrentIdx((i) => i + 1);
     setAnimKey((k) => k + 1);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const goPrev = () => {
+    // 단일 항목 수정 모드 해제 — 사용자가 [이전]을 명시적으로 눌렀으므로 일반 흐름 진입.
+    if (singleEditMode) setSingleEditMode(false);
     if (currentIdx <= 0) {
       router.push("/");
       return;
@@ -1016,7 +1075,11 @@ function QuestionnaireContent() {
           onClick={goNext}
           disabled={!isValid}
         >
-          {isLast ? "분석 시작" : "다음"} →
+          {singleEditMode
+            ? "저장"
+            : isLast
+              ? "분석 시작 →"
+              : "다음 →"}
         </button>
       </div>
     </div>

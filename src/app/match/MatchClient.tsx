@@ -103,10 +103,9 @@ export default function MatchClient() {
 function MatchContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const alreadyLoaded = (() => {
-    try { return sessionStorage.getItem("yaksa-tok-match-loaded") === "1"; } catch { return false; }
-  })();
-  const [loading, setLoading] = useState(!alreadyLoaded);
+  // 초기값은 항상 true 로 고정 — sessionStorage 분기는 서버/클라이언트 결과가 달라
+  // hydration mismatch 를 유발했음. 재방문 추적용 SET 은 아래 useEffect 에서 유지.
+  const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<TabView>("list");
   const [sortBy, setSortBy] = useState<SortKey>("match");
   const [requestedNames, setRequestedNames] = useState<Set<string>>(new Set());
@@ -350,10 +349,27 @@ function MatchContent() {
 
       // ── 2단계: 신규 분기 — consultations INSERT ──
       if (!consultationId) {
+        // INSERT 직전에 환자의 가장 최근 ai_questionnaires id 를 DB 에서 직접 조회.
+        //   sessionStorage 의 questionnaireId 가 비어있거나 다른 탭/세션이면 누락될 수 있어
+        //   DB 기준으로 최신 id 를 확보. 행이 없으면(.maybeSingle → data null) null 로 두고
+        //   INSERT 는 정상 진행. 에러는 console.error 만 (블로킹 X).
+        const latestQResp = await supabase
+          .from("ai_questionnaires")
+          .select("id")
+          .eq("patient_id", user.id)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle<{ id: string }>();
+        if (latestQResp.error) {
+          console.error("[match] latest ai_questionnaires lookup failed:", latestQResp.error);
+        }
+        const latestQuestionnaireId = latestQResp.data?.id ?? null;
+        console.log("[match] latest questionnaire id (DB):", latestQuestionnaireId);
+
         const payload: ConsultationInsert = {
           patient_id: user.id,
           pharmacist_id: realPharmacistId,
-          questionnaire_id: questionnaireId,
+          questionnaire_id: latestQuestionnaireId,
           consultation_type: "local",
           status: "pending",
           matching_source: "ai_questionnaire",
@@ -423,12 +439,10 @@ function MatchContent() {
         next.delete(pharmacistName);
         return next;
       });
-      setRequestToast(
-        isNewConsultation
-          ? `${pharmacistName}에게 상담 요청을 보냈어요!`
-          : `${pharmacistName}에게 새 차수 상담 요청을 보냈어요!`,
-      );
-      setTimeout(() => setRequestToast(null), 2500);
+      // 토스트 제거 — 채팅방으로 직진하면서 사용자에게 다음 단계를 명시적으로 보여줌.
+      // 채팅방의 "약사 수락 대기 중" 안내가 토스트 역할을 대체.
+      // 뒤로가기로 매칭 페이지 복귀 시엔 requestedNames 가 유지되어 "요청 완료 ✓" 라벨 그대로.
+      router.push(`/chat/${consultationId}?role=patient`);
     } catch (err) {
       console.error("[match] consultation create threw:", err);
       setRequestingNames((prev) => {
@@ -464,7 +478,7 @@ function MatchContent() {
             <span><span className="meta-dot" /> 불편도 7/10</span>
           </div>
         </div>
-        <Link href="/questionnaire?from=start" className="edit-answers-link">
+        <Link href="/questionnaire-summary" className="edit-answers-link">
           답변 수정하기 →
         </Link>
 

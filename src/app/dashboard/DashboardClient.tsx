@@ -1827,29 +1827,44 @@ function DashboardContent() {
     questionnaire: { symptoms: string[] | null } | null;
     patient_profile: { birth_year: number | null; gender: string | null } | null;
   }
-  const { user: authUser } = useAuth();
+  const { user: authUser, loading: authLoading, profile, profileLoading } = useAuth();
 
   /* ── license_name 미등록 약사 가드 ──
    * 직접 URL 로 /dashboard 에 접근한 약사 중 pharmacist_profiles.license_name 이
    * NULL/빈값이면 면허증 이름 입력 단계로 보냄. (콜백 라우트와 동일한 정책)
+   *
+   * race condition 방지:
+   *  - auth/profile 로딩 중에는 절대 쿼리 안 던짐 (세션 토큰 stale 로 RLS 일시 거부 회피)
+   *  - profile.role 이 'pharmacist' 일 때만 가드 동작 (환자 계정 보호)
+   *  - 쿼리 에러/row 없음 vs 진짜 빈 값을 구분 — 진짜 빈 값일 때만 redirect
    */
   useEffect(() => {
+    if (authLoading || profileLoading) return;
     if (!authUser) return;
+    if (profile?.role !== "pharmacist") return;
     let cancelled = false;
     (async () => {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("pharmacist_profiles")
         .select("license_name")
         .eq("id", authUser.id)
         .maybeSingle<{ license_name: string | null }>();
       if (cancelled) return;
-      const ln = data?.license_name?.trim() || "";
+      if (error) {
+        console.error("[dashboard guard] license check failed:", error);
+        return;
+      }
+      if (!data) {
+        console.error("[dashboard guard] no pharmacist_profiles row found");
+        return;
+      }
+      const ln = (data.license_name ?? "").trim();
       if (!ln) {
         router.replace("/signup/pharmacist?step=license");
       }
     })();
     return () => { cancelled = true; };
-  }, [authUser, router]);
+  }, [authUser, router, profile, authLoading, profileLoading]);
 
   const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
   const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
