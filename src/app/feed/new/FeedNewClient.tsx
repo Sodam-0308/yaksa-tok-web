@@ -227,7 +227,6 @@ function FeedNewContent() {
       setSubmitting(false);
       return;
     }
-    console.log("[feed-new] case_studies created with photos:", photoUrls.length);
 
     setSubmitting(false);
     setShowToast(true);

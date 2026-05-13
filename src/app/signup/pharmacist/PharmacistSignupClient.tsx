@@ -277,8 +277,6 @@ function PharmacistSignupContent() {
       .upsert(ppPayload, { onConflict: "id" });
     if (ppRes.error) {
       console.error("[ph-signup] pharmacist_profiles upsert failed:", ppRes.error);
-    } else {
-      console.log("[ph-signup] pharmacist_profiles saved with license_name:", licenseNameTrimmed);
     }
 
     // profiles.name = license_name (환자에게 보여지는 약사 이름)

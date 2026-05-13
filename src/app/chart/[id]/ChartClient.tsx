@@ -758,7 +758,6 @@ function ChartContent() {
           : [],
       }));
       setVisits(mapped);
-      console.log("[chart] visit_records loaded:", mapped.length);
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps

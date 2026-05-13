@@ -342,7 +342,6 @@ function MypageContent() {
         .filter((x): x is ConsultItem => x !== null);
 
       setDbConsults(built);
-      console.log("[mypage] consultations loaded:", built.length);
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -475,7 +474,6 @@ function MypageContent() {
         }
         return next;
       });
-      console.log("[mypage] medication_checks loaded:", rows.length);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, supplements.length]);
@@ -520,7 +518,6 @@ function MypageContent() {
       }
       setDoseStatus(map);
       setDoseLoaded(true);
-      console.log("[mypage] medication_status loaded:", rows.length);
     })();
   }, [user]);
 
@@ -553,8 +550,6 @@ function MypageContent() {
     setStatusSaving(false);
     if (error) {
       console.error("[mypage] medication_status save failed:", error);
-    } else {
-      console.log("[mypage] medication_status saved:", targetId, nextStatus);
     }
   };
 
@@ -628,8 +623,6 @@ function MypageContent() {
           dayChecks[id] = arr;
           return { ...prev, [dateKey]: dayChecks };
         });
-      } else {
-        console.log("[mypage] medication_checks upsert OK:", supp.name, slot, dateKey, nextChecked);
       }
     })();
   };

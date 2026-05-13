@@ -394,6 +394,11 @@ function ChatContent() {
   const [showEndConfirm, setShowEndConfirm] = useState(false);
   const [endingConsult, setEndingConsult] = useState(false);
   const [endError, setEndError] = useState<string | null>(null);
+  // 약사 측 거절 액션 상태 (pending UI 거절 버튼 → 사유 선택 모달 → UPDATE)
+  const [showRejectConfirm, setShowRejectConfirm] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectError, setRejectError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -834,7 +839,6 @@ function ChatContent() {
       // 활성 차수 기본값 = 가장 최근 round (round_number 가 가장 큼). rounds 가 빈 배열이면 null → 통합 뷰 폴백
       const latestRoundId = loadedRounds.length > 0 ? loadedRounds[loadedRounds.length - 1].id : null;
       setActiveRoundId(latestRoundId);
-      console.log("[chat] rounds loaded:", loadedRounds.length, "active:", latestRoundId);
 
       // 1.6) ai_questionnaires 콘텐츠 IN 쿼리 — 차수별 박스 렌더용
       const qIds = Array.from(
@@ -866,7 +870,6 @@ function ChatContent() {
               });
             }
             setQuestionnaireById(map);
-            console.log("[chat] ai_questionnaires loaded:", map.size);
           }
         }
       }
@@ -932,7 +935,6 @@ function ChatContent() {
       const rows = (msgResp.data ?? []) as unknown as DbMessageRow[];
       setMessages(rows.map(mapRow));
       setDbLoading(false);
-      console.log("[chat] loaded messages:", rows.length);
 
       // 2.5) 진입 시점에 상대방 미읽음 메시지 읽음 처리
       void markCounterpartRead();
@@ -964,15 +966,23 @@ function ChatContent() {
                   : prev,
               );
             }
+            // [CONSULT_REJECTED] 가 realtime 으로 도착 = 약사가 방금 거절한 시점.
+            //   consultation.status 를 'rejected' 로 로컬 갱신 → 환자 측 거절 안내 카드 자동 노출.
+            //   약사 본인은 이미 /dashboard 로 라우팅되어 이 콜백 영향 없음.
+            if (row.content === "[CONSULT_REJECTED]") {
+              setDbConsultation((prev) =>
+                prev && prev.status === "pending"
+                  ? { ...prev, status: "rejected" }
+                  : prev,
+              );
+            }
             // 상대방이 보낸 메시지면 즉시 읽음 처리 (채팅방 열려있는 동안 배지 누적 방지)
             if (user && row.sender_id !== user.id) {
               void markCounterpartRead();
             }
           },
         )
-        .subscribe((status) => {
-          console.log("[chat] realtime status:", status);
-        });
+        .subscribe(() => {});
     })();
 
     return () => {
@@ -981,7 +991,7 @@ function ChatContent() {
         supabase.removeChannel(channel);
       }
     };
-  }, [isDbConsultation, chatId]);
+  }, [isDbConsultation, chatId, user?.id]);
 
   /* ── 약사 측 pending 환자 정보 fetch ──
    * pending 시점엔 consultation_rounds 가 없어 위의 rounds 기반 ai_questionnaires
@@ -991,42 +1001,24 @@ function ChatContent() {
    * 더 이상 트리거되지 않음(상호 충돌 없음).
    */
   useEffect(() => {
-    console.log("[chat-pharm-pending-debug] guards:", {
-      role,
-      isDbConsultation,
-      hasDbConsultation: !!dbConsultation,
-      status: dbConsultation?.status,
-      questionnaire_id: dbConsultation?.questionnaire_id,
-      passRole: role === "pharmacist",
-      passIsDb: isDbConsultation === true,
-      passHas: !!dbConsultation,
-      passStatus: dbConsultation?.status === "pending",
-      passQid: !!dbConsultation?.questionnaire_id,
-    });
     if (role !== "pharmacist") {
-      console.log("[chat-pharm-pending-debug] returning early at role check (role =", role, ")");
       return;
     }
     if (!isDbConsultation) {
-      console.log("[chat-pharm-pending-debug] returning early at isDbConsultation check");
       return;
     }
     if (!dbConsultation) {
-      console.log("[chat-pharm-pending-debug] returning early at dbConsultation null check");
       return;
     }
     if (dbConsultation.status !== "pending") {
-      console.log("[chat-pharm-pending-debug] returning early at status check (status =", dbConsultation.status, ")");
       return;
     }
     if (!dbConsultation.questionnaire_id) {
-      console.log("[chat-pharm-pending-debug] returning early at questionnaire_id check (questionnaire_id =", dbConsultation.questionnaire_id, ")");
       return;
     }
     const qid = dbConsultation.questionnaire_id;
     let cancelled = false;
     (async () => {
-      console.log("[chat-pharm-pending] fetching questionnaire id =", qid);
       const { data, error } = await supabase
         .from("ai_questionnaires")
         .select("symptoms, symptom_duration, severity, free_text, ai_summary")
@@ -1043,11 +1035,6 @@ function ChatContent() {
         console.error("[chat-pharm-pending] questionnaire fetch failed:", error);
         return;
       }
-      console.log("[chat-pharm-pending] questionnaire loaded =", {
-        symptoms: data?.symptoms,
-        severity: data?.severity,
-        symptom_duration: data?.symptom_duration,
-      });
       setPendingQuestionnaire(data);
     })();
     return () => { cancelled = true; };
@@ -1212,11 +1199,87 @@ function ChatContent() {
     router.push("/dashboard");
   };
 
-  /* 종료 잠금 판정 — DB 모드에서 status가 completed/cancelled 면 입력 차단 */
+  /* ── 약사 측 상담 요청 거절 ──
+   * pending 상태 consultation 에 대해 status='rejected' UPDATE + 거절 사유 기록.
+   * UPDATE 성공 후 [CONSULT_REJECTED] 시스템 메시지 INSERT — 환자 측 realtime 이
+   * 이 메시지를 받아 로컬 status='rejected' 로 갱신, 거절 안내 카드 자동 노출.
+   * 거절 사유는 메시지 content 에 절대 담지 않음 (환자 노출 금지).
+   */
+  const rejectConsultation = async () => {
+    if (rejecting) return;
+    if (!isDbConsultation) {
+      setRejectError("DB 상담이 아닙니다");
+      return;
+    }
+    if (!user) {
+      setRejectError("로그인이 필요해요");
+      return;
+    }
+    if (!rejectReason) {
+      setRejectError("사유를 선택해 주세요");
+      return;
+    }
+    setRejecting(true);
+    setRejectError(null);
+    type ConsRejectUpdate = {
+      status: string;
+      rejected_reason: string;
+      rejected_at: string;
+    };
+    const upPayload: ConsRejectUpdate = {
+      status: "rejected",
+      rejected_reason: rejectReason,
+      rejected_at: new Date().toISOString(),
+    };
+    const upResp = await (supabase
+      .from("consultations") as unknown as {
+        update: (p: ConsRejectUpdate) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update(upPayload)
+      .eq("id", chatId);
+    if (upResp.error) {
+      setRejecting(false);
+      console.error("[chat] reject UPDATE failed:", upResp.error);
+      setRejectError(upResp.error.message || "거절 처리에 실패했어요");
+      return;
+    }
+    // 시스템 메시지 INSERT — 환자 측 realtime trigger. 실패해도 UPDATE 는 성공이므로 라우팅은 그대로 진행.
+    const rejectMsgPayload: MessageInsert = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content: "[CONSULT_REJECTED]",
+      message_type: "system",
+      is_read: true,
+    };
+    const msgResp = await (supabase
+      .from("messages") as unknown as {
+        insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(rejectMsgPayload);
+    if (msgResp.error) {
+      console.error("[chat] reject system message INSERT failed (UPDATE 는 성공):", msgResp.error);
+    }
+    setRejecting(false);
+    setShowRejectConfirm(false);
+    setDbConsultation((prev) => (prev ? { ...prev, status: "rejected" } : prev));
+    router.push("/dashboard");
+  };
+
+  /* 거절 상태 — 약사가 pending 요청을 거절하면 status='rejected'. 환자 측 안내 박스 분기용. */
+  const consultationRejected =
+    isDbConsultation &&
+    !!dbConsultation &&
+    dbConsultation.status === "rejected";
+  /* 종료 잠금 판정 — DB 모드에서 status가 completed/cancelled/rejected 면 입력 차단.
+   * 'rejected' 는 안내 박스 문구가 다르므로 consultationRejected 로 별도 분기. */
   const consultationLocked =
     isDbConsultation &&
     !!dbConsultation &&
-    (dbConsultation.status === "completed" || dbConsultation.status === "cancelled");
+    (dbConsultation.status === "completed" ||
+      dbConsultation.status === "cancelled" ||
+      dbConsultation.status === "rejected");
   /* 수락 대기 잠금 — DB 모드에서 status='pending' 이면 약사 수락 전.
    * 환자가 매칭에서 요청 직후 진입한 채팅방. 약사가 수락하면 realtime 으로
    * [ROUND_START] 메시지가 도착하며 status 도 'accepted' 로 갱신됨 (아래 콜백). */
@@ -1253,7 +1316,6 @@ function ChatContent() {
         // 활성 차수가 있으면 그 차수에 귀속, 없으면 null (통합 뷰 폴백)
         round_id: activeRoundId,
       };
-      console.log("[chat] sending message:", payload);
       setInput("");
       if (inputRef.current) inputRef.current.style.height = "auto";
 
@@ -1284,7 +1346,6 @@ function ChatContent() {
           setInput(text);
           return;
         }
-        console.log("[chat] message sent — id:", data?.id);
         // Realtime echo가 곧 도착하지만, 즉시 옵티미스틱 추가 (구독 echo는 dedupe됨)
         if (data) {
           const row = data;
@@ -1677,8 +1738,8 @@ function ChatContent() {
         </div>
       )}
 
-      {/* 환자 측 안내 박스 — 항상 노출 (read-receipt 형태 X). 베이지/살구 톤 */}
-      {role === "patient" && (
+      {/* 환자 측 안내 박스 — 베이지/살구 톤. 로딩 중에는 노출 X (rejected 깜빡임 방지). */}
+      {role === "patient" && !dbLoading && !consultationRejected && (
         <div
           className="chat-status-banner waiting"
           style={{ padding: "12px 16px" }}
@@ -1734,11 +1795,6 @@ function ChatContent() {
             }
             return null;
           })();
-          // [임시 디버그] — 사용자 확인 후 제거 예정
-          console.log("[round-box] activeRoundId:", activeRoundId);
-          console.log("[round-box] rounds:", rounds);
-          console.log("[round-box] activeRound:", activeRound);
-          console.log("[round-box] questionnaire:", q, "symptoms:", symptoms, "summary:", summary);
           return (
             <div style={{
               margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
@@ -1898,8 +1954,73 @@ function ChatContent() {
         </div>
       )}
 
-      {/* Messages */}
+      {/* Messages — 3분기:
+            (1) dbLoading: 빈 영역 (메시지/카드 둘 다 안 보임 → rejected 깜빡임 방지)
+            (2) !dbLoading + rejected + patient: 거절 안내 카드 (정중앙)
+            (3) 그 외: 기존 메시지 리스트 */}
       <div className="chat-messages" style={{ borderTop: "none" }}>
+        {dbLoading ? null : !dbLoading && consultationRejected && role === "patient" ? (
+          /* 거절 안내 카드 — 채팅 영역 정중앙. 메시지 리스트는 숨김.
+             거절 사유는 환자에게 노출 X. */
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "center",
+              alignItems: "center",
+              flex: 1,
+              padding: "20px",
+            }}
+          >
+            <div
+              style={{
+                width: "100%",
+                maxWidth: 320,
+                padding: "16px 18px",
+                borderRadius: 12,
+                background: "#EDF4F0",
+                border: "1px solid rgba(94,125,108,0.18)",
+                color: "#2C3630",
+                fontFamily: "'Noto Sans KR', sans-serif",
+              }}
+            >
+              <div style={{
+                fontSize: 15, fontWeight: 700, color: "#2C3630",
+                textAlign: "center", lineHeight: 1.5,
+              }}>
+                이번에는 상담이 어려운 상황이에요
+              </div>
+              <div style={{
+                fontSize: 14, color: "#3D4A42",
+                textAlign: "center", marginTop: 6, lineHeight: 1.6,
+              }}>
+                다른 약사님께 상담 요청을 보내보시겠어요?
+              </div>
+              <button
+                type="button"
+                onClick={() => router.push("/match")}
+                style={{
+                  width: "100%",
+                  height: 44,
+                  marginTop: 12,
+                  borderRadius: 10,
+                  background: "#4A6355",
+                  color: "#fff",
+                  border: "none",
+                  fontSize: 14,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                매칭 페이지로
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
         {!isDbConsultation && (
           <div className="chat-date-divider">
             <span>{activeSession === "s1" ? "오늘" : "2026년 4월 11일"}</span>
@@ -2347,6 +2468,8 @@ function ChatContent() {
           );
         })}
         <div ref={messagesEndRef} />
+          </>
+        )}
       </div>
 
       {/* 새 상담 요청 액션 박스 (sage 톤) — 약사 측, 도구 버튼 줄 바로 위.
@@ -2401,7 +2524,7 @@ function ChatContent() {
               <div style={{ textAlign: "right", marginTop: 6 }}>
                 <button
                   type="button"
-                  onClick={() => console.log("[chat-pharm-action] view full clicked")}
+                  onClick={() => {}}
                   style={{
                     background: "transparent",
                     border: "none",
@@ -2420,7 +2543,7 @@ function ChatContent() {
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 type="button"
-                onClick={() => console.log("[chat-pharm-action] reject clicked")}
+                onClick={() => { setRejectReason(""); setRejectError(null); setShowRejectConfirm(true); }}
                 style={{
                   flex: 1,
                   minHeight: 44,
@@ -2439,7 +2562,7 @@ function ChatContent() {
               </button>
               <button
                 type="button"
-                onClick={() => console.log("[chat-pharm-action] accept clicked")}
+                onClick={() => {}}
                 style={{
                   flex: 1,
                   minHeight: 44,
@@ -2560,9 +2683,9 @@ function ChatContent() {
         );
       })()}
 
-      {/* 상태 안내 박스 — 입력란 바로 위. consultationLocked 와 consultationPending 은 상호 배타 (status 가 동시에 두 값일 수 없음). */}
-      {/* 종료된 상담 안내 (회색 톤) */}
-      {consultationLocked && (
+      {/* 상태 안내 박스 — 입력란 바로 위. consultationLocked / consultationPending / consultationRejected 는 상호 배타. */}
+      {/* 종료된 상담 안내 (회색 톤) — rejected 는 별도 박스에서 분기 처리하므로 제외 */}
+      {consultationLocked && !consultationRejected && (
         <div
           role="status"
           style={{
@@ -2620,13 +2743,15 @@ function ChatContent() {
           ref={inputRef}
           className="chat-input"
           placeholder={
-            consultationLocked
-              ? "종료된 상담은 메시지를 보낼 수 없어요"
-              : consultationPending
-                ? "약사 수락 대기 중이에요"
-                : isLatestSession
-                  ? "메시지를 입력하세요..."
-                  : "이전 차수는 읽기 전용입니다"
+            consultationRejected
+              ? "다른 약사님께 상담을 요청해 주세요"
+              : consultationLocked
+                ? "종료된 상담은 메시지를 보낼 수 없어요"
+                : consultationPending
+                  ? "약사 수락 대기 중이에요"
+                  : isLatestSession
+                    ? "메시지를 입력하세요..."
+                    : "이전 차수는 읽기 전용입니다"
           }
           value={isLatestSession && !inputLocked ? input : ""}
           onChange={(e) => setInput(e.target.value)}
@@ -3976,6 +4101,132 @@ function ChatContent() {
           </div>
         </div>
       )}
+
+      {/* 거절 사유 선택 모달 (약사 전용 — pending 상담 거절) */}
+      {showRejectConfirm && role === "pharmacist" && (() => {
+        const reasons = [
+          "일정이 어려워요",
+          "전문 영역이 아니에요",
+          "기타",
+        ];
+        return (
+          <div
+            // 약사 모드: 외부 클릭으로 닫히지 않음 (실수 방지) — endConfirm 약사 패턴 차용
+            style={{
+              position: "fixed", inset: 0, zIndex: 300,
+              background: "rgba(0,0,0,0.4)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              padding: 20,
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                background: "#fff", borderRadius: 16, padding: "24px 22px 22px",
+                maxWidth: 360, width: "100%",
+                boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
+                fontFamily: "'Noto Sans KR', sans-serif",
+              }}
+            >
+              <div style={{
+                fontSize: 16, fontWeight: 700, color: "#2C3630",
+                marginBottom: 8, textAlign: "center",
+              }}>
+                상담 요청을 거절할까요?
+              </div>
+              <div style={{
+                fontSize: 14, color: "#3D4A42", lineHeight: 1.6,
+                marginBottom: 16, textAlign: "center",
+              }}>
+                선택하신 사유는 서비스 개선에만 사용되고, 환자에게는 전달되지 않아요.
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+                {reasons.map((label) => {
+                  const checked = rejectReason === label;
+                  return (
+                    <button
+                      key={label}
+                      type="button"
+                      onClick={() => setRejectReason(label)}
+                      disabled={rejecting}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10,
+                        width: "100%", minHeight: 48,
+                        padding: "12px 14px",
+                        background: checked ? "#EDF4F0" : "#fff",
+                        border: checked
+                          ? "1.5px solid #4A6355"
+                          : "1px solid rgba(94, 125, 108, 0.14)",
+                        borderRadius: 12,
+                        cursor: rejecting ? "default" : "pointer",
+                        textAlign: "left",
+                        fontFamily: "'Noto Sans KR', sans-serif",
+                      }}
+                    >
+                      <span
+                        aria-hidden
+                        style={{
+                          width: 18, height: 18, borderRadius: "50%",
+                          border: checked ? "5px solid #4A6355" : "1.5px solid rgba(94, 125, 108, 0.35)",
+                          background: "#fff",
+                          flexShrink: 0,
+                          boxSizing: "border-box",
+                        }}
+                      />
+                      <span style={{
+                        fontSize: 14, color: "#2C3630", fontWeight: checked ? 600 : 500,
+                      }}>
+                        {label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              {rejectError && (
+                <div style={{
+                  fontSize: 14, color: "#C06B45",
+                  marginBottom: 12, lineHeight: 1.5,
+                }}>
+                  {rejectError}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => { if (!rejecting) { setShowRejectConfirm(false); setRejectError(null); } }}
+                  disabled={rejecting}
+                  style={{
+                    flex: 1, padding: "12px", borderRadius: 10,
+                    fontSize: 14, fontWeight: 600,
+                    background: "#fff", color: "#3D4A42",
+                    border: "1px solid rgba(94, 125, 108, 0.28)",
+                    cursor: rejecting ? "default" : "pointer",
+                    opacity: rejecting ? 0.6 : 1,
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  취소
+                </button>
+                <button
+                  type="button"
+                  onClick={rejectConsultation}
+                  disabled={rejectReason === "" || rejecting}
+                  style={{
+                    flex: 1, padding: "12px", borderRadius: 10,
+                    fontSize: 14, fontWeight: 700,
+                    background: "#4A6355", color: "#fff", border: "none",
+                    cursor: (rejectReason === "" || rejecting) ? "default" : "pointer",
+                    opacity: (rejectReason === "" || rejecting) ? 0.55 : 1,
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  {rejecting ? "거절하는 중..." : "거절 보내기"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* 추가 질문 세트 선택 모달 (약사 전용) */}
       {showQSetPicker && role === "pharmacist" && (

@@ -327,7 +327,6 @@ function Content() {
         }
       }
       const survivors = Array.from(pairWinners.values());
-      console.log("[chat-list] pair-grouped:", rows.length, "→", survivors.length);
 
       // 4) ChatRoom 매핑 (살아남은 row 만)
       const built: ChatRoom[] = survivors.map((r) => {
@@ -373,7 +372,6 @@ function Content() {
 
       setDbRooms(built);
       setDbLoading(false);
-      console.log("[chat-list] loaded rooms:", built.length);
     })();
 
     return () => {

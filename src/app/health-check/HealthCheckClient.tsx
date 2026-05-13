@@ -169,7 +169,6 @@ function HealthCheckContent() {
         setDbHistory([]);
         return;
       }
-      console.log("[health-check] history loaded:", data?.length ?? 0);
       setDbHistory((data ?? []) as unknown as HealthCheckRow[]);
     })();
   }, [user]);
@@ -257,7 +256,6 @@ function HealthCheckContent() {
         consultationId = consData.id;
       }
     }
-    console.log("[health-check] resolved consultation_id:", consultationId);
 
     const payload: HealthCheckInsert = {
       patient_id: user.id,
@@ -269,7 +267,6 @@ function HealthCheckContent() {
       discomfort_score: scores.symptom,
       memo: memo.trim() ? memo.trim() : null,
     };
-    console.log("[health-check] saving:", payload);
     const { data, error } = await (supabase
       .from("health_checks") as unknown as {
         insert: (p: HealthCheckInsert) => {
@@ -296,7 +293,6 @@ function HealthCheckContent() {
       });
       return false;
     }
-    console.log("[health-check] save SUCCESS — id:", data?.id);
     if (data) {
       setDbHistory((prev) => [data, ...(prev ?? [])]);
     }

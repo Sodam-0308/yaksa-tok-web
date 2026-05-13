@@ -162,7 +162,6 @@ function Content() {
       return;
     }
     setHasPharmacistProfile(true);
-    console.log("[ph-mypage] pharmacist_profiles saved:", Object.keys(fields));
   };
 
   /* DB 저장 헬퍼 — profiles.name UPDATE */
@@ -403,7 +402,6 @@ function Content() {
         });
       }
       setLoadedForUid(user.id);
-      console.log("[ph-mypage] profile loaded — has pharmacist_profile:", !!pp);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);

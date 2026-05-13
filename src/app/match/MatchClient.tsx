@@ -207,7 +207,6 @@ function MatchContent() {
             avgResponseTime,
           } satisfies PharmacistData;
         });
-      console.log("[match] DB pharmacists loaded:", list.length);
       setDbPharms(list);
     })();
     return () => {
@@ -309,7 +308,6 @@ function MatchContent() {
       typeof window !== "undefined"
         ? sessionStorage.getItem(QUESTIONNAIRE_ID_KEY)
         : null;
-    console.log("[match] questionnaireId from sessionStorage:", questionnaireId);
 
     // 실제 DB 약사면 UUID 그대로 사용. Mock 약사면 pharmacist_id는 null.
     const realPharmacistId = PHARM_UUID_RE.test(pharmacist.id) ? pharmacist.id : null;
@@ -343,7 +341,6 @@ function MatchContent() {
           console.error("[match] existing consultation lookup failed:", existResp.error);
         } else if (existResp.data?.id) {
           consultationId = existResp.data.id;
-          console.log("[match] reusing existing consultation — id:", consultationId, "prev status:", existResp.data.status);
         }
       }
 
@@ -364,7 +361,6 @@ function MatchContent() {
           console.error("[match] latest ai_questionnaires lookup failed:", latestQResp.error);
         }
         const latestQuestionnaireId = latestQResp.data?.id ?? null;
-        console.log("[match] latest questionnaire id (DB):", latestQuestionnaireId);
 
         const payload: ConsultationInsert = {
           patient_id: user.id,
@@ -374,7 +370,6 @@ function MatchContent() {
           status: "pending",
           matching_source: "ai_questionnaire",
         };
-        console.log("[match] consultations insert payload (new):", payload);
         const insResp = await (supabase
           .from("consultations") as unknown as {
             insert: (p: ConsultationInsert) => {
@@ -396,7 +391,6 @@ function MatchContent() {
         }
         consultationId = insResp.data.id;
         isNewConsultation = true;
-        console.log("[match] consultation created — id:", consultationId);
       } else {
         // ── 2단계 대안: 재사용 분기 — status='pending' 으로 재활성화 + completed_at NULL ──
         type ConsUpdate = {
@@ -423,7 +417,6 @@ function MatchContent() {
           finishWithError("상담 요청을 보내지 못했어요. 잠시 후 다시 시도해주세요.");
           return;
         }
-        console.log("[match] consultation reactivated — id:", consultationId);
       }
 
       // ── consultation_rounds INSERT 는 약사 수락 시점으로 이동 ──

@@ -1876,7 +1876,6 @@ function DashboardContent() {
 
   const fetchPendingRequests = async (myUserId: string | null) => {
     setDbPendingLoading(true);
-    console.log("[dashboard] fetchPendingRequests — myUserId:", myUserId);
 
     // 1) consultations 만 단순 SELECT — 임베드(JOIN) 없이 가져와 400 회피
     const unassignedQuery = supabase
@@ -1894,9 +1893,6 @@ function DashboardContent() {
       : Promise.resolve({ data: [] as unknown[], error: null });
 
     const [unRes, myRes] = await Promise.all([unassignedQuery, myQuery]);
-
-    console.log("[dashboard] unassigned query result:", unRes);
-    console.log("[dashboard] mine query result:", myRes);
 
     if (unRes.error) {
       console.error("[dashboard] pending unassigned query FAILED:", {
@@ -1938,11 +1934,6 @@ function DashboardContent() {
 
     const consultations = filtered.sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    );
-
-    console.log(
-      "[dashboard] consultations merged (self-filtered):",
-      consultations.length,
     );
 
     if (consultations.length === 0) {
@@ -2013,7 +2004,6 @@ function DashboardContent() {
       patient_profile: patientProfById.get(c.patient_id) ?? null,
     }));
 
-    console.log("[dashboard] pending list final:", rows);
     setDbPendingList(rows);
     setDbPendingCount(rows.length);
     setDbPendingLoading(false);
@@ -2021,7 +2011,6 @@ function DashboardContent() {
 
   const fetchActiveConsultations = async (pharmacistId: string) => {
     setDbActiveLoading(true);
-    console.log("[dashboard] fetchActiveConsultations — pharmacistId:", pharmacistId);
 
     // 1) consultations 만 단순 SELECT — 임베드 없이 (400 회피)
     const consRes = await supabase
@@ -2030,8 +2019,6 @@ function DashboardContent() {
       .in("status", ["accepted", "chatting", "visit_scheduled"])
       .eq("pharmacist_id", pharmacistId)
       .order("last_message_at", { ascending: false, nullsFirst: false });
-
-    console.log("[dashboard] active consultations query result:", consRes);
 
     if (consRes.error) {
       console.error("[dashboard] active list failed:", {
@@ -2121,7 +2108,6 @@ function DashboardContent() {
       patient_profile: patientProfById.get(c.patient_id) ?? null,
     }));
 
-    console.log("[dashboard] active list final:", rows);
     setDbActiveList(rows);
     setDbActiveLoading(false);
   };
@@ -2176,7 +2162,6 @@ function DashboardContent() {
       setActingId(null);
       return;
     }
-    console.log(`[dashboard] consultation ${nextStatus} success — id:`, id);
 
     // 수락 시: 회차(round) 부트스트랩.
     //   1) 기존 'active' round 가 남아있으면 먼저 'completed' 로 UPDATE (정합성 보장 —
@@ -2185,7 +2170,6 @@ function DashboardContent() {
     //   3) [ROUND_START] 시스템 메시지 INSERT (message_type='system', is_read=true).
     //   부분 실패해도 수락 자체는 성공으로 간주 — console.error 로 명확히 로깅.
     if (nextStatus === "accepted" && authUser) {
-      console.log("[ACCEPT] round bootstrap start — consultation:", id);
       try {
         // (a) 기존 active round 가 있으면 닫기 (legacy 데이터 정합성 보호용).
         //     ended_at 도 같이 채워서 통계 일관성 유지. 실패해도 다음 단계 진행.
@@ -2203,8 +2187,6 @@ function DashboardContent() {
           .eq("status", "active");
         if (closePrevResp.error) {
           console.error("[ACCEPT] close previous active rounds failed:", closePrevResp.error);
-        } else {
-          console.log("[ACCEPT] previous active rounds closed (if any) for consultation:", id);
         }
 
         // (b) 다음 round_number 계산
@@ -2222,7 +2204,6 @@ function DashboardContent() {
           typeof maxResp.data?.round_number === "number"
             ? maxResp.data.round_number + 1
             : 1;
-        console.log("[ACCEPT] next round_number:", nextRoundNumber);
 
         // (c) consultations.questionnaire_id 조회 — round 의 questionnaire_id 로 사용
         const consResp = await supabase
@@ -2248,7 +2229,6 @@ function DashboardContent() {
           questionnaire_id: qId,
           status: "active",
         };
-        console.log("[ACCEPT] round INSERT payload:", roundPayload);
         const roundResp = await (supabase
           .from("consultation_rounds") as unknown as {
             insert: (p: RoundInsert) => {
@@ -2267,7 +2247,6 @@ function DashboardContent() {
         if (roundResp.error || !roundResp.data?.id) {
           console.error("[ACCEPT] round insert failed:", roundResp.error);
         } else {
-          console.log("[ACCEPT] round INSERT success — round_id:", roundResp.data.id);
           // (e) 회차 시작 시스템 메시지 INSERT
           type SysMsgInsert = {
             consultation_id: string;
@@ -2292,8 +2271,6 @@ function DashboardContent() {
             .insert(sysPayload);
           if (sysResp.error) {
             console.error("[ACCEPT] round-start system message INSERT failed:", sysResp.error);
-          } else {
-            console.log("[ACCEPT] [ROUND_START] message INSERT success");
           }
         }
       } catch (roundErr) {

@@ -353,13 +353,6 @@ function QuestionnaireContent() {
   const { user, loading: authLoading } = useAuth();
   const savedRef = useRef(false);
   useEffect(() => {
-    console.log("[questionnaire] effect tick", {
-      isComplete,
-      restored,
-      authLoading,
-      hasUser: !!user,
-      saved: savedRef.current,
-    });
     // 인증 상태 확정 전에는 저장 보류 (로그인 사용자가 patient_id=null로 저장되는 것 방지)
     if (!isComplete || !restored || authLoading || savedRef.current) return;
     savedRef.current = true;
@@ -405,13 +398,6 @@ function QuestionnaireContent() {
       completed_at: new Date().toISOString(),
     };
 
-    console.log("[questionnaire] saving ai_questionnaires", {
-      patient_id: payload.patient_id,
-      symptomsCount: symptoms.length,
-      freeTextLength: freeText.length,
-      payload,
-    });
-
     (async () => {
       try {
         // 1) INSERT — RLS에서 막히면 error.code = "42501" (insufficient_privilege)
@@ -433,8 +419,6 @@ function QuestionnaireContent() {
           .select("id")
           .maybeSingle();
 
-        console.log("[questionnaire] insert response:", insertResp);
-
         if (insertResp.error) {
           console.error("[questionnaire] save FAILED:", {
             message: insertResp.error.message,
@@ -452,7 +436,6 @@ function QuestionnaireContent() {
             "[questionnaire] insert succeeded but no id returned — RLS가 SELECT를 막고 있을 수 있어요",
           );
         } else {
-          console.log("[questionnaire] save SUCCESS — id:", newId);
           if (typeof window !== "undefined") {
             sessionStorage.setItem(QUESTIONNAIRE_ID_KEY, newId);
           }
