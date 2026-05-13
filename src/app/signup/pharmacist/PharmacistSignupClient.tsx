@@ -334,7 +334,10 @@ function PharmacistSignupContent() {
                 </div>
 
                 <h1 className="step-title" style={{ textAlign: "center" }}>
-                  {(licenseNameTrimmed || name || "약사")}님, 환영합니다!
+                  {(() => {
+                    const n = licenseNameTrimmed || name;
+                    return n ? `${n} 약사님, 환영합니다!` : "약사님, 환영합니다!";
+                  })()}
                 </h1>
                 <div className="success-text">
                   약사톡과 함께 환자의 건강을 개선해주세요.

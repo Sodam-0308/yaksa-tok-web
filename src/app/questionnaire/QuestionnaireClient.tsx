@@ -374,6 +374,11 @@ function QuestionnaireContent() {
       const v = answers[key];
       return typeof v === "string" && v.trim() ? v : null;
     };
+    // slider 등 number 타입 응답을 string 컬럼에 저장할 때 사용. severity(1-10) 등.
+    const pickNumAsStr = (key: string): string | null => {
+      const v = answers[key];
+      return typeof v === "number" ? String(v) : null;
+    };
     const pickStrArr = (key: string): string[] => {
       const v = answers[key];
       return Array.isArray(v) ? (v as unknown[]).filter((x) => typeof x === "string") as string[] : [];
@@ -385,7 +390,7 @@ function QuestionnaireContent() {
       patient_id: user?.id ?? null,
       symptoms,
       symptom_duration: pickStr("duration"),
-      severity: pickStr("severity"),
+      severity: pickNumAsStr("severity"),
       meal_pattern: mealPatternArr.length > 0 ? mealPatternArr.join(", ") : null,
       alcohol: pickStr("alcohol"),
       caffeine: pickStr("caffeine"),

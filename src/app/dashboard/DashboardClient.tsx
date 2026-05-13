@@ -1495,7 +1495,7 @@ function ChatSidePanel({
               </svg>
               {sm}
             </div>
-            <span style={{ fontSize: 10, color: "#9AA8A0" }}>약사님만 보이는 메세지입니다.</span>
+            <span style={{ fontSize: 10, color: "#9AA8A0" }}>내부 메모 (환자에게 안 보임)</span>
           </div>
         ))}
         <div ref={chatEndRef} />

@@ -233,7 +233,7 @@ export default function PharmacistClient() {
     setRequested(true);
     setTimeout(() => {
       alert(
-        `${data.name}에게 상담을 요청했어요!\n약사가 수락하면 채팅이 시작됩니다.`
+        `${data.name}에게 상담을 요청했어요!\n약사님이 수락하면 채팅이 시작됩니다.`
       );
     }, 300);
   };
@@ -620,7 +620,7 @@ export default function PharmacistClient() {
       <div className="prof-bottom-cta" style={{ flexWrap: "wrap" }}>
         <div className="cta-info" style={{ minWidth: 0 }}>
           <div className="cta-free">무료 상담</div>
-          <div className="cta-sub">약사가 수락하면 채팅이 시작돼요</div>
+          <div className="cta-sub">약사님이 수락하면 채팅이 시작돼요</div>
         </div>
         <button
           className={`cta-btn${requested ? " requested" : ""}`}

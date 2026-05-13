@@ -100,7 +100,7 @@ export const questions: Question[] = [
     id: "severity",
     type: "slider",
     label: "질문 5",
-    title: "일상생활에<br/>얼마나 불편한가요?",
+    title: "일상생활에<br/>얼마나 불편한가요? (10점 만점)",
     desc: "1은 거의 괜찮음, 10은 일상이 힘든 수준이에요.",
     min: 1,
     max: 10,

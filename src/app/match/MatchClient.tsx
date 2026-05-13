@@ -725,7 +725,7 @@ function MatchContent() {
       {/* Bottom Info */}
       <div className="match-bottom-info" style={{ position: "static" }}>
         <div className="bottom-info-text">
-          상담 요청은 <strong>무료</strong>예요. 약사가 수락하면 채팅이 시작돼요.
+          상담 요청은 <strong>무료</strong>예요. 약사님이 수락하면 채팅이 시작돼요.
         </div>
       </div>
 

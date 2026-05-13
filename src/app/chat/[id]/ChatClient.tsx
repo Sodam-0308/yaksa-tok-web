@@ -9,8 +9,57 @@ import {
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import type { Database } from "@/types/database";
+import { questions as ALL_QUESTIONS, type Question } from "@/lib/questions";
 
 type MessageInsert = Database["public"]["Tables"]["messages"]["Insert"];
+
+/** severity 표시값 — severity 컬럼 우선, 없으면 detailed_answers.severity(number) 폴백.
+ *  legacy questionnaire(컬럼은 NULL 인데 detailed_answers 에는 값 있음) 대응. */
+function getSeverityDisplay(pq: {
+  severity: string | null;
+  detailed_answers: Record<string, unknown> | null;
+}): string {
+  const direct = pq.severity?.toString().trim();
+  if (direct) return direct;
+  const fromDetailed = pq.detailed_answers?.severity;
+  if (typeof fromDetailed === "number") return String(fromDetailed);
+  if (typeof fromDetailed === "string" && fromDetailed.trim()) return fromDetailed;
+  return "—";
+}
+
+/** 약사 측 23문항 사이드 패널 — 환자 답변을 질문 타입별로 보기 좋게 포매팅. */
+function formatQuestionAnswer(q: Question, value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—";
+  switch (q.type) {
+    case "single":
+    case "bristol":
+      return typeof value === "string" && value.trim() ? value : "—";
+    case "multi":
+      if (Array.isArray(value)) {
+        const arr = (value as unknown[]).filter((x) => typeof x === "string" && x.trim());
+        return arr.length > 0 ? (arr as string[]).join(", ") : "—";
+      }
+      return "—";
+    case "slider":
+      return typeof value === "number" ? String(value) : "—";
+    case "input_row": {
+      if (typeof value !== "object" || value === null) return "—";
+      const obj = value as Record<string, string>;
+      const parts = (q.inputs ?? [])
+        .map((inp) => {
+          const v = obj[inp.key];
+          if (!v || !String(v).trim()) return null;
+          return `${inp.label} ${v}${inp.unit ?? ""}`;
+        })
+        .filter((p): p is string => !!p);
+      return parts.length > 0 ? parts.join(" · ") : "—";
+    }
+    case "textarea":
+      return typeof value === "string" && value.trim() ? value : "—";
+    default:
+      return "—";
+  }
+}
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -369,6 +418,7 @@ function ChatContent() {
     severity: string | null;
     free_text: string | null;
     ai_summary: string | null;
+    detailed_answers: Record<string, unknown> | null;
   } | null>(null);
   // 차수 목록 + 활성 차수 (DB 모드 전용; mock 모드에선 빈 배열 + null)
   const [rounds, setRounds] = useState<DbRound[]>([]);
@@ -399,6 +449,11 @@ function ChatContent() {
   const [rejectReason, setRejectReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
   const [rejectError, setRejectError] = useState<string | null>(null);
+  // 약사 측 수락 액션 상태 (pending UI 수락 버튼 → 진행 중 상담 안내 모달 → UPDATE + round INSERT)
+  const [showAcceptConfirm, setShowAcceptConfirm] = useState(false);
+  const [accepting, setAccepting] = useState(false);
+  const [acceptError, setAcceptError] = useState<string | null>(null);
+  const [pendingActiveCount, setPendingActiveCount] = useState(0);
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -569,6 +624,9 @@ function ChatContent() {
     }]);
     closeAnswerForm();
   };
+
+  /* ── 환자 23문항 전체 보기 패널 (약사 측 pending UI [전체 보기 →]) ── */
+  const [showQuestionnairePanel, setShowQuestionnairePanel] = useState(false);
 
   /* ── 방문전 리포트 패널 ── */
   const [showReportPanel, setShowReportPanel] = useState(false);
@@ -1021,7 +1079,7 @@ function ChatContent() {
     (async () => {
       const { data, error } = await supabase
         .from("ai_questionnaires")
-        .select("symptoms, symptom_duration, severity, free_text, ai_summary")
+        .select("symptoms, symptom_duration, severity, free_text, ai_summary, detailed_answers")
         .eq("id", qid)
         .maybeSingle<{
           symptoms: string[] | null;
@@ -1029,6 +1087,7 @@ function ChatContent() {
           severity: string | null;
           free_text: string | null;
           ai_summary: string | null;
+          detailed_answers: Record<string, unknown> | null;
         }>();
       if (cancelled) return;
       if (error) {
@@ -1265,6 +1324,164 @@ function ChatContent() {
     setShowRejectConfirm(false);
     setDbConsultation((prev) => (prev ? { ...prev, status: "rejected" } : prev));
     router.push("/dashboard");
+  };
+
+  /* ── 약사 측 상담 요청 수락 ──
+   * pending 상태 consultation 에 대해:
+   *  (a) consultations.status='accepted' + pharmacist_id=본인 UPDATE
+   *  (b) max(round_number)+1 계산 (consultation_rounds)
+   *  (c) consultation_rounds INSERT (status='active') → 새 round id 확보
+   *  (d) [ROUND_START] 시스템 메시지 INSERT (round_id=새 round)
+   * 다른 환자 상담 자동 종료 없음 — 비즈니스 룰상 약사 1명이 여러 환자 동시 상담 가능.
+   * 성공 시 채팅방 유지 (router push 없음). status='accepted' 로 로컬 갱신되면
+   * 수락 대기 잠금 해제 + [ROUND_START] divider 가 메시지 리스트에 자동 노출.
+   */
+  const acceptConsultation = async () => {
+    if (accepting) return;
+    if (!isDbConsultation) {
+      setAcceptError("DB 상담이 아닙니다");
+      return;
+    }
+    if (!user) {
+      setAcceptError("로그인이 필요해요");
+      return;
+    }
+    setAccepting(true);
+    setAcceptError(null);
+
+    // (a) consultations UPDATE
+    type ConsAcceptUpdate = { status: string; pharmacist_id: string };
+    const upPayload: ConsAcceptUpdate = {
+      status: "accepted",
+      pharmacist_id: user.id,
+    };
+    const upResp = await (supabase
+      .from("consultations") as unknown as {
+        update: (p: ConsAcceptUpdate) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update(upPayload)
+      .eq("id", chatId);
+    if (upResp.error) {
+      setAccepting(false);
+      console.error("[chat] accept consultations UPDATE failed:", upResp.error);
+      setAcceptError(upResp.error.message || "수락 처리에 실패했어요");
+      return;
+    }
+
+    // (b) max(round_number) 조회
+    const maxResp = await supabase
+      .from("consultation_rounds")
+      .select("round_number")
+      .eq("consultation_id", chatId)
+      .order("round_number", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ round_number: number }>();
+    if (maxResp.error) {
+      console.error("[chat] accept max round_number lookup failed:", maxResp.error);
+    }
+    const nextRoundNumber =
+      typeof maxResp.data?.round_number === "number"
+        ? maxResp.data.round_number + 1
+        : 1;
+
+    // (c) consultation_rounds INSERT
+    type RoundInsert = {
+      consultation_id: string;
+      round_number: number;
+      questionnaire_id: string | null;
+      status: string;
+      started_at: string;
+    };
+    const roundPayload: RoundInsert = {
+      consultation_id: chatId,
+      round_number: nextRoundNumber,
+      questionnaire_id: dbConsultation?.questionnaire_id ?? null,
+      status: "active",
+      started_at: new Date().toISOString(),
+    };
+    const roundResp = await (supabase
+      .from("consultation_rounds") as unknown as {
+        insert: (p: RoundInsert) => {
+          select: (cols: string) => {
+            maybeSingle: () => Promise<{
+              data: { id: string } | null;
+              error: { message: string } | null;
+            }>;
+          };
+        };
+      })
+      .insert(roundPayload)
+      .select("id")
+      .maybeSingle();
+    if (roundResp.error || !roundResp.data?.id) {
+      setAccepting(false);
+      console.error("[chat] accept round insert failed:", roundResp.error);
+      setAcceptError(roundResp.error?.message || "회차 생성에 실패했어요");
+      return;
+    }
+    const newRoundId = roundResp.data.id;
+
+    // (d) [ROUND_START] 시스템 메시지 INSERT
+    const sysPayload: MessageInsert = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content: "[ROUND_START]",
+      message_type: "system",
+      is_read: true,
+      round_id: newRoundId,
+    };
+    const sysResp = await (supabase
+      .from("messages") as unknown as {
+        insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(sysPayload);
+    if (sysResp.error) {
+      console.error("[chat] accept [ROUND_START] INSERT failed (round 까지는 성공):", sysResp.error);
+    }
+
+    setAccepting(false);
+    setShowAcceptConfirm(false);
+    // 로컬 state 즉시 갱신 — 수락 대기 잠금 해제, realtime echo 대기 없이 입력란 활성
+    setDbConsultation((prev) =>
+      prev ? { ...prev, status: "accepted", pharmacist_id: user.id } : prev,
+    );
+  };
+
+  /* 약사 측 [수락] 버튼 클릭 — 본인 진행 중 active round 가 있으면 안내 모달, 없으면 곧장 acceptConsultation. */
+  const handleAcceptClick = async () => {
+    if (accepting) return;
+    setShowQuestionnairePanel(false);
+    setAcceptError(null);
+    if (!user) {
+      // 로그인 안 된 상태에서도 모달로 통일 — acceptConsultation 안에서 다시 가드.
+      setPendingActiveCount(0);
+      setShowAcceptConfirm(true);
+      return;
+    }
+    // 본인 명의의 다른 active round 개수 조회 — 현재 consultation 은 아직 pending 이라 제외 불필요하나 안전 차원에서 .neq.
+    const countResp = await supabase
+      .from("consultation_rounds")
+      .select("id, consultation_id, consultations!inner(pharmacist_id)", { count: "exact", head: true })
+      .eq("status", "active")
+      .eq("consultations.pharmacist_id", user.id)
+      .neq("consultation_id", chatId);
+    if (countResp.error) {
+      console.error("[chat] accept active-round count failed:", countResp.error);
+      // 방어적으로 모달 표시 (count=0 로 두고 사용자가 직접 결정).
+      setPendingActiveCount(0);
+      setShowAcceptConfirm(true);
+      return;
+    }
+    const count = countResp.count ?? 0;
+    setPendingActiveCount(count);
+    if (count > 0) {
+      setShowAcceptConfirm(true);
+      return;
+    }
+    // 진행 중 상담 없음 — 모달 없이 곧장 수락.
+    await acceptConsultation();
   };
 
   /* 거절 상태 — 약사가 pending 요청을 거절하면 status='rejected'. 환자 측 안내 박스 분기용. */
@@ -2286,7 +2503,7 @@ function ChatContent() {
                   {msg.content.replace("[시스템] ", "")}
                 </div>
                 {role === "pharmacist" && msg.pharmacistOnly && (
-                  <span style={{ fontSize: 11, color: "#9AA8A0" }}>약사님만 보이는 메세지입니다.</span>
+                  <span style={{ fontSize: 11, color: "#9AA8A0" }}>내부 메모 (환자에게 안 보임)</span>
                 )}
               </div>
             );
@@ -2483,7 +2700,7 @@ function ChatContent() {
           }
           return "—";
         })();
-        const severity = pendingQuestionnaire.severity?.toString().trim() || "—";
+        const severity = getSeverityDisplay(pendingQuestionnaire);
         const duration = pendingQuestionnaire.symptom_duration?.trim() || "—";
         const labelStyle: React.CSSProperties = {
           color: "#5E7D6C", fontWeight: 600, marginRight: 8,
@@ -2524,7 +2741,7 @@ function ChatContent() {
               <div style={{ textAlign: "right", marginTop: 6 }}>
                 <button
                   type="button"
-                  onClick={() => {}}
+                  onClick={() => setShowQuestionnairePanel(true)}
                   style={{
                     background: "transparent",
                     border: "none",
@@ -2543,7 +2760,7 @@ function ChatContent() {
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 type="button"
-                onClick={() => { setRejectReason(""); setRejectError(null); setShowRejectConfirm(true); }}
+                onClick={() => { setShowQuestionnairePanel(false); setRejectReason(""); setRejectError(null); setShowRejectConfirm(true); }}
                 style={{
                   flex: 1,
                   minHeight: 44,
@@ -2562,7 +2779,7 @@ function ChatContent() {
               </button>
               <button
                 type="button"
-                onClick={() => {}}
+                onClick={handleAcceptClick}
                 style={{
                   flex: 1,
                   minHeight: 44,
@@ -2707,7 +2924,7 @@ function ChatContent() {
       {consultationPending && role === "patient" && (() => {
         const pharmName =
           dbCounterpartLicenseName || dbCounterpartName || "";
-        const labelPrefix = pharmName ? `${pharmName} 약사가 ` : "약사가 ";
+        const labelPrefix = pharmName ? `${pharmName} 약사님이 ` : "약사님이 ";
         return (
           <div
             role="status"
@@ -3698,6 +3915,195 @@ function ChatContent() {
       )}
 
       {/* ══════════════════════════════════════════
+         환자 23문항 전체 보기 사이드 패널 (약사 전용 — pending 시)
+         ══════════════════════════════════════════ */}
+      {showQuestionnairePanel && consultationPending && role === "pharmacist" && pendingQuestionnaire && (
+        <>
+          <style>{`
+            .chat-questionnaire-panel {
+              display: flex; flex-direction: column;
+              position: fixed; top: 0; right: 0; left: 0; bottom: 0;
+              width: 100%; height: 100dvh;
+              background: #fff; z-index: 150;
+              overflow: hidden;
+            }
+            @media (min-width: 1200px) {
+              .chat-questionnaire-panel {
+                top: 60px; left: auto; bottom: auto;
+                width: 400px; height: calc(100vh - 60px);
+                box-shadow: -4px 0 24px rgba(0,0,0,0.10);
+                border-left: 1px solid rgba(94,125,108,0.14);
+              }
+            }
+            @media (min-width: 1600px) {
+              .chat-questionnaire-panel { width: 500px; }
+            }
+          `}</style>
+          <aside className="chat-questionnaire-panel">
+            {/* 헤더 */}
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "12px 16px", borderBottom: "1px solid #E5E7E3",
+              flexShrink: 0, background: "#F8F9F7",
+            }}>
+              <span style={{
+                fontWeight: 700, fontSize: 16, color: "#4A6355",
+                fontFamily: "'Gothic A1', sans-serif",
+              }}>
+                환자 문답 전체 보기
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowQuestionnairePanel(false)}
+                aria-label="닫기"
+                style={{
+                  background: "none", border: "none", fontSize: 20,
+                  cursor: "pointer", color: "#3D4A42", padding: 8, lineHeight: 1,
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* 본문 — scrollable */}
+            <div style={{
+              flex: 1, overflowY: "auto",
+              padding: "16px",
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}>
+              {(() => {
+                const detailed = pendingQuestionnaire.detailed_answers;
+
+                // AI 요약 (있을 때만 상단에 강조)
+                const aiSummary = pendingQuestionnaire.ai_summary?.trim();
+
+                // detailed_answers 가 비어있으면 (legacy) 폴백: 컬럼화된 필드 4개만 간단 표시
+                if (!detailed || Object.keys(detailed).length === 0) {
+                  const symptomsArr = Array.isArray(pendingQuestionnaire.symptoms)
+                    ? pendingQuestionnaire.symptoms
+                    : [];
+                  const fallback: Array<{ label: string; value: string }> = [
+                    { label: "주요 증상", value: symptomsArr.length > 0 ? symptomsArr.join(", ") : "—" },
+                    { label: "증상 기간", value: pendingQuestionnaire.symptom_duration?.trim() || "—" },
+                    { label: "불편도", value: getSeverityDisplay(pendingQuestionnaire) },
+                    { label: "약사에게 전하고 싶은 말", value: pendingQuestionnaire.free_text?.trim() || "—" },
+                  ];
+                  return (
+                    <>
+                      {aiSummary && (
+                        <div style={{
+                          background: "#EDF4F0",
+                          border: "1px solid rgba(94,125,108,0.18)",
+                          borderRadius: 12,
+                          padding: "12px 14px",
+                          marginBottom: 16,
+                          fontSize: 15, color: "#3D4A42", lineHeight: 1.6,
+                        }}>
+                          <div style={{
+                            fontSize: 13, fontWeight: 700, color: "#4A6355",
+                            marginBottom: 6,
+                          }}>
+                            AI 요약
+                          </div>
+                          {aiSummary}
+                        </div>
+                      )}
+                      <div style={{
+                        fontSize: 13, color: "#7A8A80", marginBottom: 10,
+                      }}>
+                        문답 상세가 누락된 옛 데이터 — 요약 정보만 표시합니다.
+                      </div>
+                      {fallback.map((row) => (
+                        <div
+                          key={row.label}
+                          style={{
+                            padding: "12px 14px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(94,125,108,0.14)",
+                            marginBottom: 10,
+                          }}
+                        >
+                          <div style={{
+                            fontSize: 13, fontWeight: 700, color: "#4A6355",
+                            marginBottom: 4,
+                          }}>
+                            {row.label}
+                          </div>
+                          <div style={{
+                            fontSize: 14, color: "#2C3630", lineHeight: 1.5,
+                            whiteSpace: "pre-wrap",
+                          }}>
+                            {row.value}
+                          </div>
+                        </div>
+                      ))}
+                    </>
+                  );
+                }
+
+                // 일반 흐름: 23문항 카드 리스트
+                const visibleQuestions = ALL_QUESTIONS.filter(
+                  (q) => !q.condition || q.condition(detailed),
+                );
+                return (
+                  <>
+                    {aiSummary && (
+                      <div style={{
+                        background: "#EDF4F0",
+                        border: "1px solid rgba(94,125,108,0.18)",
+                        borderRadius: 12,
+                        padding: "12px 14px",
+                        marginBottom: 16,
+                        fontSize: 15, color: "#3D4A42", lineHeight: 1.6,
+                      }}>
+                        <div style={{
+                          fontSize: 13, fontWeight: 700, color: "#4A6355",
+                          marginBottom: 6,
+                        }}>
+                          AI 요약
+                        </div>
+                        {aiSummary}
+                      </div>
+                    )}
+                    {visibleQuestions.map((q, idx) => {
+                      const ans = formatQuestionAnswer(q, detailed[q.id]);
+                      // q.title 은 <br/> 포함된 HTML — 패널에선 평문으로 변환
+                      const titleText = q.title.replace(/<br\s*\/?>/gi, " ");
+                      return (
+                        <div
+                          key={q.id}
+                          style={{
+                            padding: "12px 14px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(94,125,108,0.14)",
+                            marginBottom: 10,
+                            background: "#fff",
+                          }}
+                        >
+                          <div style={{
+                            fontSize: 13, fontWeight: 700, color: "#4A6355",
+                            marginBottom: 4,
+                          }}>
+                            Q{idx + 1}. {titleText}
+                          </div>
+                          <div style={{
+                            fontSize: 14, color: "#2C3630", lineHeight: 1.5,
+                            whiteSpace: "pre-wrap",
+                          }}>
+                            {ans}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </>
+                );
+              })()}
+            </div>
+          </aside>
+        </>
+      )}
+
+      {/* ══════════════════════════════════════════
          환자 차트 사이드 패널 (약사 전용)
          ══════════════════════════════════════════ */}
       {showChartPanel && role === "pharmacist" && (
@@ -4058,7 +4464,7 @@ function ChatContent() {
             <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.6, marginBottom: 18 }}>
               {role === "pharmacist"
                 ? "환자에게는 시스템 메시지로 종료 안내가 표시됩니다."
-                : "종료 후에는 같은 약사와 새로 상담 요청해야 해요."}
+                : "종료 후에는 같은 약사님과 새로 상담 요청해야 해요."}
             </div>
             {endError && (
               <div style={{
@@ -4227,6 +4633,83 @@ function ChatContent() {
           </div>
         );
       })()}
+
+      {/* 수락 확인 모달 (약사 전용 — 본인 진행 중 active round 가 있을 때만 노출) */}
+      {showAcceptConfirm && role === "pharmacist" && (
+        <div
+          // 약사 모드: 외부 클릭으로 닫히지 않음 (실수 방지)
+          style={{
+            position: "fixed", inset: 0, zIndex: 300,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff", borderRadius: 16, padding: "24px 22px 22px",
+              maxWidth: 360, width: "100%",
+              boxShadow: "0 6px 24px rgba(0,0,0,0.15)",
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}
+          >
+            <div style={{
+              fontSize: 16, fontWeight: 700, color: "#2C3630",
+              marginBottom: 10, textAlign: "center",
+            }}>
+              상담을 수락할까요?
+            </div>
+            <div style={{
+              fontSize: 14, color: "#3D4A42", lineHeight: 1.6,
+              marginBottom: 16, textAlign: "center",
+            }}>
+              이미 진행 중인 상담이 {pendingActiveCount}건 있어요. 새 환자와 동시에 상담하시겠습니까?
+            </div>
+            {acceptError && (
+              <div style={{
+                fontSize: 14, color: "#C06B45",
+                marginBottom: 12, lineHeight: 1.5,
+              }}>
+                {acceptError}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => { if (!accepting) { setShowAcceptConfirm(false); setAcceptError(null); } }}
+                disabled={accepting}
+                style={{
+                  flex: 1, padding: "12px", borderRadius: 10,
+                  fontSize: 14, fontWeight: 600,
+                  background: "#fff", color: "#3D4A42",
+                  border: "1px solid rgba(94, 125, 108, 0.28)",
+                  cursor: accepting ? "default" : "pointer",
+                  opacity: accepting ? 0.6 : 1,
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={acceptConsultation}
+                disabled={accepting}
+                style={{
+                  flex: 1, padding: "12px", borderRadius: 10,
+                  fontSize: 14, fontWeight: 700,
+                  background: "#4A6355", color: "#fff", border: "none",
+                  cursor: accepting ? "default" : "pointer",
+                  opacity: accepting ? 0.7 : 1,
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}
+              >
+                {accepting ? "수락하는 중..." : "수락하기"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 추가 질문 세트 선택 모달 (약사 전용) */}
       {showQSetPicker && role === "pharmacist" && (
