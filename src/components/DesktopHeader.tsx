@@ -21,7 +21,7 @@ const PATIENT_TABS: Tab[] = [
 const PHARMACIST_TABS: Tab[] = [
   { label: "대시보드", href: "/dashboard" },
   { label: "피드", href: "/feed?role=pharmacist" },
-  { label: "채팅", href: "/chat" },
+  { label: "채팅", href: "/chat?role=pharmacist" },
   { label: "내 정보", href: "/pharmacist/mypage" },
 ];
 

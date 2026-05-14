@@ -87,7 +87,7 @@ const PHARMACIST_TABS: Tab[] = [
   },
   {
     label: "채팅",
-    href: "/chat",
+    href: "/chat?role=pharmacist",
     icon: (c) => (
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2v10z" />

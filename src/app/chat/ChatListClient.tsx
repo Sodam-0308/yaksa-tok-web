@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, Suspense } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import { SYMPTOM_META, TAG_LABEL_TO_KEY } from "@/components/SymptomIcon";
@@ -53,11 +53,17 @@ interface ChatRoom {
 /** 회차 마커/legacy 패턴을 사용자에게 보여줄 미리보기 텍스트로 변환.
  *  마커가 아니면 content 그대로 반환. */
 function formatPreview(content: string, myRole: "patient" | "pharmacist"): string {
-  // 신규 마커
+  // 정확 일치 토큰
   if (content === "[ROUND_START]") {
     return myRole === "patient" ? "상담이 수락되었습니다" : "상담 시작";
   }
   if (content === "[ROUND_END]") return "상담 종료";
+  if (content === "[CONSULT_REJECTED]") return "상담을 거절하였습니다";
+  // 접두 토큰 — [추가질문답변] 이 [추가질문] 접두를 포함하므로 답변 먼저 분기
+  if (content.startsWith("[추가질문답변]")) return "환자가 답변했어요";
+  if (content.startsWith("[추가질문]")) return "추가 질문을 보냈어요";
+  if (content.startsWith("[방문안내]")) return content.replace(/^\[방문안내\]\s*/, "");
+  if (content.startsWith("[시스템]")) return content.replace(/^\[시스템\]\s*/, "");
   // Legacy 형식 ("--- N차 상담 시작 ---" / "--- N차 상담 종료 ---")
   if (/^--- \d+차 상담 시작 ---$/.test(content)) {
     return myRole === "patient" ? "상담이 수락되었습니다" : "상담 시작";
@@ -70,6 +76,7 @@ function formatPreview(content: string, myRole: "patient" | "pharmacist"): strin
 function statusBadgeLabel(status: string | undefined): string | null {
   if (!status) return null;
   if (status === "completed" || status === "cancelled") return "상담 종료";
+  if (status === "rejected") return "거절됨";
   if (status === "pending") return "상담 요청 중";
   if (
     status === "accepted" ||
@@ -202,11 +209,16 @@ interface DbMessageRow {
 
 function Content() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const viewRole = searchParams.get("role"); // "patient" | "pharmacist" | null — 화면 분기용 (권한은 RLS 가 보호)
   const { user, loading: authLoading } = useAuth();
 
   const [sortKey, setSortKey] = useState<SortKey>("urgent");
   const [dbRooms, setDbRooms] = useState<ChatRoom[] | null>(null);
   const [dbLoading, setDbLoading] = useState(true);
+  // 약사 채팅 목록 "거절 숨기기" 토글 — profiles.ui_preferences.hide_rejected_chats 에 영속.
+  // 환자 시점에서는 미사용 (기본 false 유지, 토글 UI 도 미노출).
+  const [hideRejected, setHideRejected] = useState<boolean>(false);
 
   /* ── DB 채팅방 로드 (로그인 사용자만) ── */
   useEffect(() => {
@@ -221,29 +233,53 @@ function Content() {
     (async () => {
       setDbLoading(true);
 
-      // 1) consultations + 환자/약사/문답 JOIN — 내가 patient_id 또는 pharmacist_id 인 행
-      const { data: consultations, error: consError } = await supabase
-        .from("consultations")
-        .select(
-          `
+      // 1) consultations + 환자/약사/문답 JOIN.
+      //    기본 쿼리: 내가 patient_id 또는 pharmacist_id 인 행.
+      //    약사 모드(viewRole==='pharmacist')에선 미할당 pending(pharmacist_id IS NULL) 도 함께 가져옴
+      //    → DashboardClient.fetchPendingRequests 와 동일한 패턴(unassigned + my 머지). 채팅 목록에서도 새 요청 인지 가능.
+      const selectCols = `
           id, patient_id, pharmacist_id, status, created_at,
           patient:profiles!consultations_patient_id_fkey(id, name, avatar_url),
           pharmacist:profiles!consultations_pharmacist_id_fkey(id, name, avatar_url),
           questionnaire:ai_questionnaires(symptoms)
-        `,
-        )
+        `;
+      const mineQuery = supabase
+        .from("consultations")
+        .select(selectCols)
         .or(`patient_id.eq.${user.id},pharmacist_id.eq.${user.id}`)
         .order("created_at", { ascending: false });
+      const unassignedQuery =
+        viewRole === "pharmacist"
+          ? supabase
+              .from("consultations")
+              .select(selectCols)
+              .is("pharmacist_id", null)
+              .eq("status", "pending")
+          : Promise.resolve({ data: [] as unknown[], error: null });
+
+      const [mineRes, unRes] = await Promise.all([mineQuery, unassignedQuery]);
 
       if (cancelled) return;
-      if (consError) {
-        console.error("[chat-list] consultations failed:", consError);
+      if (mineRes.error) {
+        console.error("[chat-list] consultations failed:", mineRes.error);
         setDbRooms([]);
         setDbLoading(false);
         return;
       }
+      if (unRes && "error" in unRes && unRes.error) {
+        console.error("[chat-list] unassigned pending failed:", unRes.error);
+      }
 
-      const rows = (consultations ?? []) as unknown as DbConsultationRow[];
+      // 두 결과 id 기준 머지 (중복 제거) + 약사 본인이 환자로서 보낸 요청은 미할당 측에서 자연 제외(patient_id != me 조건 없이도 기본 쿼리 측에서 이미 포함됨)
+      const mineRows = (mineRes.data ?? []) as unknown as DbConsultationRow[];
+      const unRows =
+        unRes && "data" in unRes ? ((unRes.data ?? []) as unknown as DbConsultationRow[]) : [];
+      const byId = new Map<string, DbConsultationRow>();
+      for (const r of [...mineRows, ...unRows]) byId.set(r.id, r);
+      const merged = Array.from(byId.values()).sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+      const rows = merged;
       if (rows.length === 0) {
         setDbRooms([]);
         setDbLoading(false);
@@ -377,14 +413,70 @@ function Content() {
     return () => {
       cancelled = true;
     };
-  }, [authLoading, user]);
+  }, [authLoading, user, viewRole]);
 
-  // 표시 대상: 로그인 + DB 로드 완료 → DB 결과 사용 / 비로그인 → Mock 폴백
+  /* ── ui_preferences (hide_rejected_chats) 로드 — 약사 시점에서만 ── */
+  useEffect(() => {
+    let cancelled = false;
+    if (authLoading) return;
+    if (!user) return;
+    if (viewRole !== "pharmacist") return;
+    (async () => {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("ui_preferences")
+        .eq("id", user.id)
+        .maybeSingle<{ ui_preferences: { hide_rejected_chats?: boolean } | null }>();
+      if (cancelled) return;
+      if (error) {
+        console.error("[chat-list] ui_preferences fetch failed:", error);
+        return;
+      }
+      setHideRejected(data?.ui_preferences?.hide_rejected_chats === true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, user, viewRole]);
+
+  /* 토글 클릭 — 옵티미스틱 setState 후 profiles.ui_preferences UPDATE (실패 시 롤백) */
+  const toggleHideRejected = async () => {
+    if (!user) return;
+    const next = !hideRejected;
+    setHideRejected(next);
+    // 기존 ui_preferences 키 보존하면서 hide_rejected_chats 만 갱신 — SELECT 후 머지.
+    const { data: cur, error: getErr } = await supabase
+      .from("profiles")
+      .select("ui_preferences")
+      .eq("id", user.id)
+      .maybeSingle<{ ui_preferences: Record<string, unknown> | null }>();
+    if (getErr) {
+      console.error("[chat-list] ui_preferences fetch (toggle) failed:", getErr);
+      setHideRejected(!next); // 롤백
+      return;
+    }
+    const merged = { ...(cur?.ui_preferences ?? {}), hide_rejected_chats: next };
+    const { error: upErr } = await (supabase
+      .from("profiles") as unknown as {
+        update: (p: { ui_preferences: Record<string, unknown> }) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update({ ui_preferences: merged })
+      .eq("id", user.id);
+    if (upErr) {
+      console.error("[chat-list] ui_preferences UPDATE failed:", upErr);
+      setHideRejected(!next); // 롤백
+    }
+  };
+
+  // 표시 대상: 로그인 + DB 로드 완료 → DB 결과 사용 / 비로그인 → Mock 폴백.
+  // hideRejected=true 면 status='rejected' row 클라이언트 측 필터링 (약사 전용 토글).
   const useDb = !!user;
   const rooms: ChatRoom[] = useMemo(() => {
-    if (useDb) return dbRooms ?? [];
-    return MOCK_CHATS;
-  }, [useDb, dbRooms]);
+    const base = useDb ? (dbRooms ?? []) : MOCK_CHATS;
+    return hideRejected ? base.filter((r) => r.status !== "rejected") : base;
+  }, [useDb, dbRooms, hideRejected]);
   const isLoading = authLoading || (useDb && dbLoading);
   const isEmpty = !isLoading && rooms.length === 0;
   const nowIso = useDb ? undefined : MOCK_NOW_ISO;
@@ -443,28 +535,52 @@ function Content() {
           }}>
             채팅
           </h1>
-          {!isLoading && !isEmpty && (
-            <div style={{ display: "inline-flex", gap: 0, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", background: C.white }}>
-              {(["urgent", "recent"] as const).map((k) => {
-                const active = sortKey === k;
-                return (
-                  <button
-                    key={k}
-                    type="button"
-                    onClick={() => setSortKey(k)}
-                    style={{
-                      padding: "7px 14px",
-                      fontSize: 14, fontWeight: 600,
-                      background: active ? C.sageDeep : C.white,
-                      color: active ? C.white : C.textMid,
-                      border: "none", cursor: "pointer",
-                      fontFamily: "'Noto Sans KR', sans-serif",
-                    }}
-                  >
-                    {k === "urgent" ? "긴급순" : "최신순"}
-                  </button>
-                );
-              })}
+          {/* 헤더 토글 wrapper — 로딩 중에만 숨김.
+              "거절 숨기기"는 약사 시점에서 항상 노출 (빈 상태에서도 끌 수 있는 탈출구).
+              "긴급순/최신순"은 항상 노출 (현재 정렬 기준 시각 확인 + 멘탈 모델 일관). */}
+          {!isLoading && (
+            <div style={{ display: "inline-flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              {viewRole === "pharmacist" && (
+                <button
+                  type="button"
+                  onClick={toggleHideRejected}
+                  aria-pressed={hideRejected}
+                  style={{
+                    padding: "7px 14px",
+                    fontSize: 14, fontWeight: 600,
+                    background: hideRejected ? C.sageDeep : C.white,
+                    color: hideRejected ? C.white : C.textMid,
+                    border: `1px solid ${hideRejected ? C.sageDeep : C.border}`,
+                    borderRadius: 10,
+                    cursor: "pointer",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  거절 숨기기
+                </button>
+              )}
+              <div style={{ display: "inline-flex", gap: 0, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", background: C.white }}>
+                {(["urgent", "recent"] as const).map((k) => {
+                  const active = sortKey === k;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() => setSortKey(k)}
+                      style={{
+                        padding: "7px 14px",
+                        fontSize: 14, fontWeight: 600,
+                        background: active ? C.sageDeep : C.white,
+                        color: active ? C.white : C.textMid,
+                        border: "none", cursor: "pointer",
+                        fontFamily: "'Noto Sans KR', sans-serif",
+                      }}
+                    >
+                      {k === "urgent" ? "긴급순" : "최신순"}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           )}
         </div>
@@ -575,7 +691,7 @@ function Content() {
                       {(() => {
                         const label = statusBadgeLabel(room.status);
                         if (!label) return null;
-                        const isEnded = label === "상담 종료";
+                        const isEnded = label === "상담 종료" || label === "거절됨";
                         return (
                           <span
                             aria-label={label}
@@ -611,7 +727,12 @@ function Content() {
                       fontWeight: hasUnread ? 500 : 400,
                       color: hasUnread ? C.textDark : C.textMid,
                       lineHeight: 1.4,
-                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      display: "-webkit-box",
+                      WebkitBoxOrient: "vertical",
+                      WebkitLineClamp: 2,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      wordBreak: "break-word",
                     }}>
                       {room.lastMessage}
                     </div>

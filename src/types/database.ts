@@ -67,6 +67,11 @@ export type ReportStatus = "pending" | "reviewed" | "dismissed";
    profiles
    ══════════════════════════════════════════ */
 
+export interface UiPreferences {
+  hide_rejected_chats?: boolean;
+  [key: string]: unknown;
+}
+
 export interface ProfileRow {
   id: UUID;
   role: UserRole;
@@ -76,12 +81,14 @@ export interface ProfileRow {
   auth_provider: string | null;
   is_active: boolean;
   role_confirmed: boolean;
+  ui_preferences: UiPreferences | null;
   created_at: ISOTimestamp;
   updated_at: ISOTimestamp;
 }
-export type ProfileInsert = Omit<ProfileRow, "created_at" | "updated_at" | "is_active" | "role_confirmed"> & {
+export type ProfileInsert = Omit<ProfileRow, "created_at" | "updated_at" | "is_active" | "role_confirmed" | "ui_preferences"> & {
   is_active?: boolean;
   role_confirmed?: boolean;
+  ui_preferences?: UiPreferences | null;
   created_at?: ISOTimestamp;
   updated_at?: ISOTimestamp;
 };

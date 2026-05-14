@@ -84,6 +84,20 @@ interface DbRound {
   status: string | null;
 }
 
+/** 시스템 메시지 회색 알약 본문 토큰 치환.
+ *  메시지 리스트(시간순 이력)에서 raw 토큰이 노출되지 않도록 자연어로 변환.
+ *  ChatListClient.formatPreview 와 별도로 유지 — 미리보기(짧은 한 줄)와 본문(시간순 이력) 은 용도 다름.
+ *  향후 새 시스템 토큰 추가 시: 미리보기 문구는 ChatListClient.formatPreview, 메시지 리스트 본문은 이 함수에 추가.
+ *  [CONSULT_REJECTED] role 별 분리 사유: 환자 측은 부드럽고 누구 탓도 아닌 톤("진행되지 않았습니다"),
+ *  약사 측은 자기 행위에 대한 시스템적 명확 표현("거절하였습니다"). 안내 카드 헤딩 톤과 일관. */
+function formatSystemMessageContent(content: string, role: "patient" | "pharmacist"): string {
+  if (content === "[CONSULT_REJECTED]") {
+    return role === "patient" ? "상담이 진행되지 않았습니다" : "상담을 거절하였습니다";
+  }
+  if (content.startsWith("[시스템] ")) return content.replace("[시스템] ", "");
+  return content;
+}
+
 function fmtChatTime(iso: string): string {
   const d = new Date(iso);
   const hours = d.getHours();
@@ -399,7 +413,7 @@ function ChatContent() {
   const isEmbedded = searchParams.get("embedded") === "true";
 
   const isDbConsultation = UUID_RE.test(chatId);
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
 
   const [messages, setMessages] = useState<Message[]>(
     isDbConsultation ? [] : [...DEMO_MESSAGES, SESSION2_SYSTEM_MSG, ...SESSION2_EXTRA_MSGS],
@@ -805,6 +819,7 @@ function ChatContent() {
   /* ── DB 채팅: consultation + 메시지 로드 + Realtime 구독 ── */
   useEffect(() => {
     if (!isDbConsultation) return;
+    if (authLoading) return;
 
     let cancelled = false;
     let channel: ReturnType<typeof supabase.channel> | null = null;
@@ -1040,6 +1055,36 @@ function ChatContent() {
             }
           },
         )
+        // consultations UPDATE 구독 — status 변경(수락/거절/종료 등) 직접 감지.
+        //   messages INSERT echo 가 RLS race 로 누락되어도 status 자동 갱신 보장 → 환자 측 거절 안내 카드 즉시 노출.
+        //   환자/약사 양쪽 모두 동작; 약사는 거절 직후 /dashboard 로 떠나므로 영향 미미하지만 무해.
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "consultations",
+            filter: `id=eq.${chatId}`,
+          },
+          (payload) => {
+            const newRow = payload.new as {
+              patient_id: string;
+              pharmacist_id: string | null;
+              status: string | null;
+              questionnaire_id: string | null;
+            };
+            setDbConsultation((prev) =>
+              prev
+                ? {
+                    patient_id: newRow.patient_id ?? prev.patient_id,
+                    pharmacist_id: newRow.pharmacist_id,
+                    status: newRow.status,
+                    questionnaire_id: newRow.questionnaire_id,
+                  }
+                : prev,
+            );
+          },
+        )
         .subscribe(() => {});
     })();
 
@@ -1049,7 +1094,7 @@ function ChatContent() {
         supabase.removeChannel(channel);
       }
     };
-  }, [isDbConsultation, chatId, user?.id]);
+  }, [isDbConsultation, chatId, user?.id, authLoading]);
 
   /* ── 약사 측 pending 환자 정보 fetch ──
    * pending 시점엔 consultation_rounds 가 없어 위의 rounds 기반 ai_questionnaires
@@ -1284,11 +1329,13 @@ function ChatContent() {
       status: string;
       rejected_reason: string;
       rejected_at: string;
+      pharmacist_id: string;
     };
     const upPayload: ConsRejectUpdate = {
       status: "rejected",
       rejected_reason: rejectReason,
       rejected_at: new Date().toISOString(),
+      pharmacist_id: user.id,
     };
     const upResp = await (supabase
       .from("consultations") as unknown as {
@@ -1434,11 +1481,39 @@ function ChatContent() {
     };
     const sysResp = await (supabase
       .from("messages") as unknown as {
-        insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+        insert: (p: MessageInsert) => {
+          select: (cols: string) => {
+            maybeSingle: () => Promise<{
+              data: { id: string; created_at: string } | null;
+              error: { message: string } | null;
+            }>;
+          };
+        };
       })
-      .insert(sysPayload);
+      .insert(sysPayload)
+      .select("id, created_at")
+      .maybeSingle();
     if (sysResp.error) {
       console.error("[chat] accept [ROUND_START] INSERT failed (round 까지는 성공):", sysResp.error);
+    }
+    // INSERT 결과로 옵티미스틱 append — realtime echo 누락/지연 대응.
+    //   realtime 핸들러(1012-1042) 의 id 기반 dedup 으로 echo 도착 시 자동 무시 → 중복 안전.
+    //   mapRow 는 SELECT effect closure 내부 로컬 함수라 외부 접근 불가 → Message 객체 직접 생성.
+    const insertedSys = sysResp.data;
+    if (insertedSys) {
+      const optimisticMsg: Message = {
+        id: insertedSys.id,
+        sender: user.id === dbConsultation?.patient_id ? "patient" : "pharmacist",
+        content: "[ROUND_START]",
+        time: fmtChatTime(insertedSys.created_at),
+        isRead: true,
+        round_id: newRoundId,
+        message_type: "system",
+        created_at: insertedSys.created_at,
+      };
+      setMessages((prev) =>
+        prev.some((m) => m.id === optimisticMsg.id) ? prev : [...prev, optimisticMsg],
+      );
     }
 
     setAccepting(false);
@@ -1447,6 +1522,35 @@ function ChatContent() {
     setDbConsultation((prev) =>
       prev ? { ...prev, status: "accepted", pharmacist_id: user.id } : prev,
     );
+    // 신규 round / questionnaire state 즉시 동기화 — SELECT effect 재실행 없이 "현재 차수" 박스 렌더.
+    //   필드 구성은 SELECT effect 1.5단계 (884-897) 의 DbRound row 구조와 동일.
+    const newRound: DbRound = {
+      id: newRoundId,
+      round_number: nextRoundNumber,
+      questionnaire_id: dbConsultation?.questionnaire_id ?? null,
+      started_at: roundPayload.started_at,
+      ended_at: null,
+      status: "active",
+    };
+    setRounds((prev) => [...prev, newRound]);
+    setActiveRoundId(newRoundId);
+    // questionnaireById 갱신: 이미 약사 측 pending UI 에서 fetch 한 pendingQuestionnaire 재활용.
+    //   QuestionnaireContent 필드 중 completed_at 만 누락이지만 렌더(2002-2014) 에서 미사용 → null.
+    //   pendingQuestionnaire 가 null 인 race 케이스는 skip — 채팅방 재진입 시 SELECT effect 가 채움.
+    const qId = dbConsultation?.questionnaire_id ?? null;
+    if (qId && pendingQuestionnaire) {
+      const pq = pendingQuestionnaire;
+      setQuestionnaireById((prev) => {
+        const next = new Map(prev);
+        next.set(qId, {
+          symptoms: pq.symptoms,
+          ai_summary: pq.ai_summary,
+          free_text: pq.free_text,
+          completed_at: null,
+        });
+        return next;
+      });
+    }
   };
 
   /* 약사 측 [수락] 버튼 클릭 — 본인 진행 중 active round 가 있으면 안내 모달, 없으면 곧장 acceptConsultation. */
@@ -2500,7 +2604,7 @@ function ChatContent() {
                       <path d="M7 11V7a5 5 0 0110 0v4" />
                     </svg>
                   )}
-                  {msg.content.replace("[시스템] ", "")}
+                  {formatSystemMessageContent(msg.content, role)}
                 </div>
                 {role === "pharmacist" && msg.pharmacistOnly && (
                   <span style={{ fontSize: 11, color: "#9AA8A0" }}>내부 메모 (환자에게 안 보임)</span>
