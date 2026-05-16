@@ -59,6 +59,13 @@ function formatPreview(content: string, myRole: "patient" | "pharmacist"): strin
   }
   if (content === "[ROUND_END]") return "상담 종료";
   if (content === "[CONSULT_REJECTED]") return "상담을 거절하였습니다";
+  // 종료 토큰 — 본인 행위는 주어 생략, 상대 행위는 호칭 명시 (ChatClient.formatSystemMessageContent 와 동일 규칙).
+  if (content === "[CONSULT_ENDED_BY_PHARMACIST]") {
+    return myRole === "patient" ? "약사님이 상담을 종료했습니다" : "상담을 종료했습니다";
+  }
+  if (content === "[CONSULT_ENDED_BY_PATIENT]") {
+    return myRole === "patient" ? "상담을 종료했습니다" : "환자님이 상담을 종료했습니다";
+  }
   // 접두 토큰 — [추가질문답변] 이 [추가질문] 접두를 포함하므로 답변 먼저 분기
   if (content.startsWith("[추가질문답변]")) return "환자가 답변했어요";
   if (content.startsWith("[추가질문]")) return "추가 질문을 보냈어요";

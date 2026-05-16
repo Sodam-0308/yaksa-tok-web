@@ -10,6 +10,8 @@ import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import type { Database } from "@/types/database";
 import { questions as ALL_QUESTIONS, type Question } from "@/lib/questions";
+import ReconsultPromptBox from "@/components/chat/ReconsultPromptBox";
+import ReconsultModal from "@/components/chat/ReconsultModal";
 
 type MessageInsert = Database["public"]["Tables"]["messages"]["Insert"];
 
@@ -93,6 +95,13 @@ interface DbRound {
 function formatSystemMessageContent(content: string, role: "patient" | "pharmacist"): string {
   if (content === "[CONSULT_REJECTED]") {
     return role === "patient" ? "상담이 진행되지 않았습니다" : "상담을 거절하였습니다";
+  }
+  // 종료 토큰 — 본인 행위는 주어 생략, 상대 행위는 호칭 명시 (호칭 정책 일관).
+  if (content === "[CONSULT_ENDED_BY_PHARMACIST]") {
+    return role === "patient" ? "약사님이 상담을 종료했습니다" : "상담을 종료했습니다";
+  }
+  if (content === "[CONSULT_ENDED_BY_PATIENT]") {
+    return role === "patient" ? "상담을 종료했습니다" : "환자님이 상담을 종료했습니다";
   }
   if (content.startsWith("[시스템] ")) return content.replace("[시스템] ", "");
   return content;
@@ -463,6 +472,8 @@ function ChatContent() {
   const [rejectReason, setRejectReason] = useState("");
   const [rejecting, setRejecting] = useState(false);
   const [rejectError, setRejectError] = useState<string | null>(null);
+  // 환자 측 재상담 요청 모달 (종료된 상담에서 CTA 클릭 → 모달 → 새 증상이면 /questionnaire?reset=1)
+  const [showReconsultModal, setShowReconsultModal] = useState(false);
   // 약사 측 수락 액션 상태 (pending UI 수락 버튼 → 진행 중 상담 안내 모달 → UPDATE + round INSERT)
   const [showAcceptConfirm, setShowAcceptConfirm] = useState(false);
   const [accepting, setAccepting] = useState(false);
@@ -1176,45 +1187,27 @@ function ChatContent() {
       console.error("[chat] end-consultation UPDATE failed:", upResp.error);
       return { ok: false, error: upResp.error.message };
     }
-    // 1) 종료 안내 메시지 INSERT 먼저 (작별 인사/시스템 알림이 위에, 회차 종료 구분자가 아래에 표시되도록).
-    //    actorRole 별로 의미가 달라 분기:
-    //      환자 종료 → 시스템 알림 (가운데 박스, is_read=true)
-    //      약사 종료 → 환자에게 보내는 작별 인사 (약사 메시지 버블, is_read=false 로 환자 목록 unread 표시)
-    if (actorRole === "patient") {
-      const sysPayload: MessageInsert = {
-        consultation_id: chatId,
-        sender_id: user.id,
-        content: "환자가 상담을 종료했습니다",
-        message_type: "system",
-        round_id: activeRoundId,
-        is_read: true,
-      };
-      const msgResp = await (supabase
-        .from("messages") as unknown as {
-          insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
-        })
-        .insert(sysPayload);
-      if (msgResp.error) {
-        console.warn("[chat] end-consultation system message INSERT failed (UPDATE 는 성공):", msgResp.error);
-      }
-    } else {
-      const farewellPayload: MessageInsert = {
-        consultation_id: chatId,
-        sender_id: user.id,
-        content:
-          "이번 상담은 여기서 마무리할게요. 또 궁금한 점이 생기면 언제든 상담 요청 해주세요 :)",
-        message_type: "text",
-        round_id: activeRoundId,
-        is_read: false,
-      };
-      const msgResp = await (supabase
-        .from("messages") as unknown as {
-          insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
-        })
-        .insert(farewellPayload);
-      if (msgResp.error) {
-        console.warn("[chat] end-consultation farewell INSERT failed (UPDATE 는 성공):", msgResp.error);
-      }
+    // 1) 종료 시스템 메시지 INSERT — actorRole 별 토큰. 양쪽 모두 message_type='system', is_read=true.
+    //    실제 표시 문구는 formatSystemMessageContent (메시지 리스트) / formatPreview (목록 미리보기) 에서
+    //    viewer role 에 따라 비대칭 변환 (본인 행위는 주어 생략, 상대 행위는 호칭 명시).
+    //    레거시 raw 한글 메시지("환자가 상담을 종료했습니다") 는 자연어 그대로 표시되므로 호환 유지.
+    const endTokenContent =
+      actorRole === "patient" ? "[CONSULT_ENDED_BY_PATIENT]" : "[CONSULT_ENDED_BY_PHARMACIST]";
+    const sysPayload: MessageInsert = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content: endTokenContent,
+      message_type: "system",
+      round_id: activeRoundId,
+      is_read: true,
+    };
+    const msgResp = await (supabase
+      .from("messages") as unknown as {
+        insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(sysPayload);
+    if (msgResp.error) {
+      console.warn("[chat] end-consultation system message INSERT failed (UPDATE 는 성공):", msgResp.error);
     }
     // 2) 회차 종료 구분자 시스템 메시지 — [ROUND_END] 마커. is_read=true 로 unread 제외.
     //    위 작별 인사/시스템 알림이 먼저 INSERT 됐으므로 created_at 순서상 구분자가 마지막에 표시됨.
@@ -1927,8 +1920,8 @@ function ChatContent() {
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {/* 환자 측 상담 종료 버튼 — DB 상담이고 아직 잠금 안 된 상태에서만 노출 */}
-          {role === "patient" && isDbConsultation && !inputLocked && (
+          {/* 환자 측 상담 종료 버튼 — DB 상담이고 아직 잠금 안 된 상태에서만 노출 (dbLoading 가드: 첫 렌더 깜빡임 방지) */}
+          {role === "patient" && isDbConsultation && !dbLoading && !inputLocked && (
             <button
               type="button"
               onClick={handlePatientEndClick}
@@ -1948,8 +1941,8 @@ function ChatContent() {
               상담 종료
             </button>
           )}
-          {/* 약사 측 상담 종료 버튼 — DB 상담이고 잠금 안 된 상태에서만 노출 */}
-          {role === "pharmacist" && isDbConsultation && !inputLocked && (
+          {/* 약사 측 상담 종료 버튼 — DB 상담이고 잠금 안 된 상태에서만 노출 (dbLoading 가드: 첫 렌더 깜빡임 방지) */}
+          {role === "pharmacist" && isDbConsultation && !dbLoading && !inputLocked && (
             <button
               type="button"
               onClick={handlePharmacistEndClick}
@@ -3005,8 +2998,13 @@ function ChatContent() {
       })()}
 
       {/* 상태 안내 박스 — 입력란 바로 위. consultationLocked / consultationPending / consultationRejected 는 상호 배타. */}
-      {/* 종료된 상담 안내 (회색 톤) — rejected 는 별도 박스에서 분기 처리하므로 제외 */}
-      {consultationLocked && !consultationRejected && (
+      {/* 종료된 상담 안내 — rejected 는 별도 박스에서 분기 처리하므로 제외
+       *   환자 측: sage-pale CTA 박스로 승격 (재상담 요청 모달 트리거)
+       *   약사 측: 기존 회색 안내 박스 유지 */}
+      {consultationLocked && !consultationRejected && role === "patient" && (
+        <ReconsultPromptBox onClickRequest={() => setShowReconsultModal(true)} />
+      )}
+      {consultationLocked && !consultationRejected && role === "pharmacist" && (
         <div
           role="status"
           style={{
@@ -5065,6 +5063,22 @@ function ChatContent() {
           </div>
         </div>
       )}
+
+      {/* 재상담 요청 모달 (환자 전용 — 종료된 상담에서 ReconsultPromptBox 클릭 시)
+       *  pharmacist_id 가 있으면 /questionnaire 진입 시 같은 약사 락인 (배너 + 완료 화면 분기).
+       *  null 이면 일반 흐름 폴백 — /match 거쳐 약사 선택. */}
+      <ReconsultModal
+        open={showReconsultModal}
+        onClose={() => setShowReconsultModal(false)}
+        onChooseNewSymptom={() => {
+          setShowReconsultModal(false);
+          const pid = dbConsultation?.pharmacist_id;
+          const url = pid
+            ? `/questionnaire?reset=1&reconsult_pharmacist=${pid}`
+            : `/questionnaire?reset=1`;
+          router.push(url);
+        }}
+      />
 
     </div>
   );

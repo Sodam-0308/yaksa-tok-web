@@ -329,7 +329,7 @@ function QuestionnaireSummaryContent() {
                   <button
                     type="button"
                     onClick={() => handleEdit(idx)}
-                    aria-label={`${q.label} 수정`}
+                    aria-label={`질문 ${idx + 1} 수정`}
                     style={{
                       background: "transparent",
                       border: `1px solid ${C.sageLight}`,

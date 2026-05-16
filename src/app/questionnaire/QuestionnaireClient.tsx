@@ -9,6 +9,12 @@ import { supabase } from "@/lib/supabase";
 import type { Database, Json } from "@/types/database";
 
 type AiQuestionnaireInsert = Database["public"]["Tables"]["ai_questionnaires"]["Insert"];
+type ConsultationInsert = Database["public"]["Tables"]["consultations"]["Insert"];
+/** UPSERT 부분 페이로드 — id 필수 + 영구 정보 필드만 선택적으로. patient_profiles row 가 이미 있으면
+ *  명시한 필드만 UPDATE, 없으면 다른 컬럼은 그대로 (signup/complete 단계에서 미리 빈 row 보장됨). */
+type PatientProfileUpsert = { id: string } & Partial<
+  Database["public"]["Tables"]["patient_profiles"]["Update"]
+>;
 
 const QUESTIONNAIRE_ID_KEY = "yaksa-tok-questionnaire-id";
 const PENDING_MATCH_KEY = "yaksa-tok-pending-match";
@@ -207,6 +213,24 @@ export function clearQuestionnaireSession() {
   } catch { /* ignore */ }
 }
 
+/** 한글 성별 답변 → DB CHECK 'male'/'female'/'other' 매핑. patient_profiles UPSERT 용. */
+function mapGenderToEn(korean: string | undefined): "male" | "female" | "other" | null {
+  if (!korean) return null;
+  if (korean === "남성") return "male";
+  if (korean === "여성") return "female";
+  if (korean === "기타") return "other";
+  return null;
+}
+
+/** DB 영문 성별 → 한글 답변 역매핑. patient_profiles 자동 채움 시 사용. */
+function mapGenderToKo(en: string | null | undefined): string | null {
+  if (!en) return null;
+  if (en === "male") return "남성";
+  if (en === "female") return "여성";
+  if (en === "other") return "기타";
+  return null;
+}
+
 export default function QuestionnaireClient() {
   return (
     <Suspense>
@@ -227,6 +251,15 @@ function QuestionnaireContent() {
   // ?step=N 으로 진입한 단일 항목 수정 모드. [다음] 누르면 다음 문항이 아닌
   // /questionnaire-summary 로 복귀. [이전] 누르면 일반 흐름으로 전환(해제).
   const [singleEditMode, setSingleEditMode] = useState(false);
+  // 재상담 락인 — ChatClient ReconsultModal "새 증상으로 상담" 클릭 시
+  //   /questionnaire?reset=1&reconsult_pharmacist={uuid} 로 진입. 같은 약사로 락인된 흐름.
+  const reconsultPharmacistId = searchParams.get("reconsult_pharmacist");
+  const [reconsultPharmacistName, setReconsultPharmacistName] = useState<string | null>(null);
+  // 완료 시 INSERT 된 ai_questionnaires.id — 재상담 흐름에서 consultations.questionnaire_id 채울 때 사용.
+  //   sessionStorage 와 별개로 state 보관 (다른 탭 영향 회피 + 즉시값 활용).
+  const [savedQuestionnaireId, setSavedQuestionnaireId] = useState<string | null>(null);
+  // 재상담 제출 진행 중 (버튼 disabled)
+  const [reconsultSubmitting, setReconsultSubmitting] = useState(false);
   const answersRef = useRef(answers);
   const idxRef = useRef(currentIdx);
 
@@ -322,6 +355,9 @@ function QuestionnaireContent() {
     }
   }, [answers, currentIdx, restored]);
 
+  // 자동 채움 가드 ref — 아래 prefill useEffect (useAuth 이후 정의) 에서 사용
+  const prefilledRef = useRef(false);
+
   const flow = useMemo(
     () => questions.filter((q) => !q.condition || q.condition(answers)),
     [answers]
@@ -351,6 +387,51 @@ function QuestionnaireContent() {
 
   /* ── 완료 시 ai_questionnaires 저장 (1회) ── */
   const { user, loading: authLoading } = useAuth();
+
+  /* ── 자동 채움 — patient_profiles 에서 gender + birth_year 선조회 후 빈 칸 채움 ──
+   *   사이클 2 sync 의 역방향. detailed_answers JSON 형식에 맞춰 한글/객체 형태로 변환.
+   *   머지 패턴 { ...prefill, ...prev } — sessionStorage 진행 중 답변(prev)이 항상 우선,
+   *   prefill 은 빈 칸일 때만 채움 (사용자 진행 중 답변 절대 덮어쓰지 않음).
+   *   prefilledRef 가드 — restored / answers 갱신으로 effect 재실행 시 중복 fetch 방지. */
+  useEffect(() => {
+    if (authLoading) return;
+    if (!user) return;
+    if (!restored) return;
+    if (prefilledRef.current) return;
+    prefilledRef.current = true;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const ppResp = await supabase
+          .from("patient_profiles")
+          .select("gender, birth_year")
+          .eq("id", user.id)
+          .maybeSingle<{ gender: string | null; birth_year: number | null }>();
+        if (cancelled) return;
+        if (ppResp.error) {
+          console.error("[patient-profiles-prefill]", ppResp.error);
+          return;
+        }
+        if (!ppResp.data) return;
+        const genderKo = mapGenderToKo(ppResp.data.gender);
+        const birthYear = ppResp.data.birth_year;
+        const prefill: Answers = {};
+        if (genderKo) prefill.gender = genderKo;
+        if (typeof birthYear === "number" && Number.isFinite(birthYear)) {
+          prefill.birth_year = { year: String(birthYear) };
+        }
+        if (Object.keys(prefill).length === 0) return;
+        setAnswers((prev) => ({ ...prefill, ...prev }));
+      } catch (err) {
+        console.error("[patient-profiles-prefill]", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, authLoading, restored]);
+
   const savedRef = useRef(false);
   useEffect(() => {
     // 인증 상태 확정 전에는 저장 보류 (로그인 사용자가 patient_id=null로 저장되는 것 방지)
@@ -444,6 +525,42 @@ function QuestionnaireContent() {
           if (typeof window !== "undefined") {
             sessionStorage.setItem(QUESTIONNAIRE_ID_KEY, newId);
           }
+          // 재상담 흐름에서 직접 사용하기 위해 state 로도 보관
+          setSavedQuestionnaireId(newId);
+        }
+
+        // 2) patient_profiles UPSERT — 영구 정보(gender + birth_year)만 정식 저장.
+        //    키/몸무게: 어린이 성장기 가변 정보라 sync 제외 (박소담 약사 결정).
+        //    monthly_budget: 가변 정보라 sync 제외.
+        //    키/몸무게는 detailed_answers JSON 안에는 그대로 보존됨 (ai_questionnaires INSERT).
+        //    ai_questionnaires INSERT 와 별개 — UPSERT 실패해도 본 흐름은 진행 (silent fail).
+        //    user 가드: 비로그인 사용자는 user.id 없으므로 UPSERT 자체 스킵.
+        if (user) {
+          const birthYearRaw = (answers.birth_year as Record<string, string> | undefined)?.year;
+          const genderRaw = typeof answers.gender === "string" ? answers.gender : undefined;
+
+          const birthYearNum = birthYearRaw ? parseInt(birthYearRaw, 10) : NaN;
+          const birthYear = Number.isFinite(birthYearNum) ? birthYearNum : null;
+          const genderEn = mapGenderToEn(genderRaw);
+
+          // 둘 다 비어있으면 UPSERT 의미 없음 — 스킵
+          if (birthYear !== null || genderEn !== null) {
+            const profilePayload: PatientProfileUpsert = { id: user.id };
+            if (birthYear !== null) profilePayload.birth_year = birthYear;
+            if (genderEn !== null) profilePayload.gender = genderEn;
+
+            const upsertResp = await (supabase
+              .from("patient_profiles") as unknown as {
+                upsert: (
+                  p: PatientProfileUpsert,
+                  opts?: { onConflict?: string },
+                ) => Promise<{ error: { message: string; code?: string } | null }>;
+              })
+              .upsert(profilePayload, { onConflict: "id" });
+            if (upsertResp.error) {
+              console.error("[patient-profiles-sync]", upsertResp.error);
+            }
+          }
         }
       } catch (err) {
         console.error("[questionnaire] save threw:", err);
@@ -451,6 +568,150 @@ function QuestionnaireContent() {
       }
     })();
   }, [isComplete, restored, authLoading, answers, user]);
+
+  /* ── 재상담 약사 이름 fetch — reconsult_pharmacist 파라미터 있을 때만 실행 ──
+   *   1) pharmacist_profiles.license_name 우선
+   *   2) 없으면 profiles.name 폴백
+   *   3) 둘 다 없으면 null 유지 → 배너/완료 화면 분기 노출 안 함 (정체불명 약사 호명 방지)
+   *   authLoading 가드 — supabase 세션 hydration 끝나기 전 fetch 발사하면 anon 요청이 되어
+   *     RLS authenticated 정책으로만 가려진 row 를 못 받는 경우가 있음 (5/14 chat 환자 이름 폴백 동일 패턴).
+   */
+  useEffect(() => {
+    if (authLoading) return;
+    if (!reconsultPharmacistId) {
+      setReconsultPharmacistName(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const ppResp = await supabase
+          .from("pharmacist_profiles")
+          .select("license_name")
+          .eq("id", reconsultPharmacistId)
+          .maybeSingle<{ license_name: string | null }>();
+        if (cancelled) return;
+        const licName = ppResp.data?.license_name?.trim() || null;
+        if (licName) {
+          setReconsultPharmacistName(licName);
+          return;
+        }
+        const profResp = await supabase
+          .from("profiles")
+          .select("name")
+          .eq("id", reconsultPharmacistId)
+          .maybeSingle<{ name: string | null }>();
+        if (cancelled) return;
+        const profName = profResp.data?.name?.trim() || null;
+        setReconsultPharmacistName(profName);
+      } catch (err) {
+        console.error("[questionnaire] reconsult pharmacist name fetch threw:", err);
+        if (!cancelled) setReconsultPharmacistName(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [reconsultPharmacistId, authLoading]);
+
+  /* ── 재상담 제출 — 완료 화면 [약사님께 보내기] 클릭 시 ──
+   *  1) 같은 (patient_id, pharmacist_id) 페어로 기존 consultation 조회 (MatchClient L329-345 패턴)
+   *  2) 있으면 status='pending', completed_at=null, questionnaire_id 갱신 (재활성화)
+   *  3) 없으면 신규 INSERT
+   *  4) /chat/{id}?role=patient 로 라우팅
+   *  필수값 누락 / 에러 시 /match 폴백 (사용자 손실 없음).
+   */
+  const handleReconsultSubmit = async () => {
+    if (!user || !reconsultPharmacistId || !savedQuestionnaireId) {
+      router.push("/match");
+      return;
+    }
+    if (reconsultSubmitting) return;
+    setReconsultSubmitting(true);
+
+    try {
+      // 1) 기존 consultation 조회
+      const existResp = await supabase
+        .from("consultations")
+        .select("id")
+        .eq("patient_id", user.id)
+        .eq("pharmacist_id", reconsultPharmacistId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle<{ id: string }>();
+      if (existResp.error) {
+        console.error("[reconsult-submit] existing lookup failed:", existResp.error);
+      }
+
+      let consultationId: string | null = existResp.data?.id ?? null;
+
+      if (consultationId) {
+        // 2) 재활성화 — pending + completed_at NULL + 새 questionnaire_id
+        type ConsUpdate = {
+          status: string;
+          completed_at: string | null;
+          questionnaire_id: string;
+        };
+        const upPayload: ConsUpdate = {
+          status: "pending",
+          completed_at: null,
+          questionnaire_id: savedQuestionnaireId,
+        };
+        const upResp = await (supabase
+          .from("consultations") as unknown as {
+            update: (p: ConsUpdate) => {
+              eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+            };
+          })
+          .update(upPayload)
+          .eq("id", consultationId);
+        if (upResp.error) {
+          console.error("[reconsult-submit] reactivate failed:", upResp.error);
+          setReconsultSubmitting(false);
+          router.push("/match");
+          return;
+        }
+      } else {
+        // 3) 신규 INSERT
+        const payload: ConsultationInsert = {
+          patient_id: user.id,
+          pharmacist_id: reconsultPharmacistId,
+          questionnaire_id: savedQuestionnaireId,
+          consultation_type: "local",
+          status: "pending",
+          matching_source: "ai_questionnaire",
+        };
+        const insResp = await (supabase
+          .from("consultations") as unknown as {
+            insert: (p: ConsultationInsert) => {
+              select: (cols: string) => {
+                maybeSingle: () => Promise<{
+                  data: { id: string } | null;
+                  error: { message: string; code?: string } | null;
+                }>;
+              };
+            };
+          })
+          .insert(payload)
+          .select("id")
+          .maybeSingle();
+        if (insResp.error || !insResp.data?.id) {
+          console.error("[reconsult-submit] insert failed:", insResp.error);
+          setReconsultSubmitting(false);
+          router.push("/match");
+          return;
+        }
+        consultationId = insResp.data.id;
+      }
+
+      // 4) 채팅방으로 라우팅 — sessionStorage 정리는 ChatClient 가 자체적으로 처리
+      router.push(`/chat/${consultationId}?role=patient`);
+    } catch (err) {
+      console.error("[reconsult-submit] threw:", err);
+      setReconsultSubmitting(false);
+      router.push("/match");
+    }
+  };
 
   const setAnswer = useCallback(
     (id: string, value: unknown) => {
@@ -560,6 +821,33 @@ function QuestionnaireContent() {
   // Don't render until restoration is done
   if (!restored) return null;
 
+  /* 재상담 락인 상단 배너 — progress-wrap 바로 아래, q-container 시작 직전 노출.
+   *   reconsultPharmacistId && reconsultPharmacistName 둘 다 있을 때만 (이름 fetch 실패 시 노출 X).
+   *   질문 화면 + 완료 화면 둘 다 동일 위치에서 재사용. */
+  const reconsultBanner =
+    reconsultPharmacistId && reconsultPharmacistName ? (
+      <div
+        role="status"
+        aria-live="polite"
+        style={{
+          margin: "8px 16px 24px",
+          padding: "10px 14px",
+          borderRadius: 10,
+          background: "#EDF4F0",
+          border: "1px solid rgba(94,125,108,0.18)",
+          fontSize: 14,
+          color: "#2C3630",
+          textAlign: "center",
+          fontFamily: "'Noto Sans KR', sans-serif",
+          lineHeight: 1.5,
+        }}
+      >
+        <span style={{ fontWeight: 700 }}>{reconsultPharmacistName} 약사님</span>께 다시 상담을 요청합니다
+      </div>
+    ) : null;
+
+  const isReconsultFlow = !!(reconsultPharmacistId && reconsultPharmacistName);
+
   // Complete screen
   if (isComplete) {
     return (
@@ -580,25 +868,102 @@ function QuestionnaireContent() {
           <div className="complete-screen">
             <div className="complete-icon">✨</div>
             <h2 className="complete-title">분석 준비 완료!</h2>
-            <p className="complete-desc">
-              답변해주신 내용을 바탕으로
-              <br />
-              가장 적합한 근처 약사를 찾고 있어요.
-              <br />
-              <strong style={{ color: "var(--terra)" }}>잠시만 기다려주세요.</strong>
-            </p>
-            <Link
-              href={`/questionnaire-result?symptom=${encodeURIComponent(((answers.symptoms as string[]) || []).join(","))}`}
-              className="complete-btn"
-            >
-              약사 매칭 확인하기 →
-            </Link>
-            <button
-              className="reset-btn"
-              onClick={handleReset}
-            >
-              처음부터 다시하기
-            </button>
+            {isReconsultFlow ? (
+              <>
+                <p
+                  style={{
+                    fontSize: 16,
+                    fontWeight: 700,
+                    color: "#2C3630",
+                    textAlign: "center",
+                    lineHeight: 1.6,
+                    margin: "12px 0 0",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  {reconsultPharmacistName} 약사님께 상담을 보내시겠어요?
+                </p>
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 10,
+                    marginTop: 20,
+                    width: "100%",
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={handleReconsultSubmit}
+                    disabled={reconsultSubmitting || !savedQuestionnaireId}
+                    style={{
+                      width: "100%",
+                      height: 48,
+                      borderRadius: 10,
+                      background:
+                        reconsultSubmitting || !savedQuestionnaireId
+                          ? "#B3CCBE"
+                          : "#4A6355",
+                      color: "#fff",
+                      border: "none",
+                      fontSize: 14,
+                      fontWeight: 700,
+                      cursor:
+                        reconsultSubmitting || !savedQuestionnaireId
+                          ? "default"
+                          : "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                  >
+                    {reconsultSubmitting
+                      ? "보내는 중..."
+                      : `${reconsultPharmacistName} 약사님께 보내기`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => router.push("/match")}
+                    disabled={reconsultSubmitting}
+                    style={{
+                      width: "100%",
+                      height: 48,
+                      borderRadius: 10,
+                      background: "#fff",
+                      color: "#3D4A42",
+                      border: "1px solid rgba(94,125,108,0.18)",
+                      fontSize: 14,
+                      fontWeight: 500,
+                      cursor: reconsultSubmitting ? "default" : "pointer",
+                      opacity: reconsultSubmitting ? 0.6 : 1,
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                  >
+                    다른 약사로 변경
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="complete-desc">
+                  답변해주신 내용을 바탕으로
+                  <br />
+                  가장 적합한 근처 약사를 찾고 있어요.
+                  <br />
+                  <strong style={{ color: "var(--terra)" }}>잠시만 기다려주세요.</strong>
+                </p>
+                <Link
+                  href={`/questionnaire-result?symptom=${encodeURIComponent(((answers.symptoms as string[]) || []).join(","))}`}
+                  className="complete-btn"
+                >
+                  약사 매칭 확인하기 →
+                </Link>
+                <button
+                  className="reset-btn"
+                  onClick={handleReset}
+                >
+                  처음부터 다시하기
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -645,6 +1010,7 @@ function QuestionnaireContent() {
       </div>
 
       <div className="q-container">
+        {reconsultBanner}
         {currentIdx === 0 && (
           <div className="q-insight-banner">
             내 몸에 맞는 관리를 찾기 위한 질문이에요.<br />
@@ -657,7 +1023,7 @@ function QuestionnaireContent() {
             <div className="section-divider">{q.sectionLabel}</div>
           )}
 
-          <div className="q-number">{q.label}</div>
+          <div className="q-number">{`질문 ${currentIdx + 1}`}</div>
           <h2
             className="q-title"
             dangerouslySetInnerHTML={{ __html: q.title }}
