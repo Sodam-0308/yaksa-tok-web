@@ -115,6 +115,35 @@ export type PatientProfileInsert = Omit<PatientProfileRow, "case_study_consent">
 export type PatientProfileUpdate = Partial<Omit<PatientProfileRow, "id">>;
 
 /* ══════════════════════════════════════════
+   pharmacist_charts
+   ══════════════════════════════════════════ */
+
+export interface PharmacistChartRow {
+  id: UUID;
+  pharmacist_id: UUID;
+  consultation_id: UUID | null;
+  patient_id: UUID | null;
+  patient_name: string;
+  birth_year: number | null;
+  birth_date: string | null;
+  gender: string | null;
+  height_cm: number | null;
+  weight_kg: number | null;
+  weight_recorded_at: string | null;
+  budget: string | null;
+  pharmacist_memo: string | null;
+  chart_type: "self" | "family" | "walkin";
+  family_relationship: string | null;
+  created_at: ISOTimestamp | null;
+  updated_at: ISOTimestamp | null;
+}
+export type PharmacistChartInsert = Partial<PharmacistChartRow> & {
+  pharmacist_id: UUID;
+  patient_name: string;
+};
+export type PharmacistChartUpdate = Partial<Omit<PharmacistChartRow, "id">>;
+
+/* ══════════════════════════════════════════
    pharmacist_profiles
    ══════════════════════════════════════════ */
 
@@ -272,6 +301,7 @@ export interface AiQuestionnaireRow {
   detailed_answers: Json | null;
   ai_summary: string | null;
   completed_at: ISOTimestamp | null;
+  consultation_for: "self" | "family" | null;
 }
 export type AiQuestionnaireInsert = Partial<AiQuestionnaireRow> & {
   patient_id: UUID | null;
@@ -742,6 +772,11 @@ export interface Database {
         Row: PharmacistProfileRow;
         Insert: PharmacistProfileInsert;
         Update: PharmacistProfileUpdate;
+      };
+      pharmacist_charts: {
+        Row: PharmacistChartRow;
+        Insert: PharmacistChartInsert;
+        Update: PharmacistChartUpdate;
       };
       consultations: {
         Row: ConsultationRow;

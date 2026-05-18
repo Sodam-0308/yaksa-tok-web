@@ -231,6 +231,14 @@ function mapGenderToKo(en: string | null | undefined): string | null {
   return null;
 }
 
+/** 한글 상담 대상 → DB CHECK 'self'/'family' 매핑. ai_questionnaires.consultation_for 컬럼 저장용. */
+function mapConsultationForToEn(korean: string | undefined): "self" | "family" | null {
+  if (!korean) return null;
+  if (korean === "본인") return "self";
+  if (korean === "가족") return "family";
+  return null;
+}
+
 export default function QuestionnaireClient() {
   return (
     <Suspense>
@@ -392,11 +400,14 @@ function QuestionnaireContent() {
    *   사이클 2 sync 의 역방향. detailed_answers JSON 형식에 맞춰 한글/객체 형태로 변환.
    *   머지 패턴 { ...prefill, ...prev } — sessionStorage 진행 중 답변(prev)이 항상 우선,
    *   prefill 은 빈 칸일 때만 채움 (사용자 진행 중 답변 절대 덮어쓰지 않음).
-   *   prefilledRef 가드 — restored / answers 갱신으로 effect 재실행 시 중복 fetch 방지. */
+   *   prefilledRef 가드 — restored / answers 갱신으로 effect 재실행 시 중복 fetch 방지.
+   *   consultation_for 가드 — "본인" 분기 통과 후에만 발동. "가족" 또는 미응답 시 스킵.
+   *     사용자가 "가족"→"본인" 변경 시 prefilledRef 가 아직 false 라 재발동 가능. */
   useEffect(() => {
     if (authLoading) return;
     if (!user) return;
     if (!restored) return;
+    if (answers.consultation_for !== "본인") return;
     if (prefilledRef.current) return;
     prefilledRef.current = true;
 
@@ -430,7 +441,7 @@ function QuestionnaireContent() {
     return () => {
       cancelled = true;
     };
-  }, [user, authLoading, restored]);
+  }, [user, authLoading, restored, answers.consultation_for]);
 
   const savedRef = useRef(false);
   useEffect(() => {
@@ -482,6 +493,9 @@ function QuestionnaireContent() {
       free_text: freeText,
       detailed_answers: answers as unknown as Json,
       completed_at: new Date().toISOString(),
+      consultation_for: mapConsultationForToEn(
+        typeof answers.consultation_for === "string" ? answers.consultation_for : undefined,
+      ),
     };
 
     (async () => {
@@ -535,7 +549,9 @@ function QuestionnaireContent() {
         //    키/몸무게는 detailed_answers JSON 안에는 그대로 보존됨 (ai_questionnaires INSERT).
         //    ai_questionnaires INSERT 와 별개 — UPSERT 실패해도 본 흐름은 진행 (silent fail).
         //    user 가드: 비로그인 사용자는 user.id 없으므로 UPSERT 자체 스킵.
-        if (user) {
+        //    consultation_for 가드: "본인" 상담일 때만 sync. "가족" 상담은 본인 patient_profiles
+        //      에 가족 정보가 오염되지 않도록 sync 스킵 (핵심 버그 방지).
+        if (user && answers.consultation_for === "본인") {
           const birthYearRaw = (answers.birth_year as Record<string, string> | undefined)?.year;
           const genderRaw = typeof answers.gender === "string" ? answers.gender : undefined;
 

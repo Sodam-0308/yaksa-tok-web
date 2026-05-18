@@ -54,6 +54,13 @@ export interface Question {
 export const questions: Question[] = [
   // ── 공통 기본 ──
   {
+    id: "consultation_for",
+    type: "single",
+    title: "누구를 위한 상담인가요?",
+    desc: "본인 외에는 자동 정보 채움이 적용되지 않아요.",
+    options: ["본인", "가족"],
+  },
+  {
     id: "symptoms",
     type: "multi",
     title: "주로 불편한 증상을<br/>모두 골라주세요",

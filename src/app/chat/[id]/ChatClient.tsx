@@ -4216,7 +4216,7 @@ function ChatContent() {
               .chat-patient-chart-panel {
                 display: flex; flex-direction: column;
                 position: fixed; top: 60px; right: 0;
-                width: 400px; height: calc(100vh - 60px);
+                width: 500px; height: calc(100vh - 60px);
                 background: #fff; z-index: 100;
                 box-shadow: -4px 0 24px rgba(0,0,0,0.10);
                 border-left: 1px solid rgba(94,125,108,0.14);
@@ -4224,7 +4224,7 @@ function ChatContent() {
               }
             }
             @media (min-width: 1600px) {
-              .chat-patient-chart-panel { width: 500px; }
+              .chat-patient-chart-panel { width: 600px; }
             }
           `}</style>
           <aside className="chat-patient-chart-panel">
@@ -4243,101 +4243,21 @@ function ChatContent() {
               </button>
             </div>
 
-            {/* 내용 */}
-            <div style={{ flex: 1, overflowY: "auto", padding: 16, fontFamily: "'Noto Sans KR', sans-serif" }}>
-              {/* 기본 정보 */}
-              <div style={{
-                background: "linear-gradient(135deg, #EDF4F0 0%, #fff 100%)",
-                borderRadius: 14, padding: "14px 16px",
-                border: "1px solid #B3CCBE", marginBottom: 14,
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                  <span style={{ fontSize: 17, fontWeight: 800, color: "#4A6355", fontFamily: "'Gothic A1', sans-serif" }}>김○○</span>
-                  <span style={{
-                    display: "inline-flex", alignItems: "center", gap: 4,
-                    padding: "2px 8px", borderRadius: 100,
-                    fontSize: 12, fontWeight: 600, background: "#EDF4F0", color: "#4A6355",
-                    marginLeft: "auto",
-                  }}>
-                    <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4CAF50" }} />
-                    상담 중
-                  </span>
-                </div>
-                <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.6 }}>
-                  여성 · 1993년생 (33세) · 162cm · 54kg
-                </div>
-                <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 4 }}>
-                  기록: 2026.04.18
-                </div>
-              </div>
-
-              {/* 예산 */}
-              <div style={{ marginBottom: 14, padding: "10px 14px", background: "#F8F9F7", borderRadius: 10, border: "1px solid rgba(94,125,108,0.14)" }}>
-                <div style={{ fontSize: 12, color: "#5E7D6C", marginBottom: 2 }}>예산</div>
-                <div style={{ fontSize: 14, fontWeight: 600, color: "#2C3630" }}>월 5~10만원</div>
-              </div>
-
-              {/* 증상 */}
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: "#4A6355", marginBottom: 8 }}>증상 (3)</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {[
-                    { label: "만성피로", status: "개선 중", bg: "#EAF3DE", color: "#3B6D11", duration: "약 6개월째" },
-                    { label: "불면/수면", status: "상담 중", bg: "#E6F1FB", color: "#185FA5", duration: "약 2개월째" },
-                    { label: "소화장애", status: "해결됨", bg: "#FAEEDA", color: "#854F0B", duration: "2026.04.08" },
-                  ].map((s, i) => (
-                    <div key={i} style={{
-                      display: "flex", alignItems: "center", gap: 8,
-                      padding: "8px 12px", borderRadius: 10,
-                      background: s.status === "해결됨" ? "#F8F9F7" : "#fff",
-                      border: "1px solid rgba(94,125,108,0.14)",
-                      flexWrap: "wrap",
-                    }}>
-                      <span style={{ padding: "3px 10px", borderRadius: 100, fontSize: 12, fontWeight: 600, background: s.bg, color: s.color }}>{s.label}</span>
-                      <span style={{ fontSize: 12, fontWeight: 600, color: s.status === "해결됨" ? "#3D4A42" : "#C06B45" }}>· {s.status}</span>
-                      <span style={{ fontSize: 12, color: "#5E7D6C", marginLeft: "auto" }}>{s.duration}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* 상세 정보 */}
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: "#4A6355", marginBottom: 8 }}>상세 정보</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {[
-                    { label: "직업", value: "사무직 (야근 잦음)" },
-                    { label: "생활습관", value: "운동 거의 안 함" },
-                    { label: "식습관", value: "불규칙, 점심·저녁 위주" },
-                    { label: "수면", value: "평균 5~6시간, 새벽 각성" },
-                    { label: "음주", value: "주 2회" },
-                    { label: "흡연", value: "비흡연" },
-                    { label: "카페인", value: "하루 2~3잔 (민감)" },
-                  ].map((d) => (
-                    <div key={d.label} style={{ padding: "10px 12px", background: "#F8F9F7", borderRadius: 8, border: "1px solid rgba(94,125,108,0.10)" }}>
-                      <div style={{ fontSize: 12, color: "#5E7D6C", marginBottom: 2 }}>{d.label}</div>
-                      <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.5 }}>{d.value}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* 방문 기록 */}
-              <div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: "#4A6355", marginBottom: 8 }}>방문 기록</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {[
-                    { date: "2026.04.12", summary: "비타민B군, 마그네슘 · 30일치" },
-                    { date: "2026.03.20", summary: "유산균, 소화효소 · 30일치" },
-                  ].map((v, i) => (
-                    <div key={i} style={{ padding: "10px 12px", borderRadius: 8, background: "#F4F6F3", border: "1px solid rgba(94,125,108,0.14)" }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: "#2C3630" }}>{v.date}</div>
-                      <div style={{ fontSize: 13, color: "#3D4A42", marginTop: 2 }}>{v.summary}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
+            {/* 내용 — 차트 페이지 임베드 (ChartClient.tsx 의 isEmbedded 인프라 활용)
+             *  · pharmacist_charts SELECT/INSERT/UPDATE, 인라인 편집, 토스트 모두 차트 페이지가 자체 처리
+             *  · Mock 채팅방(비UUID chatId)은 ChartClient 의 UUID 가드가 자동으로 mock 모드 처리
+             *  · embedded=true → nav/bottom-bar/sub-panel 숨김 + 2열→1열 자동 변환 */}
+            <iframe
+              src={`/chart/${chatId}?embedded=true`}
+              title="환자 차트"
+              style={{
+                flex: 1,
+                width: "100%",
+                border: "none",
+                display: "block",
+                background: "#F8F9F7",
+              }}
+            />
           </aside>
         </>
       )}

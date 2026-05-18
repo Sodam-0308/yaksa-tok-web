@@ -207,7 +207,8 @@ interface HealthCheck {
 interface Patient {
   id: string;
   name: string;
-  birthYear: number;
+  birthYear: number | null;
+  birthDate: string | null;
   gender: string;
   height: number;
   weight: number;
@@ -224,6 +225,7 @@ const MOCK_PATIENT: Patient = {
   id: "patient-001",
   name: "김○○",
   birthYear: 1993,
+  birthDate: null,
   gender: "여성",
   height: 162,
   weight: 54,
@@ -432,6 +434,44 @@ const todayIso = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
+/** 한글 성별 → DB CHECK 'male'/'female'/'other' 매핑. */
+function mapGenderToEn(ko: string | null): "male" | "female" | "other" | null {
+  if (!ko) return null;
+  if (ko === "남성") return "male";
+  if (ko === "여성") return "female";
+  if (ko === "기타") return "other";
+  return null;
+}
+/** DB 영문 성별 → 한글 매핑 (Mock 폴백용 빈 문자열 반환). */
+function mapGenderToKo(en: string | null): string {
+  if (en === "male") return "남성";
+  if (en === "female") return "여성";
+  if (en === "other") return "기타";
+  return "";
+}
+/** birth_date 우선, 없으면 birth_year. 둘 다 없으면 null. birth_date 있을 때 만 나이. */
+function calcAgeFromBirthDate(birthDate: string | null, birthYear: number | null): number | null {
+  if (birthDate) {
+    const [y, m, d] = birthDate.split("-").map(Number);
+    const now = new Date();
+    let age = now.getFullYear() - y;
+    const monthDiff = (now.getMonth() + 1) - m;
+    if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < d)) age -= 1;
+    return age;
+  }
+  if (birthYear) return new Date().getFullYear() - birthYear;
+  return null;
+}
+/** 표시용 포맷. birth_date 있으면 "1988년 6월 15일", birth_year만 있으면 "1988년 __월 __일", 둘 다 없으면 "미입력". */
+function formatBirthDateForDisplay(birthDate: string | null, birthYear: number | null): string {
+  if (birthDate) {
+    const [y, m, d] = birthDate.split("-");
+    return `${y}년 ${parseInt(m, 10)}월 ${parseInt(d, 10)}일`;
+  }
+  if (birthYear) return `${birthYear}년 __월 __일`;
+  return "미입력";
+}
+
 const calcDateFromQuick = (key: string): string => {
   const d = new Date();
   if (key === "1w") d.setDate(d.getDate() - 7);
@@ -539,38 +579,177 @@ function ChartContent() {
   const [patient, setPatient] = useState<Patient>(MOCK_PATIENT);
   const [editingBasicField, setEditingBasicField] = useState<string | null>(null);
   const [editBasicValue, setEditBasicValue] = useState<Record<string, string>>({});
+  /* pharmacist_charts.id — UPDATE 시 사용. Mock 모드(UUID 가드 실패)에선 null 유지. */
+  const [chartRowId, setChartRowId] = useState<string | null>(null);
+  /* 차트 동기화 토스트 — DB UPDATE 실패 시 등 약사에게 즉시 알림. */
+  const [chartToast, setChartToast] = useState<string | null>(null);
+  const chartToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showChartToast = (msg: string) => {
+    setChartToast(msg);
+    if (chartToastTimerRef.current) clearTimeout(chartToastTimerRef.current);
+    chartToastTimerRef.current = setTimeout(() => setChartToast(null), 3000);
+  };
 
   const startBasicEdit = (field: string) => {
     setEditingBasicField(field);
     if (field === "name") setEditBasicValue({ name: patient.name });
-    else if (field === "birthYear") setEditBasicValue({ birthYear: String(patient.birthYear) });
+    else if (field === "birthDate") {
+      if (patient.birthDate) {
+        const [y, m, d] = patient.birthDate.split("-");
+        setEditBasicValue({
+          birthYear: y,
+          birthMonth: String(parseInt(m, 10)),
+          birthDay: String(parseInt(d, 10)),
+        });
+      } else {
+        // birth_year 만 있을 때: 년 칸 채우고 월/일 비움. 박소담 약사 A 결정.
+        setEditBasicValue({
+          birthYear: patient.birthYear ? String(patient.birthYear) : "",
+          birthMonth: "",
+          birthDay: "",
+        });
+      }
+    }
     else if (field === "gender") setEditBasicValue({ gender: patient.gender });
     else if (field === "height") setEditBasicValue({ height: String(patient.height) });
     else if (field === "weight") setEditBasicValue({ weight: String(patient.weight) });
     else if (field === "budget") setEditBasicValue({ budget: patient.budget });
   };
   const cancelBasicEdit = () => { setEditingBasicField(null); setEditBasicValue({}); };
-  const saveBasicEdit = () => {
+
+  /** pharmacist_charts UPDATE 헬퍼 — chartRowId 있을 때만. Mock 모드(없음)는 로컬만. */
+  const persistChartUpdate = async (
+    patch: Partial<{
+      patient_name: string;
+      birth_year: number | null;
+      birth_date: string | null;
+      gender: string | null;
+      height_cm: number;
+      weight_kg: number;
+      weight_recorded_at: string;
+      budget: string;
+    }>,
+  ): Promise<boolean> => {
+    if (!chartRowId) return true; // Mock 모드 — 성공 처리
+    type ChartUpdate = typeof patch;
+    const upResp = await (supabase
+      .from("pharmacist_charts") as unknown as {
+        update: (p: ChartUpdate) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string; code?: string } | null }>;
+        };
+      })
+      .update(patch)
+      .eq("id", chartRowId);
+    if (upResp.error) {
+      console.error("[chart-sync] update failed:", upResp.error);
+      return false;
+    }
+    return true;
+  };
+
+  const saveBasicEdit = async () => {
     if (!editingBasicField) return;
-    setPatient((prev) => {
-      const next = { ...prev };
-      if (editingBasicField === "name" && editBasicValue.name) next.name = editBasicValue.name;
-      else if (editingBasicField === "birthYear") {
-        const yr = parseInt(editBasicValue.birthYear);
-        if (yr >= 1920 && yr <= new Date().getFullYear()) next.birthYear = yr;
-      } else if (editingBasicField === "gender" && editBasicValue.gender) next.gender = editBasicValue.gender;
-      else if (editingBasicField === "height") {
-        const h = parseInt(editBasicValue.height);
-        if (h > 0 && h < 300) next.height = h;
-      } else if (editingBasicField === "weight") {
-        const w = parseFloat(editBasicValue.weight);
-        if (w > 0 && w < 500) { next.weight = w; next.weightRecordedAt = todayIso(); }
-      } else if (editingBasicField === "budget" && editBasicValue.budget) next.budget = editBasicValue.budget;
-      return next;
-    });
+    const field = editingBasicField;
+
+    if (field === "name") {
+      const v = (editBasicValue.name || "").trim();
+      if (!v) { showChartToast("이름을 입력해주세요"); return; }
+      const ok = await persistChartUpdate({ patient_name: v });
+      if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+      setPatient((p) => ({ ...p, name: v }));
+      cancelBasicEdit();
+      return;
+    }
+
+    if (field === "birthDate") {
+      const y = parseInt(editBasicValue.birthYear || "", 10);
+      const mRaw = editBasicValue.birthMonth || "";
+      const dRaw = editBasicValue.birthDay || "";
+      if (!Number.isFinite(y) || y < 1920 || y > new Date().getFullYear()) {
+        showChartToast("출생연도가 올바르지 않습니다 (1920~)");
+        return;
+      }
+      // 월/일 둘 다 빈 칸이면 birth_year 만 저장 (박소담 약사 A 결정 — 부분 입력 허용)
+      if (mRaw.trim() === "" && dRaw.trim() === "") {
+        const ok = await persistChartUpdate({ birth_year: y, birth_date: null });
+        if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+        setPatient((p) => ({ ...p, birthYear: y, birthDate: null }));
+        cancelBasicEdit();
+        return;
+      }
+      const m = parseInt(mRaw, 10);
+      const d = parseInt(dRaw, 10);
+      if (!Number.isFinite(m) || m < 1 || m > 12) {
+        showChartToast("월이 올바르지 않습니다 (1~12)");
+        return;
+      }
+      const maxDay = new Date(y, m, 0).getDate();
+      if (!Number.isFinite(d) || d < 1 || d > maxDay) {
+        showChartToast(`${y}년 ${m}월은 1~${maxDay}일입니다`);
+        return;
+      }
+      const synthesized = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      if (new Date(synthesized) > new Date()) {
+        showChartToast("미래 날짜는 입력할 수 없습니다");
+        return;
+      }
+      const ok = await persistChartUpdate({ birth_year: y, birth_date: synthesized });
+      if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+      setPatient((p) => ({ ...p, birthYear: y, birthDate: synthesized }));
+      cancelBasicEdit();
+      return;
+    }
+
+    if (field === "gender") {
+      const v = editBasicValue.gender;
+      if (!v) { cancelBasicEdit(); return; }
+      const ok = await persistChartUpdate({ gender: mapGenderToEn(v) });
+      if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+      setPatient((p) => ({ ...p, gender: v }));
+      cancelBasicEdit();
+      return;
+    }
+
+    if (field === "height") {
+      const h = parseInt(editBasicValue.height, 10);
+      if (!Number.isFinite(h) || h <= 0 || h >= 300) {
+        showChartToast("키가 올바르지 않습니다");
+        return;
+      }
+      const ok = await persistChartUpdate({ height_cm: h });
+      if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+      setPatient((p) => ({ ...p, height: h }));
+      cancelBasicEdit();
+      return;
+    }
+
+    if (field === "weight") {
+      const w = parseFloat(editBasicValue.weight);
+      if (!Number.isFinite(w) || w <= 0 || w >= 500) {
+        showChartToast("몸무게가 올바르지 않습니다");
+        return;
+      }
+      const today = todayIso();
+      const ok = await persistChartUpdate({ weight_kg: w, weight_recorded_at: today });
+      if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+      setPatient((p) => ({ ...p, weight: w, weightRecordedAt: today }));
+      cancelBasicEdit();
+      return;
+    }
+
+    if (field === "budget") {
+      const v = (editBasicValue.budget || "").trim();
+      if (!v) { cancelBasicEdit(); return; }
+      const ok = await persistChartUpdate({ budget: v });
+      if (!ok) { showChartToast("저장 실패. 다시 시도해주세요"); return; }
+      setPatient((p) => ({ ...p, budget: v }));
+      cancelBasicEdit();
+      return;
+    }
+
     cancelBasicEdit();
   };
-  const currentAge = new Date().getFullYear() - patient.birthYear;
+  const currentAge = calcAgeFromBirthDate(patient.birthDate, patient.birthYear);
 
   /* ── 약사 메모 (환자 전체) ── */
   const [editingPharmacistMemo, setEditingPharmacistMemo] = useState(false);
@@ -713,6 +892,177 @@ function ChartContent() {
   const { user: authUser } = useAuth();
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const isUuid = (s: string | null | undefined): s is string => !!s && UUID_RE.test(s);
+
+  /* ── pharmacist_charts SELECT/INSERT — 마운트 시 1회 ──
+   *  1) SELECT consultation_id 기준 (RLS 가 pharmacist_id 자동 필터)
+   *  2) 있으면 setChartRowId + setPatient 머지 종료
+   *  3) 없으면 consultations JOIN profiles + patient_profiles 로 초기값 만들어 INSERT
+   *  4) UNIQUE(pharmacist_id, consultation_id) 위반 (race) 발생 시 SELECT 한 번 더 시도
+   *  모든 에러: silent fail (console.error), Mock 폴백 유지. */
+  useEffect(() => {
+    if (!consultationId || !isUuid(consultationId)) return;
+    if (!authUser) return;
+    let cancelled = false;
+    const pharmacistId = authUser.id;
+
+    type ChartSelectRow = {
+      id: string;
+      patient_id: string | null;
+      patient_name: string;
+      birth_year: number | null;
+      birth_date: string | null;
+      gender: string | null;
+      height_cm: number | null;
+      weight_kg: number | null;
+      weight_recorded_at: string | null;
+      budget: string | null;
+      pharmacist_memo: string | null;
+      chart_type: "self" | "family" | "walkin";
+      family_relationship: string | null;
+    };
+
+    const applyRow = (row: ChartSelectRow) => {
+      setChartRowId(row.id);
+      setPatient((prev) => ({
+        ...prev,
+        id: row.patient_id ?? prev.id,
+        name: row.patient_name || prev.name,
+        birthYear: row.birth_year ?? prev.birthYear,
+        birthDate: row.birth_date,
+        gender: mapGenderToKo(row.gender) || prev.gender,
+        height: row.height_cm ?? prev.height,
+        weight: row.weight_kg ?? prev.weight,
+        weightRecordedAt: row.weight_recorded_at ?? prev.weightRecordedAt,
+        budget: row.budget ?? prev.budget,
+        pharmacistMemo: row.pharmacist_memo ?? prev.pharmacistMemo,
+      }));
+    };
+
+    const selectExisting = async (): Promise<ChartSelectRow | null> => {
+      const { data, error } = await supabase
+        .from("pharmacist_charts")
+        .select(
+          "id, patient_id, patient_name, birth_year, birth_date, gender, height_cm, weight_kg, weight_recorded_at, budget, pharmacist_memo, chart_type, family_relationship",
+        )
+        .eq("consultation_id", consultationId)
+        .order("created_at", { ascending: true })
+        .limit(1)
+        .maybeSingle<ChartSelectRow>();
+      if (error) {
+        console.error("[chart-sync] select failed:", error);
+        return null;
+      }
+      return data ?? null;
+    };
+
+    (async () => {
+      const existing = await selectExisting();
+      if (cancelled) return;
+      if (existing) {
+        applyRow(existing);
+        return;
+      }
+
+      // 신규 INSERT — 초기값을 consultations + patient_profiles 에서 수집
+      type ConsJoin = {
+        patient_id: string;
+        patient: { name: string | null } | null;
+      };
+      const consResp = await supabase
+        .from("consultations")
+        .select(
+          "patient_id, patient:profiles!consultations_patient_id_fkey(name)",
+        )
+        .eq("id", consultationId)
+        .maybeSingle<ConsJoin>();
+      if (cancelled) return;
+      if (consResp.error || !consResp.data) {
+        console.error("[chart-sync] consultation join failed:", consResp.error);
+        return;
+      }
+      const patientId = consResp.data.patient_id;
+      const patientName = consResp.data.patient?.name?.trim() || "환자";
+
+      type PpRow = {
+        birth_year: number | null;
+        birth_date: string | null;
+        gender: string | null;
+        height_cm: number | null;
+        weight_kg: number | null;
+        body_recorded_at: string | null;
+      };
+      const ppResp = await supabase
+        .from("patient_profiles")
+        .select("birth_year, birth_date, gender, height_cm, weight_kg, body_recorded_at")
+        .eq("id", patientId)
+        .maybeSingle<PpRow>();
+      if (cancelled) return;
+      if (ppResp.error) {
+        console.error("[chart-sync] patient_profiles fetch failed:", ppResp.error);
+      }
+      const pp = ppResp.data ?? null;
+
+      type ChartInsertPayload = {
+        pharmacist_id: string;
+        consultation_id: string;
+        patient_id: string;
+        patient_name: string;
+        chart_type: "self";
+        birth_year?: number | null;
+        birth_date?: string | null;
+        gender?: string | null;
+        height_cm?: number | null;
+        weight_kg?: number | null;
+        weight_recorded_at?: string | null;
+      };
+      const insertPayload: ChartInsertPayload = {
+        pharmacist_id: pharmacistId,
+        consultation_id: consultationId,
+        patient_id: patientId,
+        patient_name: patientName,
+        chart_type: "self",
+        birth_year: pp?.birth_year ?? null,
+        birth_date: pp?.birth_date ?? null,
+        gender: pp?.gender ?? null,
+        height_cm: pp?.height_cm ?? null,
+        weight_kg: pp?.weight_kg ?? null,
+        weight_recorded_at: pp?.body_recorded_at ? pp.body_recorded_at.slice(0, 10) : null,
+      };
+
+      const insResp = await (supabase
+        .from("pharmacist_charts") as unknown as {
+          insert: (p: ChartInsertPayload) => {
+            select: (cols: string) => {
+              maybeSingle: () => Promise<{
+                data: ChartSelectRow | null;
+                error: { message: string; code?: string } | null;
+              }>;
+            };
+          };
+        })
+        .insert(insertPayload)
+        .select(
+          "id, patient_id, patient_name, birth_year, birth_date, gender, height_cm, weight_kg, weight_recorded_at, budget, pharmacist_memo, chart_type, family_relationship",
+        )
+        .maybeSingle();
+      if (cancelled) return;
+      if (insResp.error) {
+        // UNIQUE(pharmacist_id, consultation_id) 위반 race — 다른 마운트가 먼저 INSERT 한 경우
+        if (insResp.error.code === "23505") {
+          const retry = await selectExisting();
+          if (cancelled) return;
+          if (retry) applyRow(retry);
+          return;
+        }
+        console.error("[chart-sync] insert failed:", insResp.error);
+        return;
+      }
+      if (insResp.data) applyRow(insResp.data);
+    })();
+
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consultationId, authUser?.id]);
 
   useEffect(() => {
     if (!consultationId || !isUuid(consultationId)) return; // mock 차트(c1 등)는 DB 로드 스킵
@@ -1107,6 +1457,32 @@ function ChartContent() {
           </div>
         )}
 
+        {/* 차트 동기화 토스트 — DB UPDATE 실패 / 검증 실패 시 약사 알림 */}
+        {chartToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              position: "fixed",
+              top: photoToast ? 120 : 70,
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 201,
+              fontSize: 14,
+              color: "#9A2C0F",
+              background: "#FCEBE4",
+              border: "1px solid #E8B49A",
+              padding: "10px 16px",
+              borderRadius: 10,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+              maxWidth: 360,
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}
+          >
+            {chartToast}
+          </div>
+        )}
+
         <div className="chart-container">
           {/* ── 1. 기본 정보 ── */}
           <div
@@ -1138,15 +1514,36 @@ function ChartContent() {
 
             {/* 정보 그리드 */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 15 }}>
-              <InfoCell label="생년월일" editing={editingBasicField === "birthYear"}
-                display={<span style={{ fontWeight: 600, color: COLOR.textDark }}>{patient.birthYear} ({currentAge}세)</span>}
-                editor={
-                  <input type="number" value={editBasicValue.birthYear || ""} autoFocus min={1920} max={new Date().getFullYear()}
-                    onChange={(e) => setEditBasicValue({ birthYear: e.target.value })}
-                    onKeyDown={(e) => { if (e.key === "Enter") saveBasicEdit(); if (e.key === "Escape") cancelBasicEdit(); }}
-                    style={{ width: 80, padding: "4px 8px", borderRadius: 6, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none" }} />
+              <InfoCell label="생년월일" editing={editingBasicField === "birthDate"}
+                display={
+                  <span style={{ fontWeight: 600, color: COLOR.textDark }}>
+                    {formatBirthDateForDisplay(patient.birthDate, patient.birthYear)}
+                    {currentAge !== null ? ` (${currentAge}세)` : ""}
+                  </span>
                 }
-                onEdit={() => startBasicEdit("birthYear")} onSave={saveBasicEdit} onCancel={cancelBasicEdit} />
+                editor={
+                  <>
+                    <input type="number" placeholder="년" autoFocus min={1920} max={new Date().getFullYear()}
+                      value={editBasicValue.birthYear || ""}
+                      onChange={(e) => setEditBasicValue((p) => ({ ...p, birthYear: e.target.value }))}
+                      onKeyDown={(e) => { if (e.key === "Enter") saveBasicEdit(); if (e.key === "Escape") cancelBasicEdit(); }}
+                      style={{ width: 70, padding: "4px 6px", borderRadius: 6, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none" }} />
+                    <span style={{ fontSize: 13, color: COLOR.textMid }}>년</span>
+                    <input type="number" placeholder="월" min={1} max={12}
+                      value={editBasicValue.birthMonth || ""}
+                      onChange={(e) => setEditBasicValue((p) => ({ ...p, birthMonth: e.target.value }))}
+                      onKeyDown={(e) => { if (e.key === "Enter") saveBasicEdit(); if (e.key === "Escape") cancelBasicEdit(); }}
+                      style={{ width: 50, padding: "4px 6px", borderRadius: 6, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none" }} />
+                    <span style={{ fontSize: 13, color: COLOR.textMid }}>월</span>
+                    <input type="number" placeholder="일" min={1} max={31}
+                      value={editBasicValue.birthDay || ""}
+                      onChange={(e) => setEditBasicValue((p) => ({ ...p, birthDay: e.target.value }))}
+                      onKeyDown={(e) => { if (e.key === "Enter") saveBasicEdit(); if (e.key === "Escape") cancelBasicEdit(); }}
+                      style={{ width: 50, padding: "4px 6px", borderRadius: 6, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none" }} />
+                    <span style={{ fontSize: 13, color: COLOR.textMid }}>일</span>
+                  </>
+                }
+                onEdit={() => startBasicEdit("birthDate")} onSave={saveBasicEdit} onCancel={cancelBasicEdit} />
 
               <InfoCell label="성별" editing={editingBasicField === "gender"}
                 display={<span style={{ fontWeight: 600, color: COLOR.textDark }}>{patient.gender}</span>}
@@ -1948,7 +2345,7 @@ function ChartContent() {
               }}>
                 <div style={{ fontSize: 15, fontWeight: 700, color: COLOR.sageDeep }}>{patient.name}</div>
                 <div style={{ fontSize: 13, color: COLOR.textMid, marginTop: 2 }}>
-                  {patient.gender} · {currentAge}세 · 예산 {patient.budget}
+                  {patient.gender} · {currentAge !== null ? `${currentAge}세` : "—세"} · 예산 {patient.budget}
                 </div>
               </div>
 
