@@ -103,6 +103,10 @@ function formatSystemMessageContent(content: string, role: "patient" | "pharmaci
   if (content === "[CONSULT_ENDED_BY_PATIENT]") {
     return role === "patient" ? "상담을 종료했습니다" : "환자님이 상담을 종료했습니다";
   }
+  // 사이클 6 — 약사 측 복용 가이드 전송 토큰 (ChartClient confirmSendGuide 에서 INSERT).
+  if (content === "[DOSAGE_GUIDE_SENT]") {
+    return role === "patient" ? "약사님이 복용 가이드를 보냈어요" : "복용 가이드를 보냈습니다";
+  }
   if (content.startsWith("[시스템] ")) return content.replace("[시스템] ", "");
   return content;
 }

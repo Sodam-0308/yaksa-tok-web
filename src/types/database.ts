@@ -16,6 +16,16 @@ export interface SupplementItem {
   dosage: string;
   timing: string;
   memo?: string;
+  /** 소분 조제약(약포지) vs 통약(보틀). 레거시 row 는 필드 없음 → "bottle" 간주. */
+  dispense_type?: "bottle" | "compounded";
+  /** "아침"|"점심"|"저녁"|"취침 전" — 소분약 체크박스 결과 + 통약 timing 파싱 결과 병기. */
+  time_slots?: string[];
+  /** 영양제별 복용 일수. 가이드 row 의 dosage_days/dosage_end_date 는 max(days) 기준 derive. */
+  days?: number | null;
+  /** 하루 복용 횟수 (최소 1). 레거시 row 에 필드 없으면 1 간주. */
+  daily_count?: number | null;
+  /** "기타" 슬롯 선택 시 짧은 설명 (예: "오전 11시"). 없으면 빈 문자열. */
+  etc_note?: string;
 }
 
 export interface ScoreSnapshot {
@@ -113,6 +123,42 @@ export type PatientProfileInsert = Omit<PatientProfileRow, "case_study_consent">
   case_study_consent?: boolean;
 };
 export type PatientProfileUpdate = Partial<Omit<PatientProfileRow, "id">>;
+
+/* ══════════════════════════════════════════
+   patient_supplements
+   ══════════════════════════════════════════ */
+
+export interface PatientSupplementRow {
+  id: UUID;
+  patient_id: UUID;
+  name: string;
+  time_slots: string[];
+  /** 하루 복용 횟수 (>=1). DB 기본값 1. 마이페이지 하트 개수의 기준. */
+  daily_count: number;
+  source: "manual" | "dosage_guide";
+  source_dosage_guide_id: UUID | null;
+  /** 복용 시작일 (YYYY-MM-DD). DB 기본값 current_date. */
+  start_date: string | null;
+  /** 복용 예정 일수. 가이드에서 가져온 값. 환자 직접 등록은 null. */
+  days: number | null;
+  created_at: ISOTimestamp | null;
+  updated_at: ISOTimestamp | null;
+}
+export type PatientSupplementInsert = Omit<
+  PatientSupplementRow, "id" | "created_at" | "updated_at" | "source" | "daily_count" | "start_date" | "days"
+> & {
+  id?: UUID;
+  source?: "manual" | "dosage_guide";
+  /** DB 기본값 1 — 생략 가능. */
+  daily_count?: number;
+  /** DB 기본값 current_date — 생략 가능. */
+  start_date?: string | null;
+  /** 복용 예정 일수. 생략 가능(NULL). */
+  days?: number | null;
+  created_at?: ISOTimestamp;
+  updated_at?: ISOTimestamp;
+};
+export type PatientSupplementUpdate = Partial<Omit<PatientSupplementRow, "id" | "patient_id">>;
 
 /* ══════════════════════════════════════════
    pharmacist_charts
@@ -663,7 +709,10 @@ export interface MedicationCheckRow {
   patient_id: UUID;
   dosage_guide_id: UUID | null;
   supplement_name: string;
-  time_slot: string;             // 아침 / 점심 / 저녁 / 취침 전
+  /** 보조 라벨 — 슬롯 라벨이 있을 때만 채움. 슬롯이 daily_count보다 적으면 null. */
+  time_slot: string | null;
+  /** 1-based 복용 회차 인덱스. unique key (patient_id, supplement_name, check_date, dose_index). */
+  dose_index: number;
   check_date: ISODate;
   is_checked: boolean;
   updated_at: ISOTimestamp;
@@ -671,9 +720,10 @@ export interface MedicationCheckRow {
 export type MedicationCheckInsert = Partial<MedicationCheckRow> & {
   patient_id: UUID;
   supplement_name: string;
-  time_slot: string;
+  dose_index: number;
   check_date: ISODate;
   is_checked: boolean;
+  time_slot?: string | null;
 };
 export type MedicationCheckUpdate = Partial<Omit<MedicationCheckRow, "id" | "patient_id">>;
 
@@ -767,6 +817,11 @@ export interface Database {
         Row: PatientProfileRow;
         Insert: PatientProfileInsert;
         Update: PatientProfileUpdate;
+      };
+      patient_supplements: {
+        Row: PatientSupplementRow;
+        Insert: PatientSupplementInsert;
+        Update: PatientSupplementUpdate;
       };
       pharmacist_profiles: {
         Row: PharmacistProfileRow;

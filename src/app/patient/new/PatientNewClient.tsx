@@ -287,7 +287,7 @@ function PatientNewContent() {
   // 1. 기본 정보 (모두 선택)
   const [name, setName] = useState("");
   const [birthYear, setBirthYear] = useState("");
-  const [gender, setGender] = useState<"male" | "female" | "">("");
+  const [gender, setGender] = useState<"male" | "female" | "other" | "">("");
   const [phone, setPhone] = useState("");
 
   // 2. 증상
@@ -427,7 +427,7 @@ function PatientNewContent() {
 
             <label style={labelStyle}>성별</label>
             <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-              {(["male", "female"] as const).map((g) => (
+              {(["male", "female", "other"] as const).map((g) => (
                 <button
                   key={g} type="button"
                   onClick={() => setGender(gender === g ? "" : g)}
@@ -439,7 +439,7 @@ function PatientNewContent() {
                     cursor: "pointer", minHeight: 48,
                   }}
                 >
-                  {g === "male" ? "남성" : "여성"}
+                  {g === "male" ? "남성" : g === "female" ? "여성" : "기타"}
                 </button>
               ))}
             </div>

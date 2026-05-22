@@ -171,7 +171,34 @@ interface ProblemItem {
   endDate?: string;
 }
 
-interface SupplementItem { name: string; dosage: string; timing: string; }
+interface SupplementItem {
+  name: string;
+  dosage: string;
+  timing: string;
+  /** "bottle"(통약) vs "compounded"(소분 조제약). 레거시는 필드 없음 → bottle. */
+  dispense_type?: "bottle" | "compounded";
+  /** 5칩 체크박스 결과(아침/점심/저녁/취침 전/기타). 통약·소분 공통. */
+  time_slots?: string[];
+  /** 영양제별 복용 일수. 가이드 전체 종료일은 max(days) 기준 derive. */
+  days?: number | null;
+  /** 하루 복용 횟수. null = 미입력(슬롯 개수 자동), >0 = 약사 직접 입력. */
+  daily_count?: number | null;
+  /** "기타" 슬롯 선택 시 짧은 설명. */
+  etc_note?: string;
+  /** 영양제별 메모 (환자에게 표시). */
+  memo?: string;
+  /** 소분 조제약일 때 "약포지에 표시된 대로 복용" 안내를 환자에게 보낼지 여부. 기본 true. */
+  package_note?: boolean;
+}
+const EMPTY_SUPP: SupplementItem = {
+  name: "", dosage: "", timing: "",
+  dispense_type: "bottle", time_slots: [], days: null, daily_count: null,
+  etc_note: "", memo: "", package_note: true,
+};
+/** 소분 조제약 전환 시 빈 필드에 채워주는 기본값.
+ *  통약 전환 시 이 값과 정확히 일치하면 자동값으로 간주해 비움. 매직스트링 방지. */
+const COMPOUND_DEFAULT_NAME = "포장된 조제약";
+const COMPOUND_DEFAULT_DOSAGE = "1포";
 
 interface VisitRecord {
   id: string;
@@ -462,6 +489,8 @@ function calcAgeFromBirthDate(birthDate: string | null, birthYear: number | null
   if (birthYear) return new Date().getFullYear() - birthYear;
   return null;
 }
+type TimeSlotKr = "아침" | "점심" | "저녁" | "취침 전" | "기타";
+
 /** 표시용 포맷. birth_date 있으면 "1988년 6월 15일", birth_year만 있으면 "1988년 __월 __일", 둘 다 없으면 "미입력". */
 function formatBirthDateForDisplay(birthDate: string | null, birthYear: number | null): string {
   if (birthDate) {
@@ -588,6 +617,14 @@ function ChartContent() {
     setChartToast(msg);
     if (chartToastTimerRef.current) clearTimeout(chartToastTimerRef.current);
     chartToastTimerRef.current = setTimeout(() => setChartToast(null), 3000);
+  };
+  /* 차트 성공 토스트 — chartToast(살구색 에러 톤)와 시각적 분리 위해 sage-pale 톤 별도 운용. */
+  const [chartSuccessToast, setChartSuccessToast] = useState<string | null>(null);
+  const chartSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showChartSuccess = (msg: string) => {
+    setChartSuccessToast(msg);
+    if (chartSuccessTimerRef.current) clearTimeout(chartSuccessTimerRef.current);
+    chartSuccessTimerRef.current = setTimeout(() => setChartSuccessToast(null), 3000);
   };
 
   const startBasicEdit = (field: string) => {
@@ -1064,6 +1101,40 @@ function ChartContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consultationId, authUser?.id]);
 
+  /* ── dosage_guides 발송 이력 SELECT — 본인 약사가 같은 consultation 에 보낸 모든 가이드 ──
+   *  차수 모델 X / 누적 모델. 새로고침 후에도 발송 이력이 사이드 패널에 자동 복원됨. */
+  useEffect(() => {
+    if (!consultationId || !isUuid(consultationId) || !authUser?.id) {
+      setGuideHistory([]);
+      setGuideHistoryLoaded(true);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("dosage_guides")
+        .select(
+          "id, supplements, dosage_days, dosage_end_date, custom_guide, dosage_status, sent_at, created_at",
+        )
+        .eq("consultation_id", consultationId)
+        .eq("pharmacist_id", authUser.id)
+        .order("sent_at", { ascending: false, nullsFirst: false })
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (error) {
+        console.error("[chart] dosage_guides history load failed:", error);
+        showChartToast("발송 이력을 불러오지 못했어요.");
+        setGuideHistoryLoaded(true);
+        return;
+      }
+      const rows = (data ?? []) as unknown as GuideHistoryRow[];
+      setGuideHistory(rows);
+      setGuideHistoryLoaded(true);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consultationId, authUser?.id]);
+
   useEffect(() => {
     if (!consultationId || !isUuid(consultationId)) return; // mock 차트(c1 등)는 DB 로드 스킵
     if (!authUser) return;
@@ -1244,38 +1315,296 @@ function ChartContent() {
 
   /* ── 복용 가이드 사이드 패널 ── */
   const [showGuidePanel, setShowGuidePanel] = useState(false);
-  const [guideSupps, setGuideSupps] = useState<SupplementItem[]>([{ name: "", dosage: "", timing: "" }]);
+  const [guideSupps, setGuideSupps] = useState<SupplementItem[]>([{ ...EMPTY_SUPP }]);
   const [guideMemo, setGuideMemo] = useState("");
-  const [guideDosageDays, setGuideDosageDays] = useState<number | undefined>(undefined);
-  const [guideSent, setGuideSent] = useState(false);
   const [sentBadgeVisible, setSentBadgeVisible] = useState(false);
+  /* 가이드 전송 성공 박스 — 사이드 패널 내부 중앙에 떠 있는 박스 팝업. 3.5초 자동 사라짐.
+   *  확인 팝업(guideShowConfirm)과 동일한 absolute inset:0 오버레이 패턴. */
+  const [guideSuccessMsg, setGuideSuccessMsg] = useState<string | null>(null);
+  const guideSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showGuideSuccess = (msg: string) => {
+    setGuideSuccessMsg(msg);
+    if (guideSuccessTimerRef.current) clearTimeout(guideSuccessTimerRef.current);
+    guideSuccessTimerRef.current = setTimeout(() => setGuideSuccessMsg(null), 3500);
+  };
+  const clearGuideSuccess = () => {
+    if (guideSuccessTimerRef.current) clearTimeout(guideSuccessTimerRef.current);
+    guideSuccessTimerRef.current = null;
+    setGuideSuccessMsg(null);
+  };
+  /* 발송 이력 — 같은 consultation + 본인 약사 가 보낸 dosage_guides 전체 (active/completed/stopped).
+   *  차수 없이 누적 모델. 새 가이드는 기존 active 를 종료시키지 않음. */
+  type GuideHistoryRow = {
+    id: string;
+    supplements: unknown;
+    dosage_days: number | null;
+    dosage_end_date: string | null;
+    custom_guide: string | null;
+    dosage_status: "active" | "completed" | "stopped";
+    sent_at: string | null;
+    created_at: string;
+  };
+  const [guideHistory, setGuideHistory] = useState<GuideHistoryRow[]>([]);
+  const [guideHistoryLoaded, setGuideHistoryLoaded] = useState(false);
+  const [expandedHistoryIds, setExpandedHistoryIds] = useState<Set<string>>(new Set());
+  const toggleHistoryExpanded = (id: string) =>
+    setExpandedHistoryIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const [guideShowConfirm, setGuideShowConfirm] = useState(false);
   const copyGuideFromVisit = () => {
     const latest = sortedVisits[0];
     if (latest && latest.products.length > 0) {
-      setGuideSupps(latest.products.map((p) => ({ ...p })));
-      if (latest.durationDays) setGuideDosageDays(latest.durationDays);
+      // 레거시 visit_records.purchased_supplements 는 dispense_type/days/time_slots 가 없을 수 있음
+      // → 통약 기본값 + 방문 기록의 durationDays 가 있으면 각 영양제 days 로 동일 적용.
+      const defaultDays = latest.durationDays ?? null;
+      setGuideSupps(latest.products.map((p) => ({
+        name: p.name,
+        dosage: p.dosage,
+        timing: p.timing,
+        dispense_type: p.dispense_type ?? "bottle",
+        time_slots: Array.isArray(p.time_slots) ? p.time_slots : [],
+        days: p.days ?? defaultDays,
+        daily_count: p.daily_count && p.daily_count > 0 ? p.daily_count : null,
+        etc_note: typeof p.etc_note === "string" ? p.etc_note : "",
+        memo: typeof p.memo === "string" ? p.memo : "",
+        package_note: typeof p.package_note === "boolean" ? p.package_note : true,
+      })));
     }
   };
   const clearGuide = () => {
-    setGuideSupps([{ name: "", dosage: "", timing: "" }]);
+    setGuideSupps([{ ...EMPTY_SUPP }]);
     setGuideMemo("");
-    setGuideDosageDays(undefined);
   };
-  const confirmSendGuide = () => {
+  /* ── 복용 가이드 전송 ──
+   *  1) UUID 가드 — mock 차트(/chart/1 등)는 기존 시뮬레이션 동작 유지
+   *  2) dosage_guides INSERT — supplements jsonb 는 마이페이지 약속 형식
+   *     [{ name, time_slots, dosage, timing, memo? }] 으로 옵션 B 병기 저장
+   *  3) [DOSAGE_GUIDE_SENT] 시스템 메시지 fire-and-forget — 실패해도 본 흐름 진행
+   *  4) UI 후처리 (sentBadge, 성공 토스트) — 종료 토큰 흐름과 일관 */
+  const confirmSendGuide = async () => {
+    const validSupps = guideSupps.filter((s) => s.name.trim());
+    if (validSupps.length === 0) {
+      showChartToast("영양제를 1개 이상 입력해주세요");
+      return;
+    }
+
+    // 1) mock 모드 가드
+    if (!isUuid(consultationId) || !isUuid(patient.id) || !authUser?.id) {
+      setGuideShowConfirm(false);
+      // 입력 폼 clear (다음 발송 준비)
+      setGuideSupps([{ ...EMPTY_SUPP }]);
+      setGuideMemo("");
+      setSentBadgeVisible(true);
+      setTimeout(() => setSentBadgeVisible(false), 3500);
+      const mockPatientName = patient.name?.trim() || "환자";
+      showGuideSuccess(`(개발 모드) ${mockPatientName}님 가이드 전송 시뮬레이션`);
+      return;
+    }
+
+    // 2) supplements jsonb — 통약/소분 입력 필드 동일. dosage/timing 모두 양쪽 보존.
+    //    timing = "식후 30분" 등 부가 설명 전용 (슬롯과 무관, 자유텍스트 파싱 폐기)
+    //    daily_count: 직접 입력값 우선, 미입력이면 슬롯 개수, 그것도 0이면 1 폴백
+    //    etc_note: "기타" 슬롯 선택 시에만 저장 / memo: 영양제별 환자 안내 메모
+    const supplementsJson = validSupps.map((s) => {
+      const dosageText = (s.dosage ?? "").trim();
+      const timingText = (s.timing ?? "").trim();
+      const slots = Array.isArray(s.time_slots) ? s.time_slots : [];
+      const hasEtc = slots.includes("기타");
+      const dailyCount = s.daily_count && s.daily_count > 0
+        ? s.daily_count
+        : (slots.length > 0 ? slots.length : 1);
+      return {
+        name: s.name.trim(),
+        dispense_type: (s.dispense_type ?? "bottle") as "bottle" | "compounded",
+        time_slots: slots,
+        dosage: dosageText,
+        timing: timingText,
+        days: s.days ?? null,
+        daily_count: dailyCount,
+        etc_note: hasEtc ? (s.etc_note ?? "").trim() : "",
+        memo: (s.memo ?? "").trim(),
+        package_note: s.package_note ?? true,
+      };
+    });
+
+    // 3) 가이드 전체 종료일 = max(영양제별 days) 기준. guideEndDate 가 이미 계산되어 있음.
+    const endDateIso = guideEndDate ? guideEndDate.replaceAll(".", "-") : null;
+
     setGuideShowConfirm(false);
-    setGuideSent(true);
+
+    // 4) dosage_guides INSERT
+    type DosageGuideInsertPayload = {
+      consultation_id: string;
+      round_id: string | null;
+      pharmacist_id: string;
+      patient_id: string;
+      supplements: typeof supplementsJson;
+      dosage_days: number | null;
+      dosage_end_date: string | null;
+      custom_guide: string | null;
+      dosage_status: "active";
+      sent_at: string;
+    };
+    const guidePayload: DosageGuideInsertPayload = {
+      consultation_id: consultationId,
+      round_id: null,
+      pharmacist_id: authUser.id,
+      patient_id: patient.id,
+      supplements: supplementsJson,
+      dosage_days: guideMaxDays > 0 ? guideMaxDays : null,
+      dosage_end_date: endDateIso,
+      custom_guide: guideMemo.trim() || null,
+      dosage_status: "active",
+      sent_at: new Date().toISOString(),
+    };
+    const guideResp = await (supabase
+      .from("dosage_guides") as unknown as {
+        insert: (p: DosageGuideInsertPayload) => {
+          select: () => {
+            single: () => Promise<{
+              data: { id: string } | null;
+              error: { message: string; code?: string } | null;
+            }>;
+          };
+        };
+      })
+      .insert(guidePayload)
+      .select()
+      .single();
+
+    if (guideResp.error || !guideResp.data) {
+      console.error("[chart] dosage_guides insert failed:", guideResp.error);
+      showChartToast("가이드 전송에 실패했어요. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+
+    // 5) 시스템 메시지 fire-and-forget — INSERT 실패해도 본 흐름은 진행
+    type SystemMsgPayload = {
+      consultation_id: string;
+      sender_id: string;
+      content: string;
+      message_type: "system";
+      round_id: string | null;
+      is_read: boolean;
+      metadata: { dosage_guide_id: string };
+    };
+    const sysPayload: SystemMsgPayload = {
+      consultation_id: consultationId,
+      sender_id: authUser.id,
+      content: "[DOSAGE_GUIDE_SENT]",
+      message_type: "system",
+      round_id: null,
+      is_read: true,
+      metadata: { dosage_guide_id: guideResp.data.id },
+    };
+    void (supabase
+      .from("messages") as unknown as {
+        insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(sysPayload)
+      .then(({ error }) => {
+        if (error) {
+          console.error("[chart] dosage_guide system message insert failed (non-fatal):", error);
+        }
+      });
+
+    // 6) UI 후처리 — 누적 모델: history 즉시 추가 + 입력 폼 clear + 다음 발송 즉시 가능
+    const newRow: GuideHistoryRow = {
+      id: guideResp.data.id,
+      supplements: supplementsJson,
+      dosage_days: guidePayload.dosage_days,
+      dosage_end_date: guidePayload.dosage_end_date,
+      custom_guide: guidePayload.custom_guide,
+      dosage_status: guidePayload.dosage_status,
+      sent_at: guidePayload.sent_at,
+      created_at: guidePayload.sent_at,
+    };
+    setGuideHistory((prev) => [newRow, ...prev]);
+    setGuideSupps([{ ...EMPTY_SUPP }]);
+    setGuideMemo("");
     setSentBadgeVisible(true);
     setTimeout(() => setSentBadgeVisible(false), 3500);
+    const sentPatientName = patient.name?.trim() || "환자";
+    showGuideSuccess(`복용 가이드를 ${sentPatientName}님께 보냈어요`);
   };
-  const addGuideSupp = () => setGuideSupps((p) => [...p, { name: "", dosage: "", timing: "" }]);
-  const updateGuideSupp = (i: number, f: keyof SupplementItem, v: string) =>
+  const addGuideSupp = () => setGuideSupps((p) => [...p, { ...EMPTY_SUPP }]);
+  /** 영양제 행의 텍스트 필드(name/dosage/timing) 갱신. dispense_type/time_slots/days 는 전용 헬퍼 사용. */
+  const updateGuideSupp = (i: number, f: "name" | "dosage" | "timing", v: string) =>
     setGuideSupps((p) => p.map((s, idx) => (idx === i ? { ...s, [f]: v } : s)));
+  /** 통약(bottle) ↔ 소분(compounded) 토글. 입력 필드는 양쪽 동일.
+   *  · bottle → compounded: 빈 name/dosage 에 기본값 채움
+   *  · compounded → bottle: 기본값 그대로 남아있는 경우만 비움 (약사가 수정한 값은 보존) */
+  const setGuideSuppDispense = (i: number, dispense: "bottle" | "compounded") =>
+    setGuideSupps((p) => p.map((s, idx) => {
+      if (idx !== i) return s;
+      const next: SupplementItem = { ...s, dispense_type: dispense };
+      if (dispense === "compounded") {
+        if (!s.name.trim()) next.name = COMPOUND_DEFAULT_NAME;
+        if (!s.dosage.trim()) next.dosage = COMPOUND_DEFAULT_DOSAGE;
+      } else {
+        // 소분 → 통약 전환: 자동 채움 값이 그대로면 비움
+        if (s.name === COMPOUND_DEFAULT_NAME) next.name = "";
+        if (s.dosage === COMPOUND_DEFAULT_DOSAGE) next.dosage = "";
+      }
+      return next;
+    }));
+  /** 5칩 슬롯 토글 (통약·소분 공통). 토글 직후 daily_count 를 슬롯 개수로 자동 동기화.
+   *  약사가 daily_count 를 직접 수정한 뒤에도 칩을 누르면 칩 개수로 덮어쓰는 게 의도된 동작.
+   *  슬롯 0개가 되면 daily_count 도 null 로 (placeholder 1 노출). */
+  const toggleGuideSuppSlot = (i: number, slot: TimeSlotKr) =>
+    setGuideSupps((p) => p.map((s, idx) => {
+      if (idx !== i) return s;
+      const prev = Array.isArray(s.time_slots) ? s.time_slots : [];
+      const has = prev.includes(slot);
+      const next = has ? prev.filter((x) => x !== slot) : [...prev, slot];
+      const nextDailyCount = next.length > 0 ? next.length : null;
+      // "기타" 해제 시 etc_note 도 초기화
+      const nextEtcNote = next.includes("기타") ? (s.etc_note ?? "") : "";
+      return { ...s, time_slots: next, daily_count: nextDailyCount, etc_note: nextEtcNote };
+    }));
+  /** 영양제별 일수 갱신. 빈 문자열/잘못된 값은 null 로. */
+  const setGuideSuppDays = (i: number, raw: string) =>
+    setGuideSupps((p) => p.map((s, idx) => {
+      if (idx !== i) return s;
+      const v = parseInt(raw, 10);
+      return { ...s, days: Number.isFinite(v) && v > 0 ? v : null };
+    }));
+  /** 영양제별 하루 복용 횟수 갱신. 빈 칸/잘못된 값은 null (placeholder 1 표시). */
+  const setGuideSuppDailyCount = (i: number, raw: string) =>
+    setGuideSupps((p) => p.map((s, idx) => {
+      if (idx !== i) return s;
+      const trimmed = raw.trim();
+      if (trimmed === "") return { ...s, daily_count: null };
+      const v = parseInt(trimmed, 10);
+      return { ...s, daily_count: Number.isFinite(v) && v > 0 ? v : null };
+    }));
+  /** "기타" 슬롯 부가 메모 (예: "오전 11시"). */
+  const setGuideSuppEtcNote = (i: number, raw: string) =>
+    setGuideSupps((p) => p.map((s, idx) => (idx === i ? { ...s, etc_note: raw } : s)));
+  /** 영양제별 메모 (환자에게 표시). 최대 200자. */
+  const setGuideSuppMemo = (i: number, raw: string) =>
+    setGuideSupps((p) => p.map((s, idx) => {
+      if (idx !== i) return s;
+      const truncated = raw.length > 200 ? raw.slice(0, 200) : raw;
+      return { ...s, memo: truncated };
+    }));
+  /** 소분 조제약 "약포지에 표시된 대로 복용 안내 보내기" 체크박스 토글. */
+  const setGuideSuppPackageNote = (i: number, checked: boolean) =>
+    setGuideSupps((p) => p.map((s, idx) => (idx === i ? { ...s, package_note: checked } : s)));
   const removeGuideSupp = (i: number) => setGuideSupps((p) => p.filter((_, idx) => idx !== i));
+  /** 가이드 전체 종료일 = max(영양제별 days) 기준 자동 계산. 0/null 만 있으면 null. */
+  const guideMaxDays = (() => {
+    const ns = guideSupps.map((s) => s.days ?? 0).filter((d) => d > 0);
+    return ns.length === 0 ? 0 : Math.max(...ns);
+  })();
   const guideEndDate = (() => {
-    if (!guideDosageDays || guideDosageDays <= 0) return null;
+    if (guideMaxDays <= 0) return null;
     const end = new Date();
-    end.setDate(end.getDate() + guideDosageDays);
+    end.setDate(end.getDate() + guideMaxDays);
     return `${end.getFullYear()}.${String(end.getMonth() + 1).padStart(2, "0")}.${String(end.getDate()).padStart(2, "0")}`;
   })();
   const canSendGuide = guideSupps.some((s) => s.name.trim()) || guideMemo.trim().length > 0;
@@ -1286,11 +1615,15 @@ function ChartContent() {
 
   const handleChatToggle = () => {
     setShowGuidePanel(false);
+    clearGuideSuccess();
     setShowChatPanel((v) => !v);
   };
   const handleGuideToggle = () => {
     setShowChatPanel(false);
-    setShowGuidePanel((v) => !v);
+    setShowGuidePanel((v) => {
+      if (v) clearGuideSuccess(); // 닫기 전환일 때만 정리
+      return !v;
+    });
   };
 
   /* 사이드 패널 — 오버레이 모드(< 780px)일 때만 body 스크롤 잠금 */
@@ -1483,6 +1816,36 @@ function ChartContent() {
           </div>
         )}
 
+        {/* 차트 성공 토스트 — sage-pale 톤. 다른 토스트와 동시 표시 시 자동 오프셋. */}
+        {chartSuccessToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              position: "fixed",
+              top: (photoToast && chartToast)
+                ? 170
+                : (photoToast || chartToast)
+                  ? 120
+                  : 70,
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 202,
+              fontSize: 14,
+              color: COLOR.textDark,
+              background: COLOR.sagePale,
+              border: `1px solid ${COLOR.sageLight}`,
+              padding: "10px 16px",
+              borderRadius: 10,
+              boxShadow: "0 4px 12px rgba(74,99,85,0.10)",
+              maxWidth: 360,
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}
+          >
+            {chartSuccessToast}
+          </div>
+        )}
+
         <div className="chart-container">
           {/* ── 1. 기본 정보 ── */}
           <div
@@ -1553,6 +1916,7 @@ function ChartContent() {
                     style={{ padding: "4px 8px", borderRadius: 6, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none" }}>
                     <option value="여성">여성</option>
                     <option value="남성">남성</option>
+                    <option value="기타">기타</option>
                   </select>
                 }
                 onEdit={() => startBasicEdit("gender")} onSave={saveBasicEdit} onCancel={cancelBasicEdit} />
@@ -2317,7 +2681,7 @@ function ChartContent() {
           <>
             <div
               className="chart-guide-backdrop"
-              onClick={() => setShowGuidePanel(false)}
+              onClick={() => { setShowGuidePanel(false); clearGuideSuccess(); }}
               aria-hidden="true"
             />
           <div className="chart-guide-panel">
@@ -2330,7 +2694,7 @@ function ChartContent() {
                   </span>
                 )}
               </div>
-              <button type="button" onClick={() => setShowGuidePanel(false)} aria-label="닫기"
+              <button type="button" onClick={() => { setShowGuidePanel(false); clearGuideSuccess(); }} aria-label="닫기"
                 style={{ width: 40, height: 40, minWidth: 40, minHeight: 40, background: COLOR.white, border: `1px solid ${COLOR.border}`, borderRadius: 10, cursor: "pointer", color: COLOR.textDark, display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 1, fontSize: 18, fontWeight: 600, flexShrink: 0 }}>
                 ✕
               </button>
@@ -2347,6 +2711,209 @@ function ChartContent() {
                 <div style={{ fontSize: 13, color: COLOR.textMid, marginTop: 2 }}>
                   {patient.gender} · {currentAge !== null ? `${currentAge}세` : "—세"} · 예산 {patient.budget}
                 </div>
+              </div>
+
+              {/* ── 발송 이력 섹션 (누적 모델) ──
+               *   guideHistory: 같은 consultation + 본인 약사 발송분 전체. 차수 없음. */}
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: COLOR.sageDeep }}>
+                    {guideHistory.length > 0 ? `발송 이력 ${guideHistory.length}건` : "발송 이력"}
+                  </div>
+                </div>
+
+                {!guideHistoryLoaded ? (
+                  <div style={{ fontSize: 13, color: COLOR.textMid, padding: "8px 0" }}>불러오는 중...</div>
+                ) : guideHistory.length === 0 ? (
+                  <div style={{
+                    fontSize: 13, color: COLOR.textMid,
+                    padding: "12px 14px", borderRadius: 10,
+                    background: COLOR.sageBg, border: `1px dashed ${COLOR.sageLight}`,
+                  }}>
+                    아직 발송한 가이드가 없어요
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {guideHistory.map((g) => {
+                      const isOpen = expandedHistoryIds.has(g.id);
+                      const isoSrc = g.sent_at || g.created_at;
+                      const sentDate = (() => {
+                        if (!isoSrc) return "";
+                        const d = new Date(isoSrc);
+                        return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+                      })();
+                      type HistorySupp = { name?: unknown; time_slots?: unknown; dosage?: unknown; timing?: unknown; dispense_type?: unknown; days?: unknown; daily_count?: unknown; etc_note?: unknown; memo?: unknown };
+                      const supps: HistorySupp[] = Array.isArray(g.supplements) ? (g.supplements as HistorySupp[]) : [];
+                      const suppNames = supps
+                        .map((s) => (typeof s?.name === "string" ? s.name : ""))
+                        .filter((n): n is string => !!n);
+                      const summary = (() => {
+                        if (suppNames.length === 0) return "영양제 0건";
+                        if (suppNames.length <= 2) return suppNames.join(", ");
+                        return `${suppNames.slice(0, 2).join(", ")} 외 ${suppNames.length - 2}건`;
+                      })();
+                      const statusLabel =
+                        g.dosage_status === "active" ? "복용 중"
+                        : g.dosage_status === "completed" ? "복용 완료"
+                        : "중단";
+                      const statusBg = g.dosage_status === "active" ? COLOR.sageDeep : "#9AA39E";
+                      return (
+                        <div key={g.id} style={{
+                          borderRadius: 10,
+                          border: `1px solid ${COLOR.sageLight}`,
+                          background: COLOR.sagePale,
+                          overflow: "hidden",
+                        }}>
+                          <button
+                            type="button"
+                            onClick={() => toggleHistoryExpanded(g.id)}
+                            style={{
+                              width: "100%", padding: "10px 12px",
+                              display: "flex", alignItems: "center", justifyContent: "space-between",
+                              gap: 8, flexWrap: "wrap",
+                              background: "transparent", border: "none", cursor: "pointer",
+                              textAlign: "left", fontFamily: "'Noto Sans KR', sans-serif",
+                            }}
+                          >
+                            <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                <span style={{ fontSize: 13, fontWeight: 700, color: COLOR.textDark }}>{sentDate}</span>
+                                <span style={{
+                                  padding: "1px 8px", borderRadius: 100,
+                                  fontSize: 11, fontWeight: 700,
+                                  background: statusBg, color: COLOR.white,
+                                }}>
+                                  {statusLabel}
+                                </span>
+                                {g.dosage_days ? (
+                                  <span style={{ fontSize: 12, color: COLOR.textMid }}>{g.dosage_days}일분</span>
+                                ) : null}
+                                {g.dosage_end_date ? (
+                                  <span style={{ fontSize: 12, color: COLOR.textMid }}>~{g.dosage_end_date.replaceAll("-", ".")}</span>
+                                ) : null}
+                              </div>
+                              <div style={{ fontSize: 13, color: COLOR.textMid }}>
+                                {summary}
+                              </div>
+                            </div>
+                            <span aria-hidden style={{
+                              fontSize: 14, color: COLOR.sageMid, flexShrink: 0,
+                              transform: isOpen ? "rotate(180deg)" : "rotate(0deg)",
+                              transition: "transform 0.2s",
+                            }}>▼</span>
+                          </button>
+                          {isOpen && (
+                            <div style={{
+                              padding: "0 12px 12px",
+                              borderTop: `1px solid ${COLOR.sageLight}`,
+                              background: COLOR.white,
+                            }}>
+                              {supps.length === 0 ? (
+                                <div style={{ fontSize: 13, color: COLOR.textMid, padding: "10px 0" }}>
+                                  영양제 정보 없음
+                                </div>
+                              ) : (
+                                <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 10 }}>
+                                  {supps.map((s, i) => {
+                                    const name = typeof s.name === "string" ? s.name : "";
+                                    const timing = typeof s.timing === "string" ? s.timing : "";
+                                    const dosage = typeof s.dosage === "string" ? s.dosage : "";
+                                    // 레거시 row (dispense_type 없음) → "bottle" 간주
+                                    const isCompound = s.dispense_type === "compounded";
+                                    const slotsArr = Array.isArray(s.time_slots)
+                                      ? (s.time_slots as unknown[]).filter((x): x is string => typeof x === "string")
+                                      : [];
+                                    const days = typeof s.days === "number" ? s.days : null;
+                                    // 레거시 row (daily_count 없음) → 1 간주
+                                    const dailyCount = typeof s.daily_count === "number" && s.daily_count > 0 ? s.daily_count : 1;
+                                    const etcNote = typeof s.etc_note === "string" ? s.etc_note.trim() : "";
+                                    const memo = typeof s.memo === "string" ? s.memo.trim() : "";
+                                    // "기타" 슬롯 라벨에 메모 병기 — 예: "기타(오전 11시)"
+                                    const slotsDisplay = slotsArr.map((slot) =>
+                                      slot === "기타" && etcNote ? `기타(${etcNote})` : slot,
+                                    );
+                                    return (
+                                      <div key={i} style={{
+                                        padding: "8px 10px",
+                                        borderRadius: 8,
+                                        background: COLOR.sageBg,
+                                        border: `1px solid ${COLOR.border}`,
+                                      }}>
+                                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                          <span style={{ fontSize: 14, fontWeight: 600, color: COLOR.textDark }}>{name || "—"}</span>
+                                          <span style={{
+                                            padding: "1px 7px", borderRadius: 100,
+                                            fontSize: 10, fontWeight: 700,
+                                            background: isCompound ? "var(--terra-pale, #FBF5F1)" : COLOR.sagePale,
+                                            color: isCompound ? "#C06B45" : COLOR.sageDeep,
+                                            border: `1px solid ${isCompound ? "var(--terra-light, #F5E6DC)" : COLOR.sageLight}`,
+                                          }}>
+                                            {isCompound ? "소분 조제약" : "통약"}
+                                          </span>
+                                          <span style={{ fontSize: 12, color: COLOR.textMid }}>· 하루 {dailyCount}회</span>
+                                          {days !== null ? (
+                                            <span style={{ fontSize: 12, color: COLOR.textMid }}>· {days}일분</span>
+                                          ) : null}
+                                        </div>
+                                        {(() => {
+                                          // 통약·소분 동일 표기 — 슬롯 + 용량 + 부가설명 조합. 소분 + 모두 빈값일 때만 "약포지대로 복용" 폴백.
+                                          const parts = [
+                                            slotsDisplay.length > 0 ? slotsDisplay.join(" · ") : "",
+                                            dosage,
+                                            timing,
+                                          ].filter(Boolean);
+                                          if (parts.length > 0) {
+                                            return (
+                                              <div style={{ fontSize: 13, color: COLOR.textMid, marginTop: 2 }}>
+                                                {parts.join(" · ")}
+                                              </div>
+                                            );
+                                          }
+                                          if (isCompound) {
+                                            return (
+                                              <div style={{ fontSize: 12, color: COLOR.textMid, marginTop: 2 }}>
+                                                약포지대로 복용
+                                              </div>
+                                            );
+                                          }
+                                          return null;
+                                        })()}
+                                        {memo && (
+                                          <div style={{ fontSize: 12, color: COLOR.textMid, marginTop: 4 }}>
+                                            📝 {memo}
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              {g.custom_guide && (
+                                <div style={{
+                                  marginTop: 8, padding: "8px 10px",
+                                  borderRadius: 8,
+                                  background: "var(--terra-pale, #FBF5F1)",
+                                  border: "1px solid var(--terra-light, #F5E6DC)",
+                                  fontSize: 13, color: COLOR.textDark, lineHeight: 1.5,
+                                }}>
+                                  {g.custom_guide}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* 발송 이력과 새 가이드 작성 분리선 */}
+              <div style={{
+                height: 1, background: COLOR.border, margin: "0 0 14px",
+              }} />
+              <div style={{ fontSize: 13, fontWeight: 700, color: COLOR.sageDeep, marginBottom: 8 }}>
+                새 가이드 작성
               </div>
 
               {/* 영양제 + 복용법 헤더 */}
@@ -2368,49 +2935,160 @@ function ChartContent() {
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 10 }}>
-                {guideSupps.map((s, i) => (
+                {guideSupps.map((s, i) => {
+                  const isCompound = s.dispense_type === "compounded";
+                  return (
                   <div key={i} style={{ padding: 10, background: COLOR.sageBg, borderRadius: 10, border: `1px solid ${COLOR.border}` }}>
-                    <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
-                      <input type="text" value={s.name}
-                        onChange={(e) => updateGuideSupp(i, "name", e.target.value)}
-                        placeholder="이름 (예: 비타민B군)"
-                        style={{ flex: 1, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
+                    {/* 통약/소분 토글 + ✕ 삭제 */}
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+                      <div style={{ display: "inline-flex", borderRadius: 8, overflow: "hidden", border: `1px solid ${COLOR.sageLight}`, flexShrink: 0 }}>
+                        <button type="button" onClick={() => setGuideSuppDispense(i, "bottle")}
+                          style={{
+                            padding: "5px 10px", fontSize: 12, fontWeight: 700,
+                            background: !isCompound ? COLOR.sageDeep : COLOR.white,
+                            color: !isCompound ? COLOR.white : COLOR.sageDeep,
+                            border: "none", cursor: "pointer",
+                          }}>
+                          통약
+                        </button>
+                        <button type="button" onClick={() => setGuideSuppDispense(i, "compounded")}
+                          style={{
+                            padding: "5px 10px", fontSize: 12, fontWeight: 700,
+                            background: isCompound ? COLOR.sageDeep : COLOR.white,
+                            color: isCompound ? COLOR.white : COLOR.sageDeep,
+                            border: "none", borderLeft: `1px solid ${COLOR.sageLight}`,
+                            cursor: "pointer",
+                          }}>
+                          소분 조제약
+                        </button>
+                      </div>
+                      <div style={{ flex: 1 }} />
                       <button type="button" onClick={() => removeGuideSupp(i)} aria-label="삭제"
                         style={{ width: 28, height: 28, borderRadius: 6, background: "transparent", border: `1px solid ${COLOR.border}`, cursor: "pointer", color: COLOR.textMid, flexShrink: 0 }}>
                         ✕
                       </button>
                     </div>
-                    <div style={{ display: "flex", gap: 6 }}>
+
+                    {/* 이름 input */}
+                    <input type="text" value={s.name}
+                      onChange={(e) => updateGuideSupp(i, "name", e.target.value)}
+                      placeholder="이름 (예: 비타민B군)"
+                      style={{ width: "100%", padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, marginBottom: 6, boxSizing: "border-box" }} />
+
+                    {/* 용량 + 부가 설명 — 통약·소분 공통. 소분은 기본값 "1포"로 채워져 있고 수정 가능. */}
+                    <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
                       <input type="text" value={s.dosage}
                         onChange={(e) => updateGuideSupp(i, "dosage", e.target.value)}
-                        placeholder="용량 (예: 1알, 2포)"
+                        placeholder="용량 (예: 1정, 2포)"
                         style={{ flex: 1, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, minWidth: 0 }} />
                       <input type="text" value={s.timing}
                         onChange={(e) => updateGuideSupp(i, "timing", e.target.value)}
-                        placeholder="복용 시점 (예: 아침 식후)"
+                        placeholder="설명 (식후, 흔들어서)"
                         style={{ flex: 1.2, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, minWidth: 0 }} />
                     </div>
+
+                    {/* 5칩 슬롯 체크박스 — 통약·소분 공통. "기타" 포함 다중 선택. 칩 개수가 daily_count 자동 결정. */}
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6, alignItems: "center" }}>
+                      {(["아침", "점심", "저녁", "취침 전", "기타"] as const).map((slot) => {
+                        const checked = (s.time_slots ?? []).includes(slot);
+                        return (
+                          <button key={slot} type="button"
+                            onClick={() => toggleGuideSuppSlot(i, slot)}
+                            style={{
+                              padding: "5px 10px", borderRadius: 100, fontSize: 12, fontWeight: 600,
+                              background: checked ? COLOR.sageDeep : COLOR.white,
+                              color: checked ? COLOR.white : COLOR.sageDeep,
+                              border: `1px solid ${checked ? COLOR.sageDeep : COLOR.sageLight}`,
+                              cursor: "pointer",
+                            }}>
+                            {checked ? "✓ " : ""}{slot}
+                          </button>
+                        );
+                      })}
+                      {/* "기타" 선택 시 짧은 설명 input */}
+                      {(s.time_slots ?? []).includes("기타") && (
+                        <input type="text" value={s.etc_note ?? ""}
+                          onChange={(e) => setGuideSuppEtcNote(i, e.target.value)}
+                          placeholder="예: 오전 11시"
+                          maxLength={40}
+                          style={{
+                            width: 120, padding: "5px 10px",
+                            borderRadius: 100,
+                            border: `1px solid ${COLOR.sageLight}`,
+                            fontSize: 12, outline: "none", background: COLOR.white,
+                          }} />
+                      )}
+                    </div>
+
+                    {isCompound && (
+                      <label style={{
+                        display: "flex", alignItems: "center", gap: 6,
+                        fontSize: 13, color: COLOR.textMid,
+                        marginBottom: 6, cursor: "pointer",
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={s.package_note ?? true}
+                          onChange={(e) => setGuideSuppPackageNote(i, e.target.checked)}
+                          style={{ width: 16, height: 16, accentColor: COLOR.sageDeep, cursor: "pointer" }}
+                        />
+                        '약포지에 표시된 대로 복용하세요' 안내 보내기
+                      </label>
+                    )}
+
+                    {/* 하루 횟수 + 일수 나란히 */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 13, color: COLOR.textMid }}>하루</span>
+                        <input type="number" min={1} value={s.daily_count ?? ""}
+                          onChange={(e) => setGuideSuppDailyCount(i, e.target.value)}
+                          placeholder="1"
+                          style={{ width: 64, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
+                        <span style={{ fontSize: 13, color: COLOR.textMid }}>회</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <input type="number" min={1} value={s.days ?? ""}
+                          onChange={(e) => setGuideSuppDays(i, e.target.value)}
+                          placeholder="14"
+                          style={{ width: 72, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
+                        <span style={{ fontSize: 13, color: COLOR.textMid }}>일분</span>
+                      </div>
+                    </div>
+
+                    {/* 영양제별 메모 — 환자에게도 표시. 200자 제한. */}
+                    <div style={{ marginTop: 8 }}>
+                      <input type="text" value={s.memo ?? ""}
+                        onChange={(e) => setGuideSuppMemo(i, e.target.value)}
+                        placeholder="메모 (선택) · 주의·참고사항 (환자에게 표시됩니다)"
+                        maxLength={200}
+                        style={{
+                          width: "100%", padding: "7px 10px",
+                          borderRadius: 6, border: `1px solid ${COLOR.border}`,
+                          fontSize: 13, outline: "none", background: COLOR.white,
+                          boxSizing: "border-box",
+                        }} />
+                    </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
               <button type="button" onClick={addGuideSupp}
                 style={{ width: "100%", padding: "8px 0", borderRadius: 8, fontSize: 13, fontWeight: 600, background: COLOR.sagePale, color: COLOR.sageDeep, border: `1px dashed ${COLOR.sageLight}`, cursor: "pointer", marginBottom: 18 }}>
                 + 영양제 추가
               </button>
 
-              {/* 복용 일수 */}
-              <div style={{ fontSize: 14, fontWeight: 700, color: COLOR.sageDeep, marginBottom: 6 }}>복용 일수</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
-                <input type="number" value={guideDosageDays ?? ""} min={1}
-                  onChange={(e) => { const v = parseInt(e.target.value, 10); setGuideDosageDays(isNaN(v) ? undefined : v); }}
-                  placeholder="14"
-                  style={{ width: 100, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none" }} />
-                <span style={{ fontSize: 14, color: COLOR.textMid }}>일분</span>
-                {guideEndDate && <span style={{ fontSize: 13, color: COLOR.sageMid }}>(종료 예정: {guideEndDate})</span>}
-              </div>
-              <div style={{ fontSize: 12, color: COLOR.textMid, marginBottom: 18 }}>
-                복용 기간을 입력하면 종료일과 알림 내역이 표시됩니다
-              </div>
+              {/* 가이드 전체 종료 예정일 — 영양제별 일수 중 max 기준 자동 계산 */}
+              {guideEndDate && (
+                <div style={{
+                  padding: "10px 12px", borderRadius: 8,
+                  background: COLOR.sagePale, border: `1px solid ${COLOR.sageLight}`,
+                  fontSize: 13, color: COLOR.textDark, marginBottom: 18,
+                  fontFamily: "'Noto Sans KR', sans-serif",
+                }}>
+                  전체 종료 예정: <strong style={{ color: COLOR.sageDeep }}>{guideEndDate}</strong>
+                  <span style={{ marginLeft: 6, color: COLOR.textMid }}>(가장 긴 {guideMaxDays}일 기준)</span>
+                </div>
+              )}
 
               {/* 맞춤 가이드 */}
               <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 6 }}>
@@ -2427,15 +3105,15 @@ function ChartContent() {
             </div>
 
             <div style={{ padding: "12px 16px", borderTop: `1px solid ${COLOR.border}`, flexShrink: 0 }}>
-              <button type="button" onClick={guideSent ? undefined : requestSendGuide} disabled={guideSent || !canSendGuide}
+              <button type="button" onClick={requestSendGuide} disabled={!canSendGuide}
                 style={{
                   width: "100%", padding: "14px 0", borderRadius: 12,
                   fontSize: 15, fontWeight: 700,
-                  background: guideSent ? COLOR.sageLight : (canSendGuide ? COLOR.sageDeep : COLOR.sageLight),
+                  background: canSendGuide ? COLOR.sageDeep : COLOR.sageLight,
                   color: COLOR.white, border: "none",
-                  cursor: (guideSent || !canSendGuide) ? "default" : "pointer",
+                  cursor: canSendGuide ? "pointer" : "default",
                 }}>
-                {guideSent ? "전송 완료 ✓" : "가이드 전송"}
+                가이드 전송
               </button>
             </div>
 
@@ -2470,6 +3148,51 @@ function ChartContent() {
                     </button>
                   </div>
                 </div>
+              </div>
+            )}
+
+            {/* 전송 성공 박스 — 확인 팝업과 동일 absolute inset:0 오버레이. 3.5초 자동 사라짐 + backdrop 클릭 즉시 닫힘. */}
+            {guideSuccessMsg && (
+              <div
+                role="status"
+                aria-live="polite"
+                style={{
+                  position: "absolute", inset: 0, zIndex: 21,
+                  background: "rgba(0,0,0,0.3)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}
+                onClick={clearGuideSuccess}
+              >
+                <div onClick={(e) => e.stopPropagation()}
+                  style={{
+                    background: COLOR.white, borderRadius: 14, padding: "24px 22px 22px",
+                    maxWidth: 280, width: "85%", textAlign: "center",
+                    boxShadow: "0 8px 28px rgba(74,99,85,0.18)",
+                    animation: "fadeInScale 0.18s ease-out",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  <div
+                    aria-hidden
+                    style={{
+                      width: 44, height: 44, borderRadius: "50%",
+                      background: COLOR.sageDeep, color: COLOR.white,
+                      display: "inline-flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 22, fontWeight: 700, marginBottom: 12,
+                    }}
+                  >
+                    ✓
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: COLOR.textDark, lineHeight: 1.5 }}>
+                    {guideSuccessMsg}
+                  </div>
+                </div>
+                <style>{`
+                  @keyframes fadeInScale {
+                    from { opacity: 0; transform: scale(0.92); }
+                    to { opacity: 1; transform: scale(1); }
+                  }
+                `}</style>
               </div>
             )}
           </div>

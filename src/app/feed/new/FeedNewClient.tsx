@@ -18,8 +18,8 @@ interface SymptomOption {
 
 const PHARMACIST = { name: "김서연 약사", pharmacy: "그린약국" };
 
-const GENDERS = ["남성", "여성"] as const;
-const AGE_GROUPS = ["10대", "20대", "30대", "40대", "50대", "60대 이상"] as const;
+const GENDERS = ["남성", "여성", "기타"] as const;
+const AGE_GROUPS = ["영유아 (0~6세)", "어린이 (7~12세)", "10대", "20대", "30대", "40대", "50대", "60대", "70대 이상"] as const;
 
 const SYMPTOM_OPTIONS: SymptomOption[] = [
   { label: "만성피로", variant: "terra" },

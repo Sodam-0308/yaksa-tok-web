@@ -32,8 +32,8 @@ const SYMPTOM_OPTIONS: SymptomOption[] = [
   { label: "기타", variant: "muted" },
 ];
 
-const GENDERS = ["남성", "여성"] as const;
-const AGE_GROUPS = ["10대", "20대", "30대", "40대", "50대", "60대 이상"] as const;
+const GENDERS = ["남성", "여성", "기타"] as const;
+const AGE_GROUPS = ["영유아 (0~6세)", "어린이 (7~12세)", "10대", "20대", "30대", "40대", "50대", "60대", "70대 이상"] as const;
 const DURATION_OPTIONS = ["2주 이내", "2~4주", "1~2개월", "2~3개월", "3~6개월", "6개월 이상"] as const;
 
 const MAX_TITLE = 50;
@@ -217,7 +217,7 @@ function RecommendContent() {
                 </div>
                 {/* 성별 */}
                 <div>
-                  <div className="fn-field-label">���별</div>
+                  <div className="fn-field-label">성별</div>
                   <div className="fn-chip-row">
                     {GENDERS.map((g) => (
                       <button

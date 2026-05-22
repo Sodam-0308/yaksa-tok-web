@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
@@ -14,6 +14,9 @@ type MedicationStatusRow = Database["public"]["Tables"]["medication_status"]["Ro
 type MedicationStatusInsert = Database["public"]["Tables"]["medication_status"]["Insert"];
 type MedicationCheckRow = Database["public"]["Tables"]["medication_checks"]["Row"];
 type MedicationCheckInsert = Database["public"]["Tables"]["medication_checks"]["Insert"];
+type PatientSupplementRow = Database["public"]["Tables"]["patient_supplements"]["Row"];
+type PatientSupplementInsert = Database["public"]["Tables"]["patient_supplements"]["Insert"];
+type PatientSupplementUpdate = Database["public"]["Tables"]["patient_supplements"]["Update"];
 
 /* ══════════════════════════════════════════
    기본 프로필 (DB 로딩 실패 시 fallback)
@@ -31,14 +34,143 @@ type TimeSlot = "아침" | "점심" | "저녁" | "취침 전";
 interface Supplement {
   id: string;
   name: string;
-  times: { slot: TimeSlot; checked: boolean }[];
+  time_slots: TimeSlot[];
+  /** 하루 복용 횟수. 마이페이지 하트 개수의 기준. 슬롯은 보조 라벨로만. */
+  daily_count: number;
+  source: "manual" | "dosage_guide";
+  source_dosage_guide_id: string | null;
+  /** 복용 시작일 (YYYY-MM-DD). 레거시 row 는 null. */
+  start_date: string | null;
+  /** 복용 예정 일수. 가이드 가져오기 시 채워짐. null 이면 카운트다운 미표시. */
+  days: number | null;
 }
 
-const INITIAL_SUPPLEMENTS: Supplement[] = [
-  { id: "s1", name: "비타민D 1000IU", times: [{ slot: "아침", checked: true }, { slot: "저녁", checked: false }] },
-  { id: "s2", name: "유산균", times: [{ slot: "아침", checked: false }] },
-  { id: "s3", name: "마그네슘", times: [{ slot: "취침 전", checked: false }] },
-];
+/** dosage_guides.supplements jsonb 해석용 (약속된 신규 형식: { name, time_slots }).
+ *  기존 SupplementItem({name, dosage, timing})과 다른 별개 약속이라 mypage 로컬 타입으로 둠. */
+interface DosageGuide {
+  id: string;
+  supplements: {
+    name: string;
+    time_slots: string[];
+    daily_count?: number;
+    dispense_type: "bottle" | "compounded";
+    days: number | null;
+    dosage: string;
+    timing: string;
+    etc_note: string;
+    memo: string;
+    package_note: boolean;
+  }[];
+  dosage_days: number | null;
+  dosage_end_date: string | null;
+  custom_guide: string | null;
+  dosage_status: "active" | "completed" | "stopped";
+  sent_at: string | null;
+  created_at: string;
+  /** 발송 약사 id (dosage_guides.pharmacist_id). */
+  pharmacist_id: string | null;
+  /** pharmacist_profiles.license_name (없으면 profiles.name 폴백). */
+  pharmacist_name: string | null;
+  /** pharmacist_profiles.pharmacy_name. */
+  pharmacy_name: string | null;
+}
+
+const VALID_TIME_SLOTS: TimeSlot[] = ["아침", "점심", "저녁", "취침 전"];
+/** 슬롯 표준 순서 — VALID_TIME_SLOTS 와 동일. 저장 시 이 순서로 정규화. */
+const SLOT_ORDER: readonly TimeSlot[] = VALID_TIME_SLOTS;
+/** slots 를 SLOT_ORDER 인덱스 기준으로 정렬. 표에 없는 값은 뒤로. */
+function sortSlots(slots: TimeSlot[]): TimeSlot[] {
+  return [...slots].sort((a, b) => {
+    const ai = SLOT_ORDER.indexOf(a);
+    const bi = SLOT_ORDER.indexOf(b);
+    const aRank = ai < 0 ? Number.MAX_SAFE_INTEGER : ai;
+    const bRank = bi < 0 ? Number.MAX_SAFE_INTEGER : bi;
+    return aRank - bRank;
+  });
+}
+const isValidTimeSlot = (s: string): s is TimeSlot =>
+  (VALID_TIME_SLOTS as string[]).includes(s);
+
+/** patient_supplements row → 화면용 Supplement 매핑.
+ *  time_slots 는 DB text[] 라 임의 문자열일 수 있으므로 알려진 4종으로 필터. */
+function mapPatientSupplementRow(row: PatientSupplementRow): Supplement {
+  const slots = Array.isArray(row.time_slots)
+    ? row.time_slots.filter((s): s is TimeSlot => typeof s === "string" && isValidTimeSlot(s))
+    : [];
+  // DB가 NOT NULL/기본 1 이지만 방어적으로: row.daily_count 가 number 면 그 값, 아니면 슬롯 개수(최소 1).
+  const dailyCount =
+    typeof row.daily_count === "number" && row.daily_count > 0
+      ? row.daily_count
+      : Math.max(slots.length, 1);
+  return {
+    id: row.id,
+    name: row.name,
+    time_slots: slots,
+    daily_count: dailyCount,
+    source: row.source === "dosage_guide" ? "dosage_guide" : "manual",
+    source_dosage_guide_id: row.source_dosage_guide_id,
+    start_date: row.start_date ?? null,
+    days: typeof row.days === "number" && row.days > 0 ? row.days : null,
+  };
+}
+
+/** 오늘 날짜를 로컬(한국시간) 기준 YYYY-MM-DD 문자열로 반환.
+ *  toISOString() 은 UTC 라 한국시간 자정 부근에 하루 어긋날 수 있으니 로컬 연/월/일로 조립. */
+function getTodayLocalISO(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** YYYY-MM-DD → "M월 D일" 형식 라벨. 형식 파괴/null 이면 null.
+ *  new Date 미사용 (자정 어긋남 회피) — 문자열 분해해서 숫자만 추출. */
+function formatStartLabel(startDate: string | null): string | null {
+  if (!startDate) return null;
+  const m = startDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (!month || !day) return null;
+  return `${month}월 ${day}일`;
+}
+
+/** start_date(YYYY-MM-DD) + days → 종료예정일 기준 남은 일수.
+ *  로직: end = start + days. remain = end - today (달력 날짜 차이).
+ *  start_date / days 가 없거나 형식이 깨지면 null. */
+function calcRemainingDays(startDate: string | null, days: number | null): number | null {
+  if (!startDate || days == null || days <= 0) return null;
+  const m = startDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const sy = Number(m[1]); const sm = Number(m[2]); const sd = Number(m[3]);
+  const start = new Date(sy, sm - 1, sd);
+  if (Number.isNaN(start.getTime())) return null;
+  const end = new Date(sy, sm - 1, sd + days);
+  const todayISO = getTodayLocalISO();
+  const tm = todayISO.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!tm) return null;
+  const today = new Date(Number(tm[1]), Number(tm[2]) - 1, Number(tm[3]));
+  // 달력 일수 차이 (시/분/초 무시)
+  const diffMs = end.getTime() - today.getTime();
+  return Math.round(diffMs / (1000 * 60 * 60 * 24));
+}
+
+/** "오늘" pill 배지. 선택된 날짜가 오늘과 같을 때만 부모가 조건부 렌더링. */
+function TodayBadge() {
+  return (
+    <span style={{
+      fontSize: 13,
+      padding: "2px 8px",
+      borderRadius: 100,
+      background: "var(--sage-pale, #EDF4F0)",
+      color: "#4A6355",
+      fontWeight: 600,
+      flexShrink: 0,
+      whiteSpace: "nowrap",
+    }}>오늘</span>
+  );
+}
 
 type HeartStatus = "full" | "half" | "empty" | "today";
 const WEEK_DAYS = ["월", "화", "수", "목", "금", "토", "일"];
@@ -414,11 +546,23 @@ function MypageContent() {
   // 날짜별 복약 상태: Record<dateKey, Record<supplementId, boolean[]>>
   const [checksByDate, setChecksByDate] = useState<Record<string, Record<string, boolean[]>>>({});
 
-  const getChecks = (suppId: string, timesLen: number): boolean[] => {
-    return checksByDate[dateKey]?.[suppId] ?? new Array(timesLen).fill(false);
+  const getChecks = (suppId: string, count: number): boolean[] => {
+    return checksByDate[dateKey]?.[suppId] ?? new Array(count).fill(false);
   };
 
-  const [supplements, setSupplements] = useState<Supplement[]>(INITIAL_SUPPLEMENTS);
+  const [supplements, setSupplements] = useState<Supplement[]>([]);
+  const [supplementsLoaded, setSupplementsLoaded] = useState(false);
+  const [dosageGuides, setDosageGuides] = useState<DosageGuide[]>([]);
+  const [dosageGuidesLoaded, setDosageGuidesLoaded] = useState(false);
+  const [addingFromGuideId, setAddingFromGuideId] = useState<string | null>(null);
+  /* 마이페이지 토스트 — 영양제/가이드 DB 동작 결과 알림 (ChartClient 패턴 차용) */
+  const [mypageToast, setMypageToast] = useState<string | null>(null);
+  const mypageToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showMypageToast = useCallback((msg: string) => {
+    setMypageToast(msg);
+    if (mypageToastTimerRef.current) clearTimeout(mypageToastTimerRef.current);
+    mypageToastTimerRef.current = setTimeout(() => setMypageToast(null), 3000);
+  }, []);
 
   /* ── 이번 주 (월~일) 날짜 계산 — 실제 today 기준 ── */
   const fmtKey = (d: Date) =>
@@ -437,6 +581,189 @@ function MypageContent() {
     });
   })();
 
+  /* ── DB 로드: 본인 patient_supplements (전체) ── */
+  useEffect(() => {
+    if (!user) {
+      setSupplementsLoaded(true);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("patient_supplements")
+        .select("id, patient_id, name, time_slots, daily_count, source, source_dosage_guide_id, start_date, days, created_at, updated_at")
+        .eq("patient_id", user.id)
+        .order("created_at", { ascending: true });
+      if (cancelled) return;
+      if (error) {
+        console.error("[mypage] patient_supplements load failed:", error);
+        showMypageToast("영양제를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.");
+        setSupplementsLoaded(true);
+        return;
+      }
+      const rows = (data ?? []) as unknown as PatientSupplementRow[];
+      setSupplements(rows.map(mapPatientSupplementRow));
+      setSupplementsLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [user, showMypageToast]);
+
+  /* ── DB 로드: 본인 dosage_guides (활성 상태만) ──
+   *  supplements jsonb 는 약속된 형식 [{ name, time_slots }] 으로 가정.
+   *  레거시 형식({name, dosage, timing}) row 가 들어오면 time_slots 비어있게 안전 폴백. */
+  useEffect(() => {
+    if (!user) {
+      setDosageGuidesLoaded(true);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("dosage_guides")
+        .select("id, supplements, dosage_days, dosage_end_date, custom_guide, dosage_status, sent_at, created_at, pharmacist_id")
+        .eq("patient_id", user.id)
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (error) {
+        console.error("[mypage] dosage_guides load failed:", error);
+        showMypageToast("복용 가이드를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.");
+        setDosageGuidesLoaded(true);
+        return;
+      }
+      type GuideRow = {
+        id: string;
+        supplements: unknown;
+        dosage_days: number | null;
+        dosage_end_date: string | null;
+        custom_guide: string | null;
+        dosage_status: "active" | "completed" | "stopped";
+        sent_at: string | null;
+        created_at: string;
+        pharmacist_id: string | null;
+      };
+      const rows = (data ?? []) as unknown as GuideRow[];
+
+      // pharmacist_profiles IN 조회 — L385-394 패턴 재사용
+      const pharmIds = Array.from(
+        new Set(rows.map((r) => r.pharmacist_id).filter((id): id is string => !!id)),
+      );
+      const pharmInfoById = new Map<string, { license_name: string | null; pharmacy_name: string | null }>();
+      if (pharmIds.length > 0) {
+        const { data: ppData, error: ppErr } = await supabase
+          .from("pharmacist_profiles")
+          .select("id, license_name, pharmacy_name")
+          .in("id", pharmIds);
+        if (cancelled) return;
+        if (ppErr) {
+          console.error("[mypage] dosage_guides pharmacist_profiles load failed:", ppErr);
+        } else {
+          for (const pp of (ppData ?? []) as { id: string; license_name: string | null; pharmacy_name: string | null }[]) {
+            pharmInfoById.set(pp.id, {
+              license_name: pp.license_name,
+              pharmacy_name: pp.pharmacy_name,
+            });
+          }
+        }
+      }
+
+      // profiles.name 폴백 — license_name 없을 때 사용 (L400 패턴 재사용)
+      const profileNameById = new Map<string, string>();
+      if (pharmIds.length > 0) {
+        const { data: profData, error: profErr } = await supabase
+          .from("profiles")
+          .select("id, name")
+          .in("id", pharmIds);
+        if (cancelled) return;
+        if (profErr) {
+          console.error("[mypage] dosage_guides profiles fetch failed:", profErr);
+        } else {
+          for (const p of (profData ?? []) as { id: string; name: string | null }[]) {
+            if (p.name && p.name.trim()) profileNameById.set(p.id, p.name.trim());
+          }
+        }
+      }
+      const parsed: DosageGuide[] = rows.map((r) => {
+        const rawList = Array.isArray(r.supplements) ? r.supplements : [];
+        type ParsedSupp = {
+          name: string;
+          time_slots: string[];
+          daily_count?: number;
+          dispense_type: "bottle" | "compounded";
+          days: number | null;
+          dosage: string;
+          timing: string;
+          etc_note: string;
+          memo: string;
+          package_note: boolean;
+        };
+        const supps = rawList
+          .map((item): ParsedSupp | null => {
+            if (typeof item !== "object" || item === null) return null;
+            const obj = item as {
+              name?: unknown;
+              time_slots?: unknown;
+              daily_count?: unknown;
+              dispense_type?: unknown;
+              days?: unknown;
+              dosage?: unknown;
+              timing?: unknown;
+              etc_note?: unknown;
+              memo?: unknown;
+              package_note?: unknown;
+            };
+            const name = typeof obj.name === "string" ? obj.name : "";
+            if (!name) return null;
+            const ts = Array.isArray(obj.time_slots)
+              ? obj.time_slots.filter((s): s is string => typeof s === "string")
+              : [];
+            const dc = typeof obj.daily_count === "number" && obj.daily_count > 0 ? obj.daily_count : undefined;
+            const dispense: "bottle" | "compounded" = obj.dispense_type === "compounded" ? "compounded" : "bottle";
+            const days = typeof obj.days === "number" ? obj.days : null;
+            const dosage = typeof obj.dosage === "string" ? obj.dosage : "";
+            const timing = typeof obj.timing === "string" ? obj.timing : "";
+            const etcNote = typeof obj.etc_note === "string" ? obj.etc_note : "";
+            const memo = typeof obj.memo === "string" ? obj.memo : "";
+            // 레거시 row 에 package_note 없으면 true 간주 (소분약은 기본적으로 약포지 안내 노출)
+            const pkgNote = typeof obj.package_note === "boolean" ? obj.package_note : true;
+            return {
+              name,
+              time_slots: ts,
+              daily_count: dc,
+              dispense_type: dispense,
+              days,
+              dosage,
+              timing,
+              etc_note: etcNote,
+              memo,
+              package_note: pkgNote,
+            };
+          })
+          .filter((s): s is ParsedSupp => s !== null);
+        const ppInfo = r.pharmacist_id ? pharmInfoById.get(r.pharmacist_id) : null;
+        const profName = r.pharmacist_id ? profileNameById.get(r.pharmacist_id) : null;
+        const pharmacistName =
+          (ppInfo?.license_name && ppInfo.license_name.trim()) || profName || null;
+        const pharmacyName = (ppInfo?.pharmacy_name && ppInfo.pharmacy_name.trim()) || null;
+        return {
+          id: r.id,
+          supplements: supps,
+          dosage_days: r.dosage_days,
+          dosage_end_date: r.dosage_end_date,
+          custom_guide: r.custom_guide,
+          dosage_status: r.dosage_status,
+          sent_at: r.sent_at,
+          created_at: r.created_at,
+          pharmacist_id: r.pharmacist_id,
+          pharmacist_name: pharmacistName,
+          pharmacy_name: pharmacyName,
+        };
+      });
+      setDosageGuides(parsed);
+      setDosageGuidesLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [user, showMypageToast]);
+
   /* ── DB 로드: 본인 medication_checks (이번 주 + 최근 3일) ── */
   useEffect(() => {
     if (!user) return;
@@ -445,7 +772,7 @@ function MypageContent() {
     (async () => {
       const { data, error } = await supabase
         .from("medication_checks")
-        .select("supplement_name, time_slot, check_date, is_checked")
+        .select("supplement_name, dose_index, check_date, is_checked")
         .eq("patient_id", user.id)
         .gte("check_date", fromDate)
         .lte("check_date", toDate);
@@ -455,7 +782,7 @@ function MypageContent() {
       }
       const rows = (data ?? []) as unknown as Pick<
         MedicationCheckRow,
-        "supplement_name" | "time_slot" | "check_date" | "is_checked"
+        "supplement_name" | "dose_index" | "check_date" | "is_checked"
       >[];
       const nameToSupp = new Map(supplements.map((s) => [s.name, s] as const));
 
@@ -464,11 +791,13 @@ function MypageContent() {
         for (const row of rows) {
           const supp = nameToSupp.get(row.supplement_name);
           if (!supp) continue;
-          const slotIndex = supp.times.findIndex((t) => t.slot === row.time_slot);
-          if (slotIndex < 0) continue;
+          // dose_index 는 1-based. 0-based 배열 인덱스로 변환.
+          // 과거 row 의 dose_index 가 supp.daily_count 보다 크면 화면에 안 그려짐(데이터 손실 아님, 표시 생략).
+          const idx = row.dose_index - 1;
+          if (idx < 0 || idx >= supp.daily_count) continue;
           const dateMap = { ...(next[row.check_date] ?? {}) };
-          const arr = [...(dateMap[supp.id] ?? new Array(supp.times.length).fill(false))];
-          arr[slotIndex] = !!row.is_checked;
+          const arr = [...(dateMap[supp.id] ?? new Array(supp.daily_count).fill(false))];
+          arr[idx] = !!row.is_checked;
           dateMap[supp.id] = arr;
           next[row.check_date] = dateMap;
         }
@@ -480,6 +809,17 @@ function MypageContent() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState("");
   const [newTimes, setNewTimes] = useState<Set<TimeSlot>>(new Set());
+  /** addSupplement 모달의 복용 시작일 (기본 오늘 YYYY-MM-DD) */
+  const [addStartDate, setAddStartDate] = useState<string>(() => getTodayLocalISO());
+  /** 편집 모달 상태. editingId 가 null 이 아니면 열림. */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editSuppName, setEditSuppName] = useState<string>("");
+  const [editTimes, setEditTimes] = useState<Set<TimeSlot>>(new Set());
+  const [editStartDate, setEditStartDate] = useState<string>("");
+  /** 일수 입력 — number input 이지만 빈 문자열도 허용(미지정 → null 로 저장). */
+  const [editDays, setEditDays] = useState<string>("");
+  /** "이대로 추가하기" 시작일 확인 미니 모달 상태. null 이면 닫힘. */
+  const [guideStartModal, setGuideStartModal] = useState<{ guide: DosageGuide; date: string } | null>(null);
   const [swipedId, setSwipedId] = useState<string | null>(null);
 
   /* ── 지난 상담 복용 상태 (DB: medication_status) ── */
@@ -574,19 +914,23 @@ function MypageContent() {
   const age = calcAge(editMode ? editBirth : profile.birth);
 
   /* 영양제 체크 토글 (날짜별) — 즉시 UI 반영 + DB upsert */
-  const toggleCheck = (id: string, timeIndex: number) => {
+  /** doseIndex 는 0-based 하트 인덱스. DB 의 dose_index = doseIndex + 1 (1-based). */
+  const toggleCheck = (id: string, doseIndex: number) => {
     const supp = supplements.find((s) => s.id === id);
     if (!supp) return;
-    const slot = supp.times[timeIndex]?.slot;
-    if (!slot) return;
-    const prevArr = checksByDate[dateKey]?.[id] ?? new Array(supp.times.length).fill(false);
-    const nextChecked = !prevArr[timeIndex];
+    if (doseIndex < 0 || doseIndex >= supp.daily_count) return;
+    // 시작일 전 영양제는 체크 불가 — 하트 disabled 의 안전망
+    if (supp.start_date && supp.start_date > dateKey) return;
+    // 라벨이 있으면 time_slot 에 보조 저장, 없으면 null. dose_index 가 unique key 라 라벨 없어도 OK.
+    const slot = supp.time_slots[doseIndex] ?? null;
+    const prevArr = checksByDate[dateKey]?.[id] ?? new Array(supp.daily_count).fill(false);
+    const nextChecked = !prevArr[doseIndex];
 
     // 1) 즉시 UI 반영
     setChecksByDate((prev) => {
       const dayChecks = { ...(prev[dateKey] || {}) };
-      const arr = [...(dayChecks[id] ?? new Array(supp.times.length).fill(false))];
-      arr[timeIndex] = nextChecked;
+      const arr = [...(dayChecks[id] ?? new Array(supp.daily_count).fill(false))];
+      arr[doseIndex] = nextChecked;
       dayChecks[id] = arr;
       return { ...prev, [dateKey]: dayChecks };
     });
@@ -597,6 +941,7 @@ function MypageContent() {
       patient_id: user.id,
       dosage_guide_id: null,
       supplement_name: supp.name,
+      dose_index: doseIndex + 1,
       time_slot: slot,
       check_date: dateKey,
       is_checked: nextChecked,
@@ -611,15 +956,15 @@ function MypageContent() {
           ) => Promise<{ error: Error | null }>;
         })
         .upsert(payload, {
-          onConflict: "patient_id,supplement_name,time_slot,check_date",
+          onConflict: "patient_id,supplement_name,check_date,dose_index",
         });
       if (error) {
         console.error("[mypage] medication_checks upsert failed:", error);
         // 실패 시 롤백
         setChecksByDate((prev) => {
           const dayChecks = { ...(prev[dateKey] || {}) };
-          const arr = [...(dayChecks[id] ?? new Array(supp.times.length).fill(false))];
-          arr[timeIndex] = !nextChecked;
+          const arr = [...(dayChecks[id] ?? new Array(supp.daily_count).fill(false))];
+          arr[doseIndex] = !nextChecked;
           dayChecks[id] = arr;
           return { ...prev, [dateKey]: dayChecks };
         });
@@ -627,24 +972,189 @@ function MypageContent() {
     })();
   };
 
-  /* 영양제 삭제 */
-  const deleteSupplement = (id: string) => {
+  /* 영양제 삭제 — 옵티미스틱 + 롤백 */
+  const deleteSupplement = async (id: string) => {
+    setSwipedId(null);
+    const target = supplements.find((s) => s.id === id);
+    if (!target) return;
+    const prevList = supplements;
     setSupplements((prev) => prev.filter((s) => s.id !== id));
+    if (!user) return; // 비로그인 — 로컬만
+    const { error } = await supabase
+      .from("patient_supplements")
+      .delete()
+      .eq("id", id);
+    if (error) {
+      console.error("[mypage] patient_supplements delete failed:", error);
+      setSupplements(prevList);
+      showMypageToast("영양제 삭제에 실패했어요. 잠시 후 다시 시도해 주세요.");
+    }
+  };
+
+  /** 복용 가이드의 모든 영양제를 한 번에 patient_supplements 에 등록.
+   *  source='dosage_guide' + source_dosage_guide_id 로 중복 방지 표식.
+   *  time_slots 가 빈 가이드 항목은 건너뜀(체크할 슬롯이 없으면 의미 없음).
+   *  startDate: 시작일 확인 모달에서 받은 YYYY-MM-DD. */
+  const addFromDosageGuide = async (guide: DosageGuide, startDate: string) => {
+    if (!user) {
+      showMypageToast("로그인 후 이용해 주세요.");
+      return;
+    }
+    if (addingFromGuideId) return;
+    const filtered = guide.supplements
+      .filter((s) => s.name.trim())
+      .map((s) => {
+        const slots = s.time_slots.filter((slot): slot is TimeSlot => isValidTimeSlot(slot));
+        return { name: s.name.trim(), time_slots: slots, daily_count: s.daily_count, days: s.days };
+      })
+      // 슬롯도 0이고 daily_count 도 없으면 의미 없으니 스킵, 둘 중 하나라도 있으면 통과
+      .filter((s) => s.time_slots.length > 0 || (s.daily_count != null && s.daily_count > 0));
+    if (filtered.length === 0) {
+      showMypageToast("추가할 수 있는 영양제가 없어요.");
+      return;
+    }
+    const rows: PatientSupplementInsert[] = filtered.map((s) => ({
+      patient_id: user.id,
+      name: s.name,
+      time_slots: s.time_slots,
+      // ChartClient 폴백 패턴: 직접값 > 슬롯수 > 1
+      daily_count: (s.daily_count && s.daily_count > 0)
+        ? s.daily_count
+        : (s.time_slots.length > 0 ? s.time_slots.length : 1),
+      source: "dosage_guide",
+      source_dosage_guide_id: guide.id,
+      start_date: startDate,
+      days: (typeof s.days === "number" && s.days > 0) ? s.days : null,
+    }));
+    setAddingFromGuideId(guide.id);
+    const { data, error } = await (supabase
+      .from("patient_supplements") as unknown as {
+        insert: (p: PatientSupplementInsert[]) => {
+          select: (cols: string) => Promise<{
+            data: PatientSupplementRow[] | null;
+            error: { message: string; code?: string } | null;
+          }>;
+        };
+      })
+      .insert(rows)
+      .select("id, patient_id, name, time_slots, daily_count, source, source_dosage_guide_id, start_date, days, created_at, updated_at");
+    setAddingFromGuideId(null);
+    if (error || !data) {
+      console.error("[mypage] addFromDosageGuide insert failed:", error);
+      showMypageToast("영양제 등록에 실패했어요. 잠시 후 다시 시도해 주세요.");
+      return;
+    }
+    const mapped = data.map(mapPatientSupplementRow);
+    setSupplements((prev) => [...prev, ...mapped]);
+    setGuideStartModal(null);
+    showMypageToast(`영양제 ${mapped.length}개를 추가했어요`);
+  };
+
+  /* 영양제 추가 — patient_supplements INSERT 후 setState */
+  const addSupplement = async () => {
+    const trimmedName = newName.trim();
+    if (!trimmedName || newTimes.size === 0) return;
+    if (!user) {
+      showMypageToast("로그인 후 이용해 주세요.");
+      return;
+    }
+    const slots = sortSlots(Array.from(newTimes));
+    // 슬롯 1개 이상이면 그 개수, 0개면 1. 환자 직접 등록은 슬롯을 1개 이상 강제하지만 안전한 폴백.
+    const dailyCount = slots.length > 0 ? slots.length : 1;
+    const payload: PatientSupplementInsert = {
+      patient_id: user.id,
+      name: trimmedName,
+      time_slots: slots,
+      daily_count: dailyCount,
+      source: "manual",
+      source_dosage_guide_id: null,
+      start_date: addStartDate,
+    };
+    const { data, error } = await (supabase
+      .from("patient_supplements") as unknown as {
+        insert: (p: PatientSupplementInsert) => {
+          select: (cols: string) => {
+            single: () => Promise<{
+              data: PatientSupplementRow | null;
+              error: { message: string; code?: string } | null;
+            }>;
+          };
+        };
+      })
+      .insert(payload)
+      .select("id, patient_id, name, time_slots, daily_count, source, source_dosage_guide_id, start_date, days, created_at, updated_at")
+      .single();
+    if (error || !data) {
+      console.error("[mypage] patient_supplements insert failed:", error);
+      showMypageToast("영양제 등록에 실패했어요. 잠시 후 다시 시도해 주세요.");
+      return;
+    }
+    setSupplements((prev) => [...prev, mapPatientSupplementRow(data)]);
+    setNewName("");
+    setNewTimes(new Set());
+    setAddStartDate(getTodayLocalISO());
+    setShowAddModal(false);
+  };
+
+  /** 영양제 편집 모달 열기 — 현재 값 prefill, swipe 닫기. */
+  const openEditSupplement = (s: Supplement) => {
+    setEditingId(s.id);
+    setEditSuppName(s.name);
+    setEditTimes(new Set(s.time_slots));
+    setEditStartDate(s.start_date ?? getTodayLocalISO());
+    setEditDays(s.days != null ? String(s.days) : "");
     setSwipedId(null);
   };
 
-  /* 영양제 추가 */
-  const addSupplement = () => {
-    if (!newName.trim() || newTimes.size === 0) return;
-    const newItem: Supplement = {
-      id: `s-new-${Date.now()}`,
-      name: newName.trim(),
-      times: Array.from(newTimes).map((slot) => ({ slot, checked: false })),
+  /* 영양제 수정 — patient_supplements UPDATE (행만; 약사 원본 가이드 미수정) */
+  const updateSupplement = async () => {
+    if (!editingId) return;
+    const trimmedName = editSuppName.trim();
+    if (!trimmedName) return;
+    if (!user) {
+      showMypageToast("로그인 후 이용해 주세요.");
+      return;
+    }
+    const slots = sortSlots(Array.from(editTimes));
+    const dailyCount = slots.length > 0 ? slots.length : 1;
+    let daysVal: number | null = null;
+    const trimmedDays = editDays.trim();
+    if (trimmedDays) {
+      const parsed = parseInt(trimmedDays, 10);
+      daysVal = (!Number.isNaN(parsed) && parsed > 0) ? parsed : null;
+    }
+    const patch: PatientSupplementUpdate = {
+      name: trimmedName,
+      time_slots: slots,
+      daily_count: dailyCount,
+      start_date: editStartDate || null,
+      days: daysVal,
     };
-    setSupplements((prev) => [...prev, newItem]);
-    setNewName("");
-    setNewTimes(new Set());
-    setShowAddModal(false);
+    const { data, error } = await (supabase
+      .from("patient_supplements") as unknown as {
+        update: (p: PatientSupplementUpdate) => {
+          eq: (col: string, val: string) => {
+            select: (cols: string) => {
+              single: () => Promise<{
+                data: PatientSupplementRow | null;
+                error: { message: string; code?: string } | null;
+              }>;
+            };
+          };
+        };
+      })
+      .update(patch)
+      .eq("id", editingId)
+      .select("id, patient_id, name, time_slots, daily_count, source, source_dosage_guide_id, start_date, days, created_at, updated_at")
+      .single();
+    if (error || !data) {
+      console.error("[mypage] patient_supplements update failed:", error);
+      showMypageToast("영양제 수정에 실패했어요. 잠시 후 다시 시도해 주세요.");
+      return;
+    }
+    const updatedRow = data;
+    setSupplements((prev) => prev.map((x) => x.id === editingId ? mapPatientSupplementRow(updatedRow) : x));
+    setEditingId(null);
   };
 
   /* 프로필 저장 — supabase.profiles UPDATE */
@@ -679,10 +1189,36 @@ function MypageContent() {
     setSavingProfile(false);
   }, [user, editName, editBirth]);
 
-  const checkedCount = supplements.reduce((acc, s) => acc + getChecks(s.id, s.times.length).filter(Boolean).length, 0);
+  const checkedCount = supplements.reduce((acc, s) => acc + getChecks(s.id, s.daily_count).filter(Boolean).length, 0);
 
   return (
     <div className="my-page">
+      {/* 마이페이지 토스트 — 영양제/가이드 DB 동작 결과 알림 */}
+      {mypageToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: "fixed",
+            top: 70,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 300,
+            fontSize: 14,
+            color: "#2C3630",
+            background: "#EDF4F0",
+            border: "1px solid #B3CCBE",
+            padding: "10px 16px",
+            borderRadius: 10,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+            maxWidth: 360,
+            fontFamily: "'Noto Sans KR', sans-serif",
+          }}
+        >
+          {mypageToast}
+        </div>
+      )}
+
       {/* 네비게이션 */}
       <nav>
         <button className="nav-back" onClick={() => router.back()} aria-label="뒤로가기">
@@ -838,12 +1374,12 @@ function MypageContent() {
         <section className="my-section">
           <h2 className="my-section-title">내 영양제 관리</h2>
 
-          {showEmptyState ? (
+          {supplementsLoaded && supplements.length === 0 ? (
             <div style={emptyBox}>
               <div style={emptyEmoji}>💊</div>
               <div style={emptyTitle}>아직 등록된 영양제가 없어요</div>
               <div style={emptyDesc}>영양제를 등록하면 복약 체크를 할 수 있어요</div>
-              <button type="button" style={emptyBtn} onClick={() => setShowAddModal(true)}>+ 영양제 추가</button>
+              <button type="button" style={emptyBtn} onClick={() => { setAddStartDate(getTodayLocalISO()); setShowAddModal(true); }}>+ 영양제 추가</button>
             </div>
           ) : (
           <>
@@ -901,7 +1437,107 @@ function MypageContent() {
 
           <div className="my-supplement-list">
             {supplements.map((s) => {
-              const checks = getChecks(s.id, s.times.length);
+              // 시작일 전 판정 — dateKey(선택 날짜) 와 start_date 문자열 사전식 비교
+              const notStarted = !!s.start_date && s.start_date > dateKey;
+              const isTodayView = dayOffset === 0;
+              // 과거 날짜에서 아직 시작 전인 영양제는 카드 자체 숨김
+              if (notStarted && !isTodayView) return null;
+              const checks = getChecks(s.id, s.daily_count);
+
+              // "곧 시작" 비활성 카드 — 오늘 화면에서 미래 시작 영양제
+              if (notStarted && isTodayView) {
+                let upcomingPharmacy: string | null = null;
+                if (s.source === "dosage_guide" && s.source_dosage_guide_id) {
+                  const g = dosageGuides.find((x) => x.id === s.source_dosage_guide_id);
+                  upcomingPharmacy = g?.pharmacy_name ?? null;
+                }
+                const upcomingStartLabel = formatStartLabel(s.start_date);
+                return (
+                  <div
+                    key={s.id}
+                    className={`my-supplement-card${swipedId === s.id ? " swiped" : ""}`}
+                  >
+                    <div
+                      className="my-supplement-content"
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setSwipedId(swipedId === s.id ? null : s.id);
+                      }}
+                      style={{ display: "flex", flexDirection: "column", gap: 0, alignItems: "stretch", textAlign: "left", transform: swipedId === s.id ? "translateX(-140px)" : undefined }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                        <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0, flex: 1 }}>
+                          <span className="my-supplement-name">{s.name}</span>
+                          {upcomingPharmacy && (
+                            <span style={{
+                              fontSize: 13,
+                              fontWeight: 400,
+                              color: "#5E7D6C",
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}>{upcomingPharmacy}</span>
+                          )}
+                        </div>
+                        <div style={{
+                          display: "flex", gap: 10, alignItems: "center", flexShrink: 0,
+                          opacity: 0.35, pointerEvents: "none",
+                        }}>
+                          {Array.from({ length: s.daily_count }).map((_, ti) => {
+                            const label = s.time_slots[ti] ?? `${ti + 1}회`;
+                            return (
+                              <button
+                                key={ti}
+                                type="button"
+                                disabled
+                                aria-label={`${s.name} ${label} 시작 전`}
+                                style={{
+                                  display: "flex", alignItems: "center", gap: 4,
+                                  background: "none", border: "none", cursor: "default", padding: 0,
+                                }}
+                              >
+                                <HeartIcon filled={false} size={20} />
+                                <span style={{ fontSize: 13, fontWeight: 500, color: "#3D4A42" }}>{label}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      {upcomingStartLabel && (
+                        <span style={{
+                          display: "block",
+                          marginTop: 2,
+                          fontSize: 13,
+                          fontWeight: 500,
+                          color: "#5E7D6C",
+                          textAlign: "left",
+                        }}>
+                          곧 시작 · {upcomingStartLabel}부터
+                        </span>
+                      )}
+                    </div>
+                    {/* 스와이프 액션 */}
+                    <div className="my-supplement-actions">
+                      <button
+                        className="my-swipe-btn"
+                        style={{ background: "#5E7D6C", color: "#fff" }}
+                        onClick={() => openEditSupplement(s)}
+                        type="button"
+                      >
+                        수정
+                      </button>
+                      <button
+                        className="my-swipe-btn delete"
+                        onClick={() => deleteSupplement(s.id)}
+                        type="button"
+                      >
+                        삭제
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+
               return (
                 <div
                   key={s.id}
@@ -913,32 +1549,104 @@ function MypageContent() {
                       e.preventDefault();
                       setSwipedId(swipedId === s.id ? null : s.id);
                     }}
-                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}
+                    style={{ display: "flex", flexDirection: "column", gap: 0, alignItems: "stretch", textAlign: "left", transform: swipedId === s.id ? "translateX(-140px)" : undefined }}
                   >
-                    <span className="my-supplement-name">{s.name}</span>
-                    <div style={{ display: "flex", gap: 10, alignItems: "center", flexShrink: 0 }}>
-                      {s.times.map((t, ti) => {
-                        const isChecked = checks[ti] ?? false;
-                        return (
-                          <button
-                            key={ti}
-                            type="button"
-                            onClick={() => toggleCheck(s.id, ti)}
-                            aria-label={`${s.name} ${t.slot} ${isChecked ? "복용 완료" : "복용 체크"}`}
-                            style={{
-                              display: "flex", alignItems: "center", gap: 4,
-                              background: "none", border: "none", cursor: "pointer", padding: 0,
-                            }}
-                          >
-                            <HeartIcon filled={isChecked} size={20} />
-                            <span style={{ fontSize: 13, fontWeight: 500, color: isChecked ? "#4A6355" : "#3D4A42" }}>{t.slot}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
+                    {(() => {
+                      const remain = calcRemainingDays(s.start_date, s.days);
+                      let remainText: string | null = null;
+                      let remainEnded = false;
+                      if (remain != null) {
+                        if (remain > 0) remainText = `${remain}일분 남음`;
+                        else if (remain === 0) remainText = "오늘까지";
+                        else { remainText = "복용 기간 종료"; remainEnded = true; }
+                      }
+                      // 약국명: dosage_guide 출처일 때만 매칭 (전체 dosageGuides 에서 find — 비활성 가이드도 잡힘). manual 은 null.
+                      let pharmacyName: string | null = null;
+                      if (s.source === "dosage_guide" && s.source_dosage_guide_id) {
+                        const g = dosageGuides.find((x) => x.id === s.source_dosage_guide_id);
+                        pharmacyName = g?.pharmacy_name ?? null;
+                      }
+                      const startLabel = formatStartLabel(s.start_date);
+                      return (
+                        <>
+                          {/* 상단행: 이름 + 약국명 / 하트 */}
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                            <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0, flex: 1 }}>
+                              <span className="my-supplement-name">{s.name}</span>
+                              {pharmacyName && (
+                                <span style={{
+                                  fontSize: 13,
+                                  fontWeight: 400,
+                                  color: "#5E7D6C",
+                                  whiteSpace: "nowrap",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                }}>{pharmacyName}</span>
+                              )}
+                            </div>
+                            <div style={{ display: "flex", gap: 10, alignItems: "center", flexShrink: 0 }}>
+                              {Array.from({ length: s.daily_count }).map((_, ti) => {
+                                const isChecked = checks[ti] ?? false;
+                                // 슬롯이 있으면 그 라벨, 없으면 "N회"(1-based)
+                                const label = s.time_slots[ti] ?? `${ti + 1}회`;
+                                return (
+                                  <button
+                                    key={ti}
+                                    type="button"
+                                    onClick={() => toggleCheck(s.id, ti)}
+                                    aria-label={`${s.name} ${label} ${isChecked ? "복용 완료" : "복용 체크"}`}
+                                    style={{
+                                      display: "flex", alignItems: "center", gap: 4,
+                                      background: "none", border: "none", cursor: "pointer", padding: 0,
+                                    }}
+                                  >
+                                    <HeartIcon filled={isChecked} size={20} />
+                                    <span style={{ fontSize: 13, fontWeight: 500, color: isChecked ? "#4A6355" : "#3D4A42" }}>{label}</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                          {/* 하단 보조줄: 전체폭 — 하트 폭에 안 눌림 */}
+                          {(remainText || startLabel) && (
+                            <span style={{
+                              display: "block",
+                              marginTop: 2,
+                              lineHeight: 1.4,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              textAlign: "left",
+                            }}>
+                              {remainText && (
+                                <span style={{
+                                  fontSize: 14,
+                                  fontWeight: 700,
+                                  color: remainEnded ? "#3D4A42" : "#4A6355",
+                                }}>{remainText}</span>
+                              )}
+                              {remainText && startLabel && (
+                                <span style={{ fontSize: 13, fontWeight: 400, color: "#5E7D6C" }}>{" · "}</span>
+                              )}
+                              {startLabel && (
+                                <span style={{ fontSize: 13, fontWeight: 400, color: "#5E7D6C" }}>{startLabel} 시작</span>
+                              )}
+                            </span>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                   {/* 스와이프 액션 */}
                   <div className="my-supplement-actions">
+                    <button
+                      className="my-swipe-btn"
+                      style={{ background: "#5E7D6C", color: "#fff" }}
+                      onClick={() => openEditSupplement(s)}
+                      type="button"
+                    >
+                      수정
+                    </button>
                     <button
                       className="my-swipe-btn delete"
                       onClick={() => deleteSupplement(s.id)}
@@ -960,9 +1668,11 @@ function MypageContent() {
                 const dayKey = fmtKey(d);
                 const isToday = dayKey === todayKey;
                 // 해당 날짜에 모든 영양제·시간슬롯의 체크 비율 계산
+                // 단, 그 요일에 아직 시작 전인 영양제는 분모에서 제외 (start_date > dayKey)
                 const allFlags = supplements.flatMap((s) => {
+                  if (s.start_date && s.start_date > dayKey) return [];
                   const arr = checksByDate[dayKey]?.[s.id]
-                    ?? new Array(s.times.length).fill(false);
+                    ?? new Array(s.daily_count).fill(false);
                   return arr;
                 });
                 const total = allFlags.length;
@@ -992,7 +1702,7 @@ function MypageContent() {
 
           <button
             className="my-add-supplement-btn"
-            onClick={() => setShowAddModal(true)}
+            onClick={() => { setAddStartDate(getTodayLocalISO()); setShowAddModal(true); }}
             type="button"
           >
             + 영양제 추가
@@ -1005,127 +1715,212 @@ function MypageContent() {
         <section className="my-section">
           <h2 className="my-section-title">내 복용 가이드</h2>
 
-          {/* 가이드 카드 */}
-          {([
-            {
-              pharmacist: "김서연 약사",
-              pharmacy: "그린약국",
-              date: "2026.04.07",
-              items: [
-                { name: "비타민B군", dosage: "1알 씩", timing: "아침 식후", memo: "피로 개선 목적, 2주 후 경과 확인" },
-                { name: "마그네슘", dosage: "1알 씩", timing: "취침 전", memo: "수면 질 개선, 근육 이완 도움" },
-              ],
-              lifestyle: "카페인 하루 2잔 이하로 줄이기, 취침 30분 전 스마트폰 금지",
-            },
-            {
-              pharmacist: "김서연 약사",
-              pharmacy: "그린약국",
-              date: "2026.03.27",
-              items: [
-                { name: "마그네슘", dosage: "1알 씩", timing: "취침 전", memo: "수면 보조" },
-                { name: "유산균", dosage: "1포 씩", timing: "아침 공복", memo: "장 건강 개선" },
-              ],
-              lifestyle: "저녁 9시 이후 야식 줄이기",
-            },
-          ] as const).map((guide, gi) => {
-            const isGuideOpen = expandedGuides.has(gi);
-            return (
-            <div
-              key={gi}
-              style={{
-                borderRadius: 14,
-                border: gi === 0 ? "1.5px solid #F0D9CC" : "1px solid rgba(94,125,108,0.14)",
-                marginBottom: 12,
-                overflow: "hidden",
-                fontStyle: "normal",
-              }}
-            >
-              {/* 클릭 가능한 헤더 */}
-              <button
-                type="button"
-                onClick={() => toggleGuide(gi)}
-                style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
-                  width: "100%", padding: 16,
-                  background: gi === 0 ? "#FDF5F2" : "#F4F6F3",
-                  border: "none",
-                  cursor: "pointer", textAlign: "left",
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <div style={{
-                    width: 32, height: 32, borderRadius: "50%",
-                    background: "var(--sage-pale, #EDF4F0)",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    flexShrink: 0,
-                  }}>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                      <circle cx="12" cy="8" r="4" fill="var(--sage-mid, #5E7D6C)" />
-                      <path d="M4 20c0-3.31 3.58-6 8-6s8 2.69 8 6" fill="var(--sage-mid, #5E7D6C)" />
-                    </svg>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: "#2C3630" }}>{guide.pharmacist}</div>
-                    <div style={{ fontSize: 14, color: "#3D4A42" }}>
-                      {guide.pharmacy} · {guide.date}
-                    </div>
-                  </div>
+          {(() => {
+            // active 가이드만 카드 목록에 노출. 비활성(completed/stopped) 은 영양제 출처 매칭용으로만 사용.
+            const activeGuides = dosageGuides.filter((g) => g.dosage_status === "active");
+            if (dosageGuidesLoaded && activeGuides.length === 0) {
+              return (
+                <div style={{
+                  padding: "16px 18px", borderRadius: 12,
+                  background: "#F8F9F7", border: "1px solid rgba(94,125,108,0.14)",
+                  fontSize: 14, color: "#3D4A42", lineHeight: 1.5,
+                }}>
+                  아직 받은 복용 가이드가 없어요. 약사님 상담 후 가이드가 이곳에 표시돼요.
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  {!isGuideOpen && (
-                    <span style={{ fontSize: 14, color: "#3D4A42", fontWeight: 500 }}>{guide.items.length}개 영양제</span>
-                  )}
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5E7D6C" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
-                    style={{ transition: "transform 0.2s", transform: isGuideOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}>
-                    <polyline points="6 9 12 15 18 9" />
-                  </svg>
-                </div>
-              </button>
-
-              {/* 펼쳐진 내용 */}
-              {isGuideOpen && (
-                <div style={{ padding: "12px 16px 16px", background: "#fff", borderTop: "1px solid rgba(94,125,108,0.12)" }}>
-                  {/* 영양제 목록 */}
-                  {guide.items.map((item, ii) => (
-                    <div
-                      key={ii}
-                      style={{
-                        padding: 12,
-                        borderRadius: 10,
+              );
+            }
+            return activeGuides.map((guide, gi) => {
+              const isGuideOpen = expandedGuides.has(gi);
+              const sentDate = (() => {
+                const iso = guide.sent_at || guide.created_at;
+                if (!iso) return "";
+                const d = new Date(iso);
+                return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+              })();
+              const alreadyAdded = supplements.some(
+                (s) => s.source_dosage_guide_id === guide.id,
+              );
+              const isAdding = addingFromGuideId === guide.id;
+              return (
+                <div
+                  key={guide.id}
+                  style={{
+                    borderRadius: 14,
+                    border: gi === 0 ? "1.5px solid #F0D9CC" : "1px solid rgba(94,125,108,0.14)",
+                    marginBottom: 12,
+                    overflow: "hidden",
+                    fontStyle: "normal",
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => toggleGuide(gi)}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      width: "100%", padding: 16,
+                      background: gi === 0 ? "#FDF5F2" : "#F4F6F3",
+                      border: "none",
+                      cursor: "pointer", textAlign: "left",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{
+                        width: 32, height: 32, borderRadius: "50%",
                         background: "var(--sage-pale, #EDF4F0)",
-                        marginBottom: 8,
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
-                        <span style={{ fontSize: 15, fontWeight: 600, color: "#2C3630" }}>{item.name}</span>
-                        <span style={{ fontSize: 14, fontWeight: 600, color: "#2C3630" }}>{item.dosage}</span>
-                        <span style={{ fontSize: 14, fontWeight: 500, color: "#2C3630" }}>{item.timing}</span>
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        flexShrink: 0,
+                      }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                          <circle cx="12" cy="8" r="4" fill="var(--sage-mid, #5E7D6C)" />
+                          <path d="M4 20c0-3.31 3.58-6 8-6s8 2.69 8 6" fill="var(--sage-mid, #5E7D6C)" />
+                        </svg>
                       </div>
-                      {item.memo && (
-                        <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontStyle: "normal" }}>
-                          {item.memo}
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: "#2C3630" }}>
+                          {guide.pharmacist_name ? `${guide.pharmacist_name} 약사님 복용 가이드` : "약사님 복용 가이드"}
+                        </div>
+                        <div style={{ fontSize: 14, color: "#3D4A42" }}>
+                          {sentDate}
+                          {guide.dosage_days ? ` · ${guide.dosage_days}일치` : ""}
+                          {guide.pharmacy_name ? ` · ${guide.pharmacy_name}` : ""}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {!isGuideOpen && (
+                        <span style={{ fontSize: 14, color: "#3D4A42", fontWeight: 500 }}>{guide.supplements.length}개 영양제</span>
+                      )}
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5E7D6C" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                        style={{ transition: "transform 0.2s", transform: isGuideOpen ? "rotate(180deg)" : "rotate(0deg)", flexShrink: 0 }}>
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                    </div>
+                  </button>
+
+                  {isGuideOpen && (
+                    <div style={{ padding: "12px 16px 16px", background: "#fff", borderTop: "1px solid rgba(94,125,108,0.12)" }}>
+                      {guide.supplements.map((item, ii) => {
+                        const isCompound = item.dispense_type === "compounded";
+                        // 하루 횟수 폴백: 직접값 > 슬롯수 > 1 (ChartClient 동일 패턴)
+                        const dc = item.daily_count && item.daily_count > 0
+                          ? item.daily_count
+                          : (item.time_slots.length > 0 ? item.time_slots.length : 1);
+                        // "기타" 슬롯에 etc_note 괄호 병기
+                        const slotsDisplay = item.time_slots.map((slot) =>
+                          slot === "기타" && item.etc_note ? `기타(${item.etc_note})` : slot,
+                        );
+                        // 메타 줄 1: [용량씩] · [하루 N회] · [슬롯들] · [부가설명] 순서.
+                        // 슬롯들은 내부 ", " 로 묶어 하나의 항목으로(메타 구분자 " · " 와 시각 분리).
+                        // 일수는 별도 줄로 분리.
+                        const slotsStr = slotsDisplay.length > 0 ? slotsDisplay.join(", ") : "";
+                        const metaParts: string[] = [];
+                        if (item.dosage) metaParts.push(`${item.dosage}씩`);
+                        metaParts.push(`하루 ${dc}회`);
+                        if (slotsStr) metaParts.push(slotsStr);
+                        if (item.timing) metaParts.push(item.timing);
+                        return (
+                        <div
+                          key={ii}
+                          style={{
+                            padding: 12,
+                            borderRadius: 10,
+                            background: "var(--sage-pale, #EDF4F0)",
+                            marginBottom: 8,
+                          }}
+                        >
+                          {/* (a) 헤더 — 통약/소분 배지 + 이름 */}
+                          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                            <span style={{
+                              fontSize: 11, fontWeight: 700,
+                              padding: "1px 7px", borderRadius: 100,
+                              background: isCompound ? "var(--terra-pale, #FBF5F1)" : "var(--sage-pale, #EDF4F0)",
+                              color: isCompound ? "#C06B45" : "#4A6355",
+                              border: isCompound
+                                ? "1px solid var(--terra-light, #F5E6DC)"
+                                : "1px solid rgba(94,125,108,0.2)",
+                            }}>
+                              {isCompound ? "소분 조제약" : "통약"}
+                            </span>
+                            <span style={{ fontSize: 15, fontWeight: 600, color: "#2C3630" }}>{item.name}</span>
+                          </div>
+
+                          {/* (b) 메타 줄 1 — 용량씩 · 하루 N회 · 슬롯 · 부가설명 */}
+                          <div style={{ fontSize: 14, fontWeight: 500, color: "#3D4A42", marginTop: 4, lineHeight: 1.5 }}>
+                            {metaParts.join(" · ")}
+                          </div>
+
+                          {/* (b') 메타 줄 2 — 일수 별도 줄. days 가 null 이면 그리지 않음 */}
+                          {item.days != null && (
+                            <div style={{ fontSize: 14, fontWeight: 500, color: "#3D4A42", marginTop: 2, lineHeight: 1.5 }}>
+                              {item.days}일분
+                            </div>
+                          )}
+
+                          {/* (c) 메모 */}
+                          {item.memo && (
+                            <div style={{ fontSize: 14, fontWeight: 500, color: "#3D4A42", marginTop: 6, lineHeight: 1.5 }}>
+                              📝 {item.memo}
+                            </div>
+                          )}
+
+                          {/* (d) 약포지 안내 — 소분 + package_note=true 일 때만 */}
+                          {isCompound && item.package_note && (
+                            <div style={{
+                              marginTop: 8,
+                              padding: "7px 10px",
+                              borderRadius: 8,
+                              background: "var(--terra-pale, #FBF5F1)",
+                              border: "1px solid var(--terra-light, #F5E6DC)",
+                              fontSize: 14,
+                              fontWeight: 500,
+                              color: "#C06B45",
+                            }}>
+                              약포지에 표시된 대로 복용하세요
+                            </div>
+                          )}
+                        </div>
+                        );
+                      })}
+
+                      {guide.custom_guide && (
+                        <div style={{
+                          padding: 12,
+                          borderRadius: 10,
+                          background: "var(--terra-pale, #FBF5F1)",
+                          border: "1px solid var(--terra-light, #F5E6DC)",
+                          marginBottom: 10,
+                        }}>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: "#2C3630", marginBottom: 4 }}>생활 가이드</div>
+                          <div style={{ fontSize: 15, color: "#3D4A42", lineHeight: 1.6 }}>{guide.custom_guide}</div>
                         </div>
                       )}
-                    </div>
-                  ))}
 
-                  {/* 생활 가이드 */}
-                  {guide.lifestyle && (
-                    <div style={{
-                      padding: 12,
-                      borderRadius: 10,
-                      background: "var(--terra-pale, #FBF5F1)",
-                      border: "1px solid var(--terra-light, #F5E6DC)",
-                    }}>
-                      <div style={{ fontSize: 14, fontWeight: 600, color: "#2C3630", marginBottom: 4 }}>생활 가이드</div>
-                      <div style={{ fontSize: 15, color: "#3D4A42", lineHeight: 1.6 }}>{guide.lifestyle}</div>
+                      <button
+                        type="button"
+                        onClick={() => setGuideStartModal({ guide, date: getTodayLocalISO() })}
+                        disabled={alreadyAdded || isAdding}
+                        style={{
+                          width: "100%",
+                          padding: "12px 0",
+                          borderRadius: 10,
+                          fontSize: 14,
+                          fontWeight: 700,
+                          background: alreadyAdded ? "#F4F6F3" : "#4A6355",
+                          color: alreadyAdded ? "#7A8A80" : "#fff",
+                          border: alreadyAdded ? "1px solid rgba(94,125,108,0.18)" : "none",
+                          cursor: (alreadyAdded || isAdding) ? "default" : "pointer",
+                          opacity: isAdding ? 0.7 : 1,
+                          fontFamily: "'Noto Sans KR', sans-serif",
+                        }}
+                      >
+                        {alreadyAdded ? "추가 완료" : isAdding ? "추가 중..." : "이대로 추가하기"}
+                      </button>
                     </div>
                   )}
                 </div>
-              )}
-            </div>
-            );
-          })}
+              );
+            });
+          })()}
         </section>
 
         {/* ═══════ 다음 몸 상태 체크 카드 ═══════ */}
@@ -1511,6 +2306,19 @@ function MypageContent() {
               ))}
             </div>
 
+            <label className="my-edit-label" style={{ marginTop: 14 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                복용 시작일
+                {addStartDate === getTodayLocalISO() && <TodayBadge />}
+              </span>
+              <input
+                type="date"
+                className="my-edit-input"
+                value={addStartDate}
+                onChange={(e) => setAddStartDate(e.target.value)}
+              />
+            </label>
+
             <div className="my-modal-actions">
               <button className="my-btn secondary" onClick={() => setShowAddModal(false)} type="button">
                 취소
@@ -1518,10 +2326,139 @@ function MypageContent() {
               <button
                 className="my-btn primary"
                 onClick={addSupplement}
-                disabled={!newName.trim() || newTimes.size === 0}
+                disabled={!newName.trim() || newTimes.size === 0 || !addStartDate}
                 type="button"
               >
                 등록
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════ 영양제 수정 모달 ═══════ */}
+      {editingId !== null && (
+        <div className="my-modal-overlay" onClick={() => setEditingId(null)}>
+          <div className="my-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 className="my-modal-title">영양제 수정</h3>
+
+            <label className="my-edit-label">
+              영양제 이름
+              <input
+                type="text"
+                className="my-edit-input"
+                placeholder="예: 오메가3"
+                value={editSuppName}
+                onChange={(e) => setEditSuppName(e.target.value)}
+              />
+            </label>
+
+            <div className="my-modal-time-label">복용 시간 (다중 선택)</div>
+            <div className="my-modal-time-grid">
+              {(["아침", "점심", "저녁", "취침 전"] as TimeSlot[]).map((t) => (
+                <button
+                  key={t}
+                  className={`my-time-chip${editTimes.has(t) ? " selected" : ""}`}
+                  onClick={() =>
+                    setEditTimes((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(t)) next.delete(t);
+                      else next.add(t);
+                      return next;
+                    })
+                  }
+                  type="button"
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+
+            <label className="my-edit-label" style={{ marginTop: 14 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                복용 시작일
+                {editStartDate === getTodayLocalISO() && <TodayBadge />}
+              </span>
+              <input
+                type="date"
+                className="my-edit-input"
+                value={editStartDate}
+                onChange={(e) => setEditStartDate(e.target.value)}
+              />
+            </label>
+
+            <label className="my-edit-label" style={{ marginTop: 14 }}>
+              복용 일수 (선택)
+              <input
+                type="number"
+                className="my-edit-input"
+                min={1}
+                placeholder="예: 60"
+                value={editDays}
+                onChange={(e) => setEditDays(e.target.value)}
+              />
+              <span style={{ display: "block", marginTop: 4, fontSize: 13, color: "#5E7D6C" }}>
+                남은 일수를 알려드릴 때 쓰여요. 비워두면 기간 없이 계속 챙겨요.
+              </span>
+            </label>
+
+            <div className="my-modal-actions">
+              <button className="my-btn secondary" onClick={() => setEditingId(null)} type="button">
+                취소
+              </button>
+              <button
+                className="my-btn primary"
+                onClick={updateSupplement}
+                disabled={!editSuppName.trim() || !editStartDate}
+                type="button"
+              >
+                저장
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════ "이대로 추가하기" 시작일 확인 미니 모달 ═══════ */}
+      {guideStartModal && (
+        <div className="my-modal-overlay" onClick={() => setGuideStartModal(null)}>
+          <div className="my-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 className="my-modal-title">오늘부터 복용하나요?</h3>
+            <div style={{ fontSize: 15, color: "#3D4A42", lineHeight: 1.6, marginBottom: 14 }}>
+              복용을 시작하는 날짜를 선택하세요. 종료 예정일 계산에 사용됩니다. 기본은 오늘이에요. 다른 날부터면 날짜를 바꿔주세요.
+            </div>
+
+            <label className="my-edit-label">
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                복용 시작일
+                {guideStartModal.date === getTodayLocalISO() && <TodayBadge />}
+              </span>
+              <input
+                type="date"
+                className="my-edit-input"
+                value={guideStartModal.date}
+                onChange={(e) =>
+                  setGuideStartModal((prev) => (prev ? { ...prev, date: e.target.value } : prev))
+                }
+              />
+            </label>
+
+            <div className="my-modal-actions">
+              <button
+                className="my-btn secondary"
+                onClick={() => setGuideStartModal(null)}
+                type="button"
+                disabled={addingFromGuideId === guideStartModal.guide.id}
+              >
+                취소
+              </button>
+              <button
+                className="my-btn primary"
+                onClick={() => addFromDosageGuide(guideStartModal.guide, guideStartModal.date)}
+                disabled={!guideStartModal.date || addingFromGuideId === guideStartModal.guide.id}
+                type="button"
+              >
+                {addingFromGuideId === guideStartModal.guide.id ? "추가 중..." : "추가하기"}
               </button>
             </div>
           </div>
