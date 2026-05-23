@@ -79,6 +79,11 @@ export type ReportStatus = "pending" | "reviewed" | "dismissed";
 
 export interface UiPreferences {
   hide_rejected_chats?: boolean;
+  /** 환자 마이페이지 알림 토글 4종 (사이클 5) */
+  noti_chat?: boolean;
+  noti_med?: boolean;
+  noti_health?: boolean;
+  noti_visit?: boolean;
   [key: string]: unknown;
 }
 

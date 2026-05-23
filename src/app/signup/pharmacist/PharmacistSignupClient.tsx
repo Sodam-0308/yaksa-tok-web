@@ -3,6 +3,8 @@
 import { useState, useRef, useEffect, useCallback, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import { geocodeAddress } from "@/lib/geocode";
+import AddressSearchButton from "@/components/AddressSearchButton";
 import { useAuth } from "@/contexts/AuthContext";
 
 /* ══════════════════════════════════════════
@@ -67,6 +69,7 @@ function PharmacistSignupContent() {
   /* ── Step 4: 약국 정보 ── */
   const [pharmacyName, setPharmacyName] = useState("");
   const [pharmacyAddr, setPharmacyAddr] = useState("");
+  const [pharmacyAddrDetail, setPharmacyAddrDetail] = useState("");
   const [bizNumber, setBizNumber] = useState("");
 
   /* ── Step 5: 전문 분야 ── */
@@ -253,15 +256,26 @@ function PharmacistSignupContent() {
       id: string;
       pharmacy_name: string;
       address: string;
+      lat: number | null;
+      lng: number | null;
       license_number: string | null;
       license_name: string;
       business_number: string | null;
       expert_specialties?: string[];
     };
+    // 도로명(검색 결과) + 상세주소(직접 입력) 합치기. 좌표 매칭은 도로명만으로도 충분하지만,
+    // DB 저장값은 사용자에게 보여줄 전체 주소가 되도록 합쳐서 저장한다.
+    const road = pharmacyAddr.trim();
+    const detail = pharmacyAddrDetail.trim();
+    const trimmedAddress = [road, detail].filter(Boolean).join(" ");
+    // 지오코딩 — 실패해도 null 로 폴백되어 가입 자체는 진행됨.
+    const { lat: geoLat, lng: geoLng } = await geocodeAddress(trimmedAddress);
     const ppPayload: PpUpsert = {
       id: user.id,
       pharmacy_name: pharmacyName.trim(),
-      address: pharmacyAddr.trim(),
+      address: trimmedAddress,
+      lat: geoLat,
+      lng: geoLng,
       license_number: license.trim() || null,
       license_name: licenseNameTrimmed,
       business_number: bizNumber || null,
@@ -645,16 +659,25 @@ function PharmacistSignupContent() {
 
               <div className="input-group">
                 <label className="input-label">약국 주소</label>
+                <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+                  <input
+                    type="text"
+                    className="input-field"
+                    placeholder="주소 검색을 눌러 선택하세요"
+                    value={pharmacyAddr}
+                    readOnly
+                    style={{ flex: 1, minWidth: 0 }}
+                  />
+                  <AddressSearchButton onSelect={(addr) => setPharmacyAddr(addr)} />
+                </div>
                 <input
                   type="text"
                   className="input-field"
-                  placeholder="예: 서울특별시 강남구 테헤란로 123"
-                  value={pharmacyAddr}
-                  onChange={(e) => setPharmacyAddr(e.target.value)}
+                  placeholder="상세주소 (건물명, 층, 호)"
+                  value={pharmacyAddrDetail}
+                  onChange={(e) => setPharmacyAddrDetail(e.target.value)}
+                  style={{ marginTop: 8 }}
                 />
-                <div style={{ fontSize: 13, color: C.sageMid, marginTop: 6 }}>
-                  추후 카카오맵 주소 검색으로 연동됩니다
-                </div>
               </div>
 
               <div className="input-group">

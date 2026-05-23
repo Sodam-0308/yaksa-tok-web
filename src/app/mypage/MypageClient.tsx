@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, Suspense } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
@@ -17,6 +17,7 @@ type MedicationCheckInsert = Database["public"]["Tables"]["medication_checks"]["
 type PatientSupplementRow = Database["public"]["Tables"]["patient_supplements"]["Row"];
 type PatientSupplementInsert = Database["public"]["Tables"]["patient_supplements"]["Insert"];
 type PatientSupplementUpdate = Database["public"]["Tables"]["patient_supplements"]["Update"];
+type VisitScheduleRow = Database["public"]["Tables"]["visit_schedules"]["Row"];
 
 /* ══════════════════════════════════════════
    기본 프로필 (DB 로딩 실패 시 fallback)
@@ -136,6 +137,28 @@ function formatStartLabel(startDate: string | null): string | null {
   return `${month}월 ${day}일`;
 }
 
+/** I-4 임박 알람 기준 — 단위 일. 복용 종료/방문 일정 D-N 이하일 때 배너 노출. */
+const MED_NEAR_THRESHOLD = 3;
+const VISIT_NEAR_THRESHOLD = 2;
+
+/** YYYY-MM-DD → (해당 날짜 - 오늘) 일수. 로컬 자정 기준 (toISOString UTC 미사용).
+ *  null/형식이상이면 null. calcRemainingDays 와 동일한 분해 방식. */
+function daysFromTodayLocal(iso: string | null): number | null {
+  if (!iso) return null;
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
+  if (!y || !mo || !d) return null;
+  const target = new Date(y, mo - 1, d);
+  if (Number.isNaN(target.getTime())) return null;
+  const todayISO = getTodayLocalISO();
+  const tm = todayISO.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!tm) return null;
+  const today = new Date(Number(tm[1]), Number(tm[2]) - 1, Number(tm[3]));
+  const diffMs = target.getTime() - today.getTime();
+  return Math.round(diffMs / (1000 * 60 * 60 * 24));
+}
+
 /** start_date(YYYY-MM-DD) + days → 종료예정일 기준 남은 일수.
  *  로직: end = start + days. remain = end - today (달력 날짜 차이).
  *  start_date / days 가 없거나 형식이 깨지면 null. */
@@ -154,6 +177,109 @@ function calcRemainingDays(startDate: string | null, days: number | null): numbe
   // 달력 일수 차이 (시/분/초 무시)
   const diffMs = end.getTime() - today.getTime();
   return Math.round(diffMs / (1000 * 60 * 60 * 24));
+}
+
+/** 일수 계산기 — 총개수 ÷ (하루횟수 × 한 번에 먹는 양) = 일수(버림).
+ *  추가/편집 모달 양쪽에서 재사용. dailyCount=0 이면 슬롯 먼저 선택 안내. */
+interface DayCalculatorProps {
+  dailyCount: number;
+  onApply: (days: number) => void;
+}
+function DayCalculator({ dailyCount, onApply }: DayCalculatorProps) {
+  const [totalCount, setTotalCount] = useState<string>("");
+  const [perDose, setPerDose] = useState<string>("1");
+  const totalNum = parseInt(totalCount, 10);
+  const perNum = parseInt(perDose, 10);
+  const validInputs =
+    Number.isFinite(totalNum) && totalNum > 0 &&
+    Number.isFinite(perNum) && perNum > 0;
+  const denom = dailyCount > 0 && validInputs ? dailyCount * perNum : 0;
+  const result = denom > 0 ? Math.floor(totalNum / denom) : null;
+  const hasRemainder = denom > 0 ? (totalNum % denom !== 0) : false;
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid rgba(94,125,108,0.22)",
+    fontSize: 15,
+    color: "#2C3630",
+    fontFamily: "'Noto Sans KR', sans-serif",
+    boxSizing: "border-box",
+  };
+  return (
+    <div style={{
+      marginTop: 10,
+      padding: 14,
+      borderRadius: 12,
+      background: "#EDF4F0",
+      border: "1px solid rgba(94,125,108,0.18)",
+    }}>
+      {dailyCount === 0 ? (
+        <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
+          복용 시간을 먼저 선택해 주세요.
+        </div>
+      ) : (
+        <>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#2C3630", marginBottom: 10 }}>
+            하루 {dailyCount}번 기준으로 계산해요
+          </div>
+          <label style={{ display: "block", marginBottom: 10, fontSize: 14, color: "#3D4A42" }}>
+            <span style={{ display: "block", marginBottom: 4 }}>총 개수 (정/캡슐)</span>
+            <input
+              type="number"
+              min={1}
+              placeholder="예: 60"
+              value={totalCount}
+              onChange={(e) => setTotalCount(e.target.value)}
+              style={inputStyle}
+            />
+          </label>
+          <label style={{ display: "block", marginBottom: 12, fontSize: 14, color: "#3D4A42" }}>
+            <span style={{ display: "block", marginBottom: 4 }}>한 번에 (정/캡슐)</span>
+            <input
+              type="number"
+              min={1}
+              placeholder="예: 1"
+              value={perDose}
+              onChange={(e) => setPerDose(e.target.value)}
+              style={inputStyle}
+            />
+          </label>
+          {result != null && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 15, color: "#2C3630", fontWeight: 700 }}>
+                약 {result}일분
+              </div>
+              {hasRemainder && (
+                <div style={{ fontSize: 14, color: "#C06B45", marginTop: 4, lineHeight: 1.5 }}>
+                  정확히 나누어떨어지지 않아 마지막 날은 복용량이 조금 다를 수 있어요
+                </div>
+              )}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => { if (result != null) onApply(result); }}
+            disabled={result == null}
+            style={{
+              width: "100%",
+              minHeight: 48,
+              borderRadius: 12,
+              border: "none",
+              background: result == null ? "#B3CCBE" : "#4A6355",
+              color: "#fff",
+              fontSize: 15,
+              fontWeight: 700,
+              cursor: result == null ? "default" : "pointer",
+              fontFamily: "'Noto Sans KR', sans-serif",
+            }}
+          >
+            이 일수로 넣기
+          </button>
+        </>
+      )}
+    </div>
+  );
 }
 
 /** "오늘" pill 배지. 선택된 날짜가 오늘과 같을 때만 부모가 조건부 렌더링. */
@@ -373,6 +499,108 @@ function MypageContent() {
       }
       setHcRows((data ?? []) as unknown as HealthCheckRow[]);
     })();
+  }, [user]);
+
+  /* ── DB 로드: 가장 가까운 다가오는 방문 예정 1건 ──
+   *  visit_schedules + pharmacist_profiles + profiles 폴백.
+   *  status="scheduled" + scheduled_date >= 오늘(KST). 0건이면 null. */
+  type NextVisit = {
+    id: string;
+    scheduled_date: string;
+    scheduled_time: string | null;
+    note: string | null;
+    pharmacist_name: string | null;
+    pharmacy_name: string | null;
+    address: string | null;
+    lat: number | null;
+    lng: number | null;
+  };
+  const [nextVisit, setNextVisit] = useState<NextVisit | null>(null);
+  useEffect(() => {
+    if (!user) {
+      setNextVisit(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const todayIso = getTodayLocalISO();
+      const { data: vsData, error: vsErr } = await supabase
+        .from("visit_schedules")
+        .select("id, pharmacist_id, scheduled_date, scheduled_time, note")
+        .eq("patient_id", user.id)
+        .eq("status", "scheduled")
+        .gte("scheduled_date", todayIso)
+        .order("scheduled_date", { ascending: true })
+        .limit(1);
+      if (cancelled) return;
+      if (vsErr) {
+        console.error("[mypage] visit_schedules load failed:", vsErr);
+        setNextVisit(null);
+        return;
+      }
+      const row = ((vsData ?? []) as unknown as Array<Pick<VisitScheduleRow, "id" | "pharmacist_id" | "scheduled_date" | "scheduled_time" | "note">>)[0];
+      if (!row) {
+        setNextVisit(null);
+        return;
+      }
+      // 약사/약국 정보 매칭 (license_name → profiles.name 폴백)
+      let pharmName: string | null = null;
+      let pharmacyName: string | null = null;
+      let address: string | null = null;
+      let pharmLat: number | null = null;
+      let pharmLng: number | null = null;
+      const { data: ppData, error: ppErr } = await supabase
+        .from("pharmacist_profiles")
+        .select("id, license_name, pharmacy_name, address, lat, lng")
+        .eq("id", row.pharmacist_id)
+        .maybeSingle();
+      if (cancelled) return;
+      if (ppErr) {
+        console.error("[mypage] next-visit pharmacist_profiles fetch failed:", ppErr);
+      } else if (ppData) {
+        const pp = ppData as {
+          license_name: string | null;
+          pharmacy_name: string | null;
+          address: string | null;
+          lat: number | string | null;
+          lng: number | string | null;
+        };
+        pharmName = (pp.license_name && pp.license_name.trim()) || null;
+        pharmacyName = (pp.pharmacy_name && pp.pharmacy_name.trim()) || null;
+        address = (pp.address && pp.address.trim()) || null;
+        // DB numeric → 숫자 변환 (문자열로 올 수도 있어 Number() 후 isFinite 가드)
+        const latNum = pp.lat != null ? Number(pp.lat) : NaN;
+        const lngNum = pp.lng != null ? Number(pp.lng) : NaN;
+        pharmLat = Number.isFinite(latNum) ? latNum : null;
+        pharmLng = Number.isFinite(lngNum) ? lngNum : null;
+      }
+      if (!pharmName) {
+        const { data: profData, error: profErr } = await supabase
+          .from("profiles")
+          .select("name")
+          .eq("id", row.pharmacist_id)
+          .maybeSingle();
+        if (cancelled) return;
+        if (profErr) {
+          console.error("[mypage] next-visit profiles fallback failed:", profErr);
+        } else if (profData) {
+          const pn = (profData as { name: string | null }).name;
+          if (pn && pn.trim()) pharmName = pn.trim();
+        }
+      }
+      setNextVisit({
+        id: row.id,
+        scheduled_date: row.scheduled_date,
+        scheduled_time: row.scheduled_time,
+        note: row.note,
+        pharmacist_name: pharmName,
+        pharmacy_name: pharmacyName,
+        address,
+        lat: pharmLat,
+        lng: pharmLng,
+      });
+    })();
+    return () => { cancelled = true; };
   }, [user]);
 
   /* consultations DB 로드 — 환자 본인의 상담 카드 (활성/종료) */
@@ -811,6 +1039,12 @@ function MypageContent() {
   const [newTimes, setNewTimes] = useState<Set<TimeSlot>>(new Set());
   /** addSupplement 모달의 복용 시작일 (기본 오늘 YYYY-MM-DD) */
   const [addStartDate, setAddStartDate] = useState<string>(() => getTodayLocalISO());
+  /** addSupplement 모달의 복용 일수 (선택). 빈 문자열이면 null 저장. */
+  const [addDays, setAddDays] = useState<string>("");
+  /** addSupplement 모달 안 일수 계산기 펼침 여부. */
+  const [addCalcOpen, setAddCalcOpen] = useState<boolean>(false);
+  /** updateSupplement 모달 안 일수 계산기 펼침 여부. */
+  const [editCalcOpen, setEditCalcOpen] = useState<boolean>(false);
   /** 편집 모달 상태. editingId 가 null 이 아니면 열림. */
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editSuppName, setEditSuppName] = useState<string>("");
@@ -910,6 +1144,104 @@ function MypageContent() {
   const [notiVisit, setNotiVisit] = useState(false);
   const [showLogout, setShowLogout] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
+
+  /* ── 알림 설정 영속화 (사이클 5) ──
+   *  profiles.ui_preferences 에서 noti_chat / noti_med / noti_health / noti_visit 로드.
+   *  키 없으면 위 useState 기본값 유지. 비로그인이면 SELECT 건너뜀.
+   *  참조 패턴: ChatListClient.tsx L429-451 (hide_rejected_chats 로드). */
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("ui_preferences")
+        .eq("id", user.id)
+        .maybeSingle<{
+          ui_preferences: {
+            noti_chat?: boolean;
+            noti_med?: boolean;
+            noti_health?: boolean;
+            noti_visit?: boolean;
+          } | null;
+        }>();
+      if (cancelled) return;
+      if (error) {
+        console.error("[mypage] ui_preferences fetch failed:", error);
+        return;
+      }
+      const pref = data?.ui_preferences ?? null;
+      if (pref?.noti_chat !== undefined) setNotiChat(pref.noti_chat === true);
+      if (pref?.noti_med !== undefined) setNotiMed(pref.noti_med === true);
+      if (pref?.noti_health !== undefined) setNotiHealth(pref.noti_health === true);
+      if (pref?.noti_visit !== undefined) setNotiVisit(pref.noti_visit === true);
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
+  /* 알림 토글 공통 저장 헬퍼 — ChatListClient.tsx L453-482 (toggleHideRejected) 패턴 동일.
+   *  SELECT 로 기존 ui_preferences 재조회 → 머지(다른 키 절대 덮어쓰기 금지) → UPDATE.
+   *  실패 시 onError() 로 옵티미스틱 setState 롤백. 비로그인이면 무동작. */
+  const updateNotiPref = async (
+    key: "noti_chat" | "noti_med" | "noti_health" | "noti_visit",
+    next: boolean,
+    onError: () => void,
+  ) => {
+    if (!user) return;
+    const { data: cur, error: getErr } = await supabase
+      .from("profiles")
+      .select("ui_preferences")
+      .eq("id", user.id)
+      .maybeSingle<{ ui_preferences: Record<string, unknown> | null }>();
+    if (getErr) {
+      console.error("[mypage] ui_preferences fetch (toggle) failed:", getErr);
+      onError();
+      return;
+    }
+    const merged = { ...(cur?.ui_preferences ?? {}), [key]: next };
+    const { error: upErr } = await (supabase
+      .from("profiles") as unknown as {
+        update: (p: { ui_preferences: Record<string, unknown> }) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update({ ui_preferences: merged })
+      .eq("id", user.id);
+    if (upErr) {
+      console.error("[mypage] ui_preferences UPDATE failed:", upErr);
+      onError();
+    }
+  };
+
+  /* 모달 backdrop 드래그-닫기 가드 ref — mousedown 시작 지점이 overlay 본체일 때만 닫기.
+   *  3개 모달(추가/편집/미니)이 동시에 열리지 않으므로 ref 1개 공유. */
+  const overlayDownRef = useRef(false);
+
+  /* 추가 모달 닫힘 일괄 리셋 헬퍼 — 취소·backdrop·등록 성공 모든 경로에서 동일 사용. */
+  const closeAddModal = useCallback(() => {
+    setShowAddModal(false);
+    setNewName("");
+    setNewTimes(new Set());
+    setAddStartDate(getTodayLocalISO());
+    setAddDays("");
+    setAddCalcOpen(false);
+  }, []);
+
+  /* I-4 임박 알람용 파생 데이터.
+   *  nearMeds: 복용 종료가 D-MED_NEAR_THRESHOLD 이하로 남은 영양제. 시작 전(remain < 0) 제외.
+   *  visitDaysLeft: 다음 방문 예정까지의 일수. nextVisit 없으면 null. */
+  const nearMeds = useMemo(() => {
+    return supplements
+      .map((s) => ({ s, remain: calcRemainingDays(s.start_date, s.days) }))
+      .filter((x): x is { s: Supplement; remain: number } =>
+        x.remain != null && x.remain >= 0 && x.remain <= MED_NEAR_THRESHOLD,
+      )
+      .sort((a, b) => a.remain - b.remain);
+  }, [supplements]);
+  const visitDaysLeft = useMemo(
+    () => (nextVisit ? daysFromTodayLocal(nextVisit.scheduled_date) : null),
+    [nextVisit],
+  );
 
   const age = calcAge(editMode ? editBirth : profile.birth);
 
@@ -1061,6 +1393,13 @@ function MypageContent() {
     const slots = sortSlots(Array.from(newTimes));
     // 슬롯 1개 이상이면 그 개수, 0개면 1. 환자 직접 등록은 슬롯을 1개 이상 강제하지만 안전한 폴백.
     const dailyCount = slots.length > 0 ? slots.length : 1;
+    // days: 빈 문자열이면 null, 양수 정수만 저장 (updateSupplement 패턴 동일)
+    let addDaysVal: number | null = null;
+    const trimmedAddDays = addDays.trim();
+    if (trimmedAddDays) {
+      const parsed = parseInt(trimmedAddDays, 10);
+      addDaysVal = (!Number.isNaN(parsed) && parsed > 0) ? parsed : null;
+    }
     const payload: PatientSupplementInsert = {
       patient_id: user.id,
       name: trimmedName,
@@ -1069,6 +1408,7 @@ function MypageContent() {
       source: "manual",
       source_dosage_guide_id: null,
       start_date: addStartDate,
+      days: addDaysVal,
     };
     const { data, error } = await (supabase
       .from("patient_supplements") as unknown as {
@@ -1090,10 +1430,7 @@ function MypageContent() {
       return;
     }
     setSupplements((prev) => [...prev, mapPatientSupplementRow(data)]);
-    setNewName("");
-    setNewTimes(new Set());
-    setAddStartDate(getTodayLocalISO());
-    setShowAddModal(false);
+    closeAddModal();
   };
 
   /** 영양제 편집 모달 열기 — 현재 값 prefill, swipe 닫기. */
@@ -1103,6 +1440,7 @@ function MypageContent() {
     setEditTimes(new Set(s.time_slots));
     setEditStartDate(s.start_date ?? getTodayLocalISO());
     setEditDays(s.days != null ? String(s.days) : "");
+    setEditCalcOpen(false);
     setSwipedId(null);
   };
 
@@ -1336,39 +1674,173 @@ function MypageContent() {
           )}
         </section>
 
+        {/* ═══════ 1-A. 임박 알람 (I-4) — 인앱 배너, 읽기 전용 ═══════ */}
+        {(() => {
+          const showVisitBanner =
+            notiVisit && visitDaysLeft != null &&
+            visitDaysLeft >= 0 && visitDaysLeft <= VISIT_NEAR_THRESHOLD;
+          const showMedBanner = notiMed && nearMeds.length > 0;
+          if (!showVisitBanner && !showMedBanner) return null;
+          // 방문 배너용 라벨 — "M월 D일"
+          const visitDateLabel = nextVisit
+            ? (() => {
+                const m = nextVisit.scheduled_date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+                if (!m) return nextVisit.scheduled_date;
+                return `${Number(m[2])}월 ${Number(m[3])}일`;
+              })()
+            : "";
+          return (
+            <section className="my-section">
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {showVisitBanner && visitDaysLeft != null && (
+                  <div style={{
+                    padding: "12px 14px", borderRadius: 12,
+                    background: "#E8F0F5",
+                    border: "1.5px solid #B3D1E0",
+                    display: "flex", alignItems: "flex-start", gap: 10,
+                  }}>
+                    <span style={{ fontSize: 20, lineHeight: 1.2, flexShrink: 0 }}>📅</span>
+                    <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontWeight: 600 }}>
+                      {visitDaysLeft === 0
+                        ? "오늘 약국 방문 예정이에요"
+                        : `약국 방문 D-${visitDaysLeft} — ${visitDateLabel} 예정이에요`}
+                    </div>
+                  </div>
+                )}
+                {showMedBanner && (
+                  <div style={{
+                    padding: "12px 14px", borderRadius: 12,
+                    background: "#FBF5F1",
+                    border: "1.5px solid #F5E6DC",
+                    display: "flex", alignItems: "flex-start", gap: 10,
+                  }}>
+                    <span style={{ fontSize: 20, lineHeight: 1.2, flexShrink: 0 }}>💊</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {nearMeds.length === 1 ? (
+                        <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontWeight: 600 }}>
+                          {nearMeds[0].s.name} 복용이 {nearMeds[0].remain === 0 ? "오늘까지예요" : `D-${nearMeds[0].remain} 남았어요`}
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5, fontWeight: 700, marginBottom: 6 }}>
+                            복용 종료가 임박한 영양제 {nearMeds.length}종이 있어요
+                          </div>
+                          <ul style={{ margin: 0, paddingLeft: 16, display: "flex", flexDirection: "column", gap: 2 }}>
+                            {nearMeds.map(({ s, remain }) => (
+                              <li key={s.id} style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
+                                {s.name} — {remain === 0 ? "오늘까지" : `D-${remain}`}
+                              </li>
+                            ))}
+                          </ul>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
+          );
+        })()}
+
         {/* ═══════ 1-1. 다음 방문 예정 ═══════ */}
-        <section className="my-section">
-          <h2 className="my-section-title">다음 방문 예정</h2>
-          <div style={{
-            borderRadius: 14, overflow: "hidden",
-            border: "1.5px solid #B3D1E0", background: "#fff",
-          }}>
-            <div style={{
-              padding: "14px 16px", background: "#E8F0F5",
-              display: "flex", alignItems: "center", gap: 10,
-            }}>
-              <span style={{ fontSize: 22 }}>📅</span>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>4월 12일 (토) 오전</div>
-                <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 2 }}>초록숲 약국 · 김서연 약사</div>
-              </div>
-            </div>
-            <div style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: 6 }}>
+        {nextVisit && (() => {
+          // 날짜 라벨: "M월 D일 (요일)" — 한글 요일. 파싱 실패 시 요일 생략.
+          const WEEKDAY_KR = ["일", "월", "화", "수", "목", "금", "토"] as const;
+          const dateLabel = (() => {
+            const m = nextVisit.scheduled_date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!m) return nextVisit.scheduled_date;
+            const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
+            const dt = new Date(y, mo - 1, d);
+            const head = `${mo}월 ${d}일`;
+            if (Number.isNaN(dt.getTime())) return head;
+            return `${head} (${WEEKDAY_KR[dt.getDay()]})`;
+          })();
+          const timeLabel = nextVisit.scheduled_time ?? "";
+          const headline = timeLabel ? `${dateLabel} ${timeLabel}` : dateLabel;
+          const placeParts: string[] = [];
+          if (nextVisit.pharmacy_name) placeParts.push(nextVisit.pharmacy_name);
+          if (nextVisit.pharmacist_name) placeParts.push(`${nextVisit.pharmacist_name} 약사`);
+          const placeLine = placeParts.join(" · ");
+          const hasFooter = !!(nextVisit.note || nextVisit.address);
+          return (
+            <section className="my-section">
+              <h2 className="my-section-title">다음 방문 예정</h2>
               <div style={{
-                display: "flex", alignItems: "center", gap: 6,
-                fontSize: 13, color: "#5A8BA8", fontWeight: 600,
+                borderRadius: 14, overflow: "hidden",
+                border: "1.5px solid #B3D1E0", background: "#fff",
               }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5A8BA8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" />
-                </svg>
-                전날 + 당일 알림 예정
+                <div style={{
+                  padding: "14px 16px", background: "#E8F0F5",
+                  display: "flex", alignItems: "center", gap: 10,
+                }}>
+                  <span style={{ fontSize: 22 }}>📅</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>{headline}</div>
+                    {placeLine && (
+                      <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 2 }}>{placeLine}</div>
+                    )}
+                  </div>
+                </div>
+                {hasFooter && (
+                  <div style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: 6 }}>
+                    {nextVisit.address && (
+                      <div style={{ fontSize: 13, color: "#5E7D6C", lineHeight: 1.5 }}>
+                        {nextVisit.address}
+                      </div>
+                    )}
+                    {(nextVisit.address || (nextVisit.lat != null && nextVisit.lng != null)) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // "약국명 + 도로명"이면 우리 약국이 정확히 1순위로 잡힌다. 번지·상세주소·구는 제외.
+                          // 도로명 = 한글/숫자로 끝나는 "OO로" 또는 "OO길" (대로/소로 모두 "로"에 포함, lookahead 로 뒤 한글 차단).
+                          const name = (nextVisit.pharmacy_name ?? "").trim();
+                          const addr = (nextVisit.address ?? "").trim();
+                          const roadMatch = addr.match(/[가-힣0-9]+(?:로|길)(?![가-힣])/);
+                          const road = roadMatch ? roadMatch[0] : "";
+                          const query = [name, road].filter(Boolean).join(" ");
+                          let url: string | null = null;
+                          if (query) {
+                            url = "https://map.kakao.com/?q=" + encodeURIComponent(query);
+                          } else {
+                            const lat = nextVisit.lat;
+                            const lng = nextVisit.lng;
+                            if (lat != null && lng != null) {
+                              url = "https://map.kakao.com/link/map/"
+                                + encodeURIComponent(name || "약국")
+                                + "," + lat + "," + lng;
+                            }
+                          }
+                          if (!url) return;
+                          window.open(url, "_blank");
+                        }}
+                        style={{
+                          alignSelf: "flex-start",
+                          display: "inline-flex", alignItems: "center", gap: 4,
+                          padding: "6px 12px", borderRadius: 8,
+                          background: "#fff",
+                          border: "1px solid #B3D1E0",
+                          color: "#5A8BA8",
+                          fontSize: 13, fontWeight: 600,
+                          cursor: "pointer",
+                          fontFamily: "'Noto Sans KR', sans-serif",
+                          minHeight: 36,
+                        }}
+                      >
+                        📍 위치 보기
+                      </button>
+                    )}
+                    {nextVisit.note && (
+                      <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
+                        메모: {nextVisit.note}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-              <div style={{ fontSize: 13, color: "#3D4A42" }}>
-                메모: 9시-10시가 한가해요
-              </div>
-            </div>
-          </div>
-        </section>
+            </section>
+          );
+        })()}
 
         {/* ═══════ 2. 내 영양제 관리 ═══════ */}
         <section className="my-section">
@@ -1379,7 +1851,7 @@ function MypageContent() {
               <div style={emptyEmoji}>💊</div>
               <div style={emptyTitle}>아직 등록된 영양제가 없어요</div>
               <div style={emptyDesc}>영양제를 등록하면 복약 체크를 할 수 있어요</div>
-              <button type="button" style={emptyBtn} onClick={() => { setAddStartDate(getTodayLocalISO()); setShowAddModal(true); }}>+ 영양제 추가</button>
+              <button type="button" style={emptyBtn} onClick={() => { setAddStartDate(getTodayLocalISO()); setAddDays(""); setAddCalcOpen(false); setShowAddModal(true); }}>+ 영양제 추가</button>
             </div>
           ) : (
           <>
@@ -1702,7 +2174,7 @@ function MypageContent() {
 
           <button
             className="my-add-supplement-btn"
-            onClick={() => { setAddStartDate(getTodayLocalISO()); setShowAddModal(true); }}
+            onClick={() => { setAddStartDate(getTodayLocalISO()); setAddDays(""); setAddCalcOpen(false); setShowAddModal(true); }}
             type="button"
           >
             + 영양제 추가
@@ -2223,25 +2695,65 @@ function MypageContent() {
           <div style={{ fontSize: 14, fontWeight: 600, color: "#3D4A42", marginBottom: 8 }}>알림 설정</div>
           <div className="my-setting-row">
             <span>💬 채팅 알림</span>
-            <button className={`my-toggle${notiChat ? " on" : ""}`} onClick={() => setNotiChat(!notiChat)} type="button" aria-label="채팅 알림 토글">
+            <button
+              className={`my-toggle${notiChat ? " on" : ""}`}
+              onClick={() => {
+                const prev = notiChat;
+                const next = !prev;
+                setNotiChat(next);
+                void updateNotiPref("noti_chat", next, () => setNotiChat(prev));
+              }}
+              type="button"
+              aria-label="채팅 알림 토글"
+            >
               <span className="my-toggle-knob" />
             </button>
           </div>
           <div className="my-setting-row">
             <span>💊 복약 알림</span>
-            <button className={`my-toggle${notiMed ? " on" : ""}`} onClick={() => setNotiMed(!notiMed)} type="button" aria-label="복약 알림 토글">
+            <button
+              className={`my-toggle${notiMed ? " on" : ""}`}
+              onClick={() => {
+                const prev = notiMed;
+                const next = !prev;
+                setNotiMed(next);
+                void updateNotiPref("noti_med", next, () => setNotiMed(prev));
+              }}
+              type="button"
+              aria-label="복약 알림 토글"
+            >
               <span className="my-toggle-knob" />
             </button>
           </div>
           <div className="my-setting-row">
             <span>📊 몸 상태 체크 알림</span>
-            <button className={`my-toggle${notiHealth ? " on" : ""}`} onClick={() => setNotiHealth(!notiHealth)} type="button" aria-label="몸 상태 체크 알림 토글">
+            <button
+              className={`my-toggle${notiHealth ? " on" : ""}`}
+              onClick={() => {
+                const prev = notiHealth;
+                const next = !prev;
+                setNotiHealth(next);
+                void updateNotiPref("noti_health", next, () => setNotiHealth(prev));
+              }}
+              type="button"
+              aria-label="몸 상태 체크 알림 토글"
+            >
               <span className="my-toggle-knob" />
             </button>
           </div>
           <div className="my-setting-row">
             <span>🏥 약국 방문 알림</span>
-            <button className={`my-toggle${notiVisit ? " on" : ""}`} onClick={() => setNotiVisit(!notiVisit)} type="button" aria-label="방문 예약 알림 토글">
+            <button
+              className={`my-toggle${notiVisit ? " on" : ""}`}
+              onClick={() => {
+                const prev = notiVisit;
+                const next = !prev;
+                setNotiVisit(next);
+                void updateNotiPref("noti_visit", next, () => setNotiVisit(prev));
+              }}
+              type="button"
+              aria-label="방문 예약 알림 토글"
+            >
               <span className="my-toggle-knob" />
             </button>
           </div>
@@ -2270,7 +2782,14 @@ function MypageContent() {
 
       {/* ═══════ 영양제 추가 모달 ═══════ */}
       {showAddModal && (
-        <div className="my-modal-overlay" onClick={() => setShowAddModal(false)}>
+        <div
+          className="my-modal-overlay"
+          onMouseDown={(e) => { overlayDownRef.current = e.target === e.currentTarget; }}
+          onMouseUp={(e) => {
+            if (overlayDownRef.current && e.target === e.currentTarget) closeAddModal();
+            overlayDownRef.current = false;
+          }}
+        >
           <div className="my-modal" onClick={(e) => e.stopPropagation()}>
             <h3 className="my-modal-title">영양제 추가</h3>
 
@@ -2319,8 +2838,54 @@ function MypageContent() {
               />
             </label>
 
+            <div style={{ marginBottom: 16 }}>
+              <label className="my-edit-label" style={{ marginTop: 14 }}>
+                복용 일수 (선택)
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                  <input
+                    type="number"
+                    className="my-edit-input"
+                    min={1}
+                    placeholder="예: 60"
+                    value={addDays}
+                    onChange={(e) => setAddDays(e.target.value)}
+                    style={{ width: 100, textAlign: "right" }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setAddCalcOpen((v) => !v)}
+                    style={{
+                      flex: 1,
+                      minHeight: 44,
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(94,125,108,0.22)",
+                      background: "#fff",
+                      color: "#4A6355",
+                      fontSize: 14,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                    aria-expanded={addCalcOpen}
+                  >
+                    {addCalcOpen ? "복용일수 계산기 닫기" : "복용일수 계산기 열기"}
+                  </button>
+                </div>
+                <span style={{ display: "block", marginTop: 4, fontSize: 13, color: "#5E7D6C" }}>
+                  남은 일수를 알려드릴 때 쓰여요. 비워두면 기간 없이 계속 챙겨요.
+                </span>
+              </label>
+              {addCalcOpen && (
+                <DayCalculator
+                  dailyCount={newTimes.size}
+                  onApply={(d) => { setAddDays(String(d)); setAddCalcOpen(false); }}
+                />
+              )}
+            </div>
+
             <div className="my-modal-actions">
-              <button className="my-btn secondary" onClick={() => setShowAddModal(false)} type="button">
+              <button className="my-btn secondary" onClick={closeAddModal} type="button">
                 취소
               </button>
               <button
@@ -2338,7 +2903,14 @@ function MypageContent() {
 
       {/* ═══════ 영양제 수정 모달 ═══════ */}
       {editingId !== null && (
-        <div className="my-modal-overlay" onClick={() => setEditingId(null)}>
+        <div
+          className="my-modal-overlay"
+          onMouseDown={(e) => { overlayDownRef.current = e.target === e.currentTarget; }}
+          onMouseUp={(e) => {
+            if (overlayDownRef.current && e.target === e.currentTarget) setEditingId(null);
+            overlayDownRef.current = false;
+          }}
+        >
           <div className="my-modal" onClick={(e) => e.stopPropagation()}>
             <h3 className="my-modal-title">영양제 수정</h3>
 
@@ -2387,20 +2959,51 @@ function MypageContent() {
               />
             </label>
 
-            <label className="my-edit-label" style={{ marginTop: 14 }}>
-              복용 일수 (선택)
-              <input
-                type="number"
-                className="my-edit-input"
-                min={1}
-                placeholder="예: 60"
-                value={editDays}
-                onChange={(e) => setEditDays(e.target.value)}
-              />
-              <span style={{ display: "block", marginTop: 4, fontSize: 13, color: "#5E7D6C" }}>
-                남은 일수를 알려드릴 때 쓰여요. 비워두면 기간 없이 계속 챙겨요.
-              </span>
-            </label>
+            <div style={{ marginBottom: 16 }}>
+              <label className="my-edit-label" style={{ marginTop: 14 }}>
+                복용 일수 (선택)
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                  <input
+                    type="number"
+                    className="my-edit-input"
+                    min={1}
+                    placeholder="예: 60"
+                    value={editDays}
+                    onChange={(e) => setEditDays(e.target.value)}
+                    style={{ width: 100, textAlign: "right" }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setEditCalcOpen((v) => !v)}
+                    style={{
+                      flex: 1,
+                      minHeight: 44,
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(94,125,108,0.22)",
+                      background: "#fff",
+                      color: "#4A6355",
+                      fontSize: 14,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                    aria-expanded={editCalcOpen}
+                  >
+                    {editCalcOpen ? "복용일수 계산기 닫기" : "복용일수 계산기 열기"}
+                  </button>
+                </div>
+                <span style={{ display: "block", marginTop: 4, fontSize: 13, color: "#5E7D6C" }}>
+                  남은 일수를 알려드릴 때 쓰여요. 비워두면 기간 없이 계속 챙겨요.
+                </span>
+              </label>
+              {editCalcOpen && (
+                <DayCalculator
+                  dailyCount={editTimes.size}
+                  onApply={(d) => { setEditDays(String(d)); setEditCalcOpen(false); }}
+                />
+              )}
+            </div>
 
             <div className="my-modal-actions">
               <button className="my-btn secondary" onClick={() => setEditingId(null)} type="button">
@@ -2421,7 +3024,14 @@ function MypageContent() {
 
       {/* ═══════ "이대로 추가하기" 시작일 확인 미니 모달 ═══════ */}
       {guideStartModal && (
-        <div className="my-modal-overlay" onClick={() => setGuideStartModal(null)}>
+        <div
+          className="my-modal-overlay"
+          onMouseDown={(e) => { overlayDownRef.current = e.target === e.currentTarget; }}
+          onMouseUp={(e) => {
+            if (overlayDownRef.current && e.target === e.currentTarget) setGuideStartModal(null);
+            overlayDownRef.current = false;
+          }}
+        >
           <div className="my-modal" onClick={(e) => e.stopPropagation()}>
             <h3 className="my-modal-title">오늘부터 복용하나요?</h3>
             <div style={{ fontSize: 15, color: "#3D4A42", lineHeight: 1.6, marginBottom: 14 }}>

@@ -4,6 +4,8 @@ import { useState, useRef, useEffect, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
+import { geocodeAddress } from "@/lib/geocode";
+import AddressSearchButton from "@/components/AddressSearchButton";
 
 /* ══════════════════════════════════════════
    더미 데이터 & 상수
@@ -109,6 +111,9 @@ function Content() {
   const [pName, setPName] = useState("");
   const [pPharmacy, setPPharmacy] = useState("");
   const [pAddress, setPAddress] = useState("");
+  /** 상세주소 — 도로명(pAddress) 뒤에 합쳐 저장. DB 컬럼은 1개라 화면에서만 분리.
+   *  로드 시점에는 빈 칸으로 두고, 사용자가 주소 검색을 새로 누르면 도로명만 새로 채워짐. */
+  const [pAddressDetail, setPAddressDetail] = useState("");
   const [saved, setSaved] = useState({ name: "", pharmacy: "", address: "" });
 
   /* ── DB 상태 ──
@@ -143,12 +148,20 @@ function Content() {
       id: string;
       pharmacy_name?: string;
       address?: string;
+      lat?: number | null;
+      lng?: number | null;
       expert_specialties?: string[];
       available_specialties?: string[];
       pharmacy_photos?: string[];
       // license_name 은 의도적으로 제외 — 면허 인증 무결성 보호
     };
     const payload: PpUpsert = { id: user.id, ...fields };
+    // address 가 함께 갱신될 때만 지오코딩 시도. 좌표 못 구해도 lat/lng=null 로 저장 (주소는 정상 저장).
+    if (typeof fields.address === "string") {
+      const { lat, lng } = await geocodeAddress(fields.address);
+      payload.lat = lat;
+      payload.lng = lng;
+    }
     const { error } = await (supabase
       .from("pharmacist_profiles") as unknown as {
         upsert: (
@@ -178,19 +191,27 @@ function Content() {
     if (error) console.error("[ph-mypage] profiles.name update failed:", error);
   };
 
-  const cancelEdit = () => { setPName(saved.name); setPPharmacy(saved.pharmacy); setPAddress(saved.address); setEditMode(false); };
+  const cancelEdit = () => { setPName(saved.name); setPPharmacy(saved.pharmacy); setPAddress(saved.address); setPAddressDetail(""); setEditMode(false); };
   const saveEdit = async () => {
     if (savingProfile) return;
     setSavingProfile(true);
+    // 도로명(pAddress) + 상세(pAddressDetail) 합쳐서 1개 컬럼에 저장.
+    // 좌표 매칭은 도로명만으로도 가능하지만, persistPharmacistFields 가 받은 address 를 그대로 지오코딩+저장하므로 합친 문자열을 넘긴다.
+    const road = pAddress.trim();
+    const detail = pAddressDetail.trim();
+    const combinedAddress = [road, detail].filter(Boolean).join(" ");
     // license_name 이 잠겨 있으면 profiles.name 도 건드리지 않음 (이름 변경 시도 차단)
     const tasks: Promise<void>[] = [
-      persistPharmacistFields({ pharmacy_name: pPharmacy, address: pAddress }),
+      persistPharmacistFields({ pharmacy_name: pPharmacy, address: combinedAddress }),
     ];
     if (!licenseNameLocked) {
       tasks.push(persistProfileName(pName));
     }
     await Promise.all(tasks);
-    setSaved({ name: pName, pharmacy: pPharmacy, address: pAddress });
+    setSaved({ name: pName, pharmacy: pPharmacy, address: combinedAddress });
+    // 저장 후 도로명 칸을 합쳐진 전체 주소로 갱신, 상세 칸은 비움 (다음 편집 시 깨끗한 상태).
+    setPAddress(combinedAddress);
+    setPAddressDetail("");
     setEditMode(false);
     setSavingProfile(false);
   };
@@ -572,7 +593,26 @@ function Content() {
                   }
                 />
                 <Field label="약국명" value={pPharmacy} onChange={setPPharmacy} />
-                <Field label="약국 주소" value={pAddress} onChange={setPAddress} />
+                <div>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 4 }}>약국 주소</label>
+                  <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+                    <input
+                      style={{ ...inp, flex: 1, minWidth: 0 }}
+                      type="text"
+                      placeholder="주소 검색을 눌러 선택하세요"
+                      value={pAddress}
+                      readOnly
+                    />
+                    <AddressSearchButton onSelect={(addr) => setPAddress(addr)} />
+                  </div>
+                  <input
+                    style={{ ...inp, marginTop: 8 }}
+                    type="text"
+                    placeholder="상세주소 (건물명, 층, 호)"
+                    value={pAddressDetail}
+                    onChange={(e) => setPAddressDetail(e.target.value)}
+                  />
+                </div>
                 <div style={{ fontSize: 14, color: C.textMid, padding: "10px 14px", background: C.sagePale, borderRadius: 8 }}>면허번호: {PROFILE.license}</div>
                 <div style={{ display: "flex", gap: 10 }}>
                   <button type="button" style={btnS} onClick={cancelEdit}>취소</button>

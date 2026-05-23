@@ -388,6 +388,19 @@ function formatVisitDate(iso: string): string {
   return `${y}년 ${m}월 ${d}일`;
 }
 
+/** "YYYY년 M월 D일" 텍스트에서 한글 요일(일~토) 추출. 파싱 실패 시 null.
+ *  toISOString UTC 미사용 — new Date(y, m-1, d) 로컬 기준 (자정 어긋남 회피). */
+const VISIT_WEEKDAY_KR = ["일", "월", "화", "수", "목", "금", "토"] as const;
+function extractKrWeekdayFromKoreanDate(text: string): string | null {
+  const mt = text.match(/^(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일/);
+  if (!mt) return null;
+  const y = Number(mt[1]); const mo = Number(mt[2]); const d = Number(mt[3]);
+  if (!y || !mo || !d) return null;
+  const dt = new Date(y, mo - 1, d);
+  if (Number.isNaN(dt.getTime())) return null;
+  return VISIT_WEEKDAY_KR[dt.getDay()];
+}
+
 function formatVisitDateShort(iso: string): string {
   const [, m, d] = iso.split("-").map(Number);
   return `${m}월 ${d}일`;
@@ -712,50 +725,307 @@ function ChatContent() {
     setShowVisitPanel(true);
   };
 
-  const sendVisitGuide = () => {
+  const sendVisitGuide = async () => {
     if (!visitDate) return;
-    // 기존 방문 안내가 있으면 취소 처리
+    const ts = visitTimeSlot === "직접 입력" ? (visitCustomTime || "오전") : visitTimeSlot;
+    const guide: VisitGuide = { date: visitDate, timeSlot: ts, memo: visitMemo };
+    const content = `[방문안내] ${formatVisitDate(visitDate)}\n${ts}${visitMemo ? `\n${visitMemo}` : ""}`;
+
+    // mock 모드(=비-UUID 채팅) — 기존 로컬 흐름 그대로
+    if (!isDbConsultation || !user || !dbConsultation) {
+      if (activeVisitMsgId) {
+        setCancelledVisitIds(prev => new Set(prev).add(activeVisitMsgId));
+      }
+      setVisitGuide(guide);
+      setShowVisitPanel(false);
+      const timeStr = getNowTimeStr();
+      const newId = `visit-${Date.now()}`;
+      setActiveVisitMsgId(newId);
+      setMessages(prev => [...prev, {
+        id: newId, sender: role, time: timeStr, isRead: true,
+        content,
+        sessionId: activeSession,
+      }]);
+      return;
+    }
+
+    // DB 모드 — visit_schedules 영속화 + messages INSERT (realtime 으로 채팅 동기화; dosage_guide 패턴)
+    const nowIso = new Date().toISOString();
+
+    // 1) 기존 활성 방문 안내 취소 — 마이그레이션 정책 "새 안내 = 이전 안내 자동 취소"
+    const cancelResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        update: (p: { status: "cancelled"; cancelled_at: string }) => {
+          eq: (col: string, val: string) => {
+            eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+          };
+        };
+      })
+      .update({ status: "cancelled", cancelled_at: nowIso })
+      .eq("consultation_id", chatId)
+      .eq("status", "scheduled");
+    if (cancelResp.error) {
+      console.error("[chat] visit_schedules cancel-previous failed:", cancelResp.error);
+      // 진행 — 새 INSERT 는 시도
+    }
+
+    // 2) 새 visit_schedules row INSERT
+    type VisitInsertPayload = {
+      consultation_id: string;
+      round_id: string | null;
+      pharmacist_id: string;
+      patient_id: string;
+      scheduled_date: string;
+      scheduled_time: string | null;
+      note: string | null;
+      status: "scheduled";
+    };
+    const vsPayload: VisitInsertPayload = {
+      consultation_id: chatId,
+      round_id: activeRoundId,
+      pharmacist_id: user.id,
+      patient_id: dbConsultation.patient_id,
+      scheduled_date: visitDate,
+      scheduled_time: ts,
+      note: visitMemo.trim() || null,
+      status: "scheduled",
+    };
+    const vsResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        insert: (p: VisitInsertPayload) => {
+          select: () => {
+            single: () => Promise<{
+              data: { id: string } | null;
+              error: { message: string; code?: string } | null;
+            }>;
+          };
+        };
+      })
+      .insert(vsPayload)
+      .select()
+      .single();
+    if (vsResp.error || !vsResp.data) {
+      console.error("[chat] visit_schedules insert failed:", vsResp.error);
+      alert("방문 안내 저장에 실패했어요. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+
+    // 3) 시스템 메시지 INSERT (fire-and-forget; 실패해도 visit_schedules 는 보존)
+    type SystemMsgPayload = {
+      consultation_id: string;
+      sender_id: string;
+      content: string;
+      message_type: "system";
+      round_id: string | null;
+      is_read: boolean;
+      metadata: { visit_schedule_id: string };
+    };
+    const msgPayload: SystemMsgPayload = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content,
+      message_type: "system",
+      round_id: activeRoundId,
+      is_read: true,
+      metadata: { visit_schedule_id: vsResp.data.id },
+    };
+    void (supabase
+      .from("messages") as unknown as {
+        insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(msgPayload)
+      .then(({ error }) => {
+        if (error) {
+          console.error("[chat] visit system message insert failed (non-fatal):", error);
+        }
+      });
+
+    // 4) 로컬 UI state — panel 닫기 + visit 추적. setMessages 로컬 푸시는 생략(realtime 처리, dosage_guide 패턴)
     if (activeVisitMsgId) {
       setCancelledVisitIds(prev => new Set(prev).add(activeVisitMsgId));
     }
-    const ts = visitTimeSlot === "직접 입력" ? (visitCustomTime || "오전") : visitTimeSlot;
-    const guide: VisitGuide = { date: visitDate, timeSlot: ts, memo: visitMemo };
     setVisitGuide(guide);
     setShowVisitPanel(false);
-    const timeStr = getNowTimeStr();
-    const newId = `visit-${Date.now()}`;
-    setActiveVisitMsgId(newId);
-    setMessages(prev => [...prev, {
-      id: newId, sender: role, time: timeStr, isRead: true,
-      content: `[방문안내] ${formatVisitDate(visitDate)}\n${ts}${visitMemo ? `\n${visitMemo}` : ""}`,
-      sessionId: activeSession,
-    }]);
+    setActiveVisitMsgId(vsResp.data.id);
   };
 
-  const handleReschedule = () => {
+  const handleReschedule = async () => {
     if (!rescheduleDate) return;
     setShowReschedule(false);
     const timeStr = getNowTimeStr();
     const [, rm, rd] = rescheduleDate.split("-").map(Number);
     const rts = rescheduleTimeSlot === "직접 입력" ? (rescheduleCustomTime || "오전") : rescheduleTimeSlot;
-    setMessages(prev => [...prev, {
-      id: `resched-${Date.now()}`, sender: "patient", time: timeStr, isRead: false,
-      content: `[시스템] ${rm}월 ${rd}일 ${rts}(으)로 일정 변경을 요청했습니다.`,
-      sessionId: activeSession,
-    }]);
+    const content = `[시스템] ${rm}월 ${rd}일 ${rts}(으)로 일정 변경을 요청했습니다.`;
+
+    // mock 모드 — 기존 로컬 흐름 그대로
+    if (!isDbConsultation || !user || !dbConsultation || !dbConsultation.pharmacist_id) {
+      setMessages(prev => [...prev, {
+        id: `resched-${Date.now()}`, sender: "patient", time: timeStr, isRead: false,
+        content,
+        sessionId: activeSession,
+      }]);
+      if (visitGuide) setVisitGuide({ ...visitGuide, date: rescheduleDate, timeSlot: rts });
+      setRescheduleDate("");
+      setRescheduleTimeSlot("오전");
+      setRescheduleCustomTime("");
+      return;
+    }
+
+    // DB 모드 — 기존 활성 취소 + 새 visit_schedules INSERT + messages INSERT
+    const nowIso = new Date().toISOString();
+
+    const cancelResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        update: (p: { status: "cancelled"; cancelled_at: string }) => {
+          eq: (col: string, val: string) => {
+            eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+          };
+        };
+      })
+      .update({ status: "cancelled", cancelled_at: nowIso })
+      .eq("consultation_id", chatId)
+      .eq("status", "scheduled");
+    if (cancelResp.error) {
+      console.error("[chat] visit_schedules cancel-previous (reschedule) failed:", cancelResp.error);
+    }
+
+    type VisitInsertPayload = {
+      consultation_id: string;
+      round_id: string | null;
+      pharmacist_id: string;
+      patient_id: string;
+      scheduled_date: string;
+      scheduled_time: string | null;
+      note: string | null;
+      status: "scheduled";
+    };
+    const vsPayload: VisitInsertPayload = {
+      consultation_id: chatId,
+      round_id: activeRoundId,
+      pharmacist_id: dbConsultation.pharmacist_id,
+      patient_id: user.id,
+      scheduled_date: rescheduleDate,
+      scheduled_time: rts,
+      note: null,
+      status: "scheduled",
+    };
+    const vsResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        insert: (p: VisitInsertPayload) => {
+          select: () => {
+            single: () => Promise<{
+              data: { id: string } | null;
+              error: { message: string; code?: string } | null;
+            }>;
+          };
+        };
+      })
+      .insert(vsPayload)
+      .select()
+      .single();
+    if (vsResp.error || !vsResp.data) {
+      console.error("[chat] visit_schedules insert (reschedule) failed:", vsResp.error);
+      alert("일정 변경 요청 저장에 실패했어요. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+
+    type SystemMsgPayload = {
+      consultation_id: string;
+      sender_id: string;
+      content: string;
+      message_type: "system";
+      round_id: string | null;
+      is_read: boolean;
+      metadata: { visit_schedule_id: string };
+    };
+    const msgPayload: SystemMsgPayload = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content,
+      message_type: "system",
+      round_id: activeRoundId,
+      is_read: false,
+      metadata: { visit_schedule_id: vsResp.data.id },
+    };
+    void (supabase
+      .from("messages") as unknown as {
+        insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(msgPayload)
+      .then(({ error }) => {
+        if (error) {
+          console.error("[chat] reschedule system message insert failed (non-fatal):", error);
+        }
+      });
+
     if (visitGuide) setVisitGuide({ ...visitGuide, date: rescheduleDate, timeSlot: rts });
     setRescheduleDate("");
     setRescheduleTimeSlot("오전");
     setRescheduleCustomTime("");
   };
 
-  const handleDeclineVisit = () => {
+  const handleDeclineVisit = async () => {
     const timeStr = getNowTimeStr();
-    setMessages(prev => [...prev, {
-      id: `decline-${Date.now()}`, sender: "patient", time: timeStr, isRead: false,
-      content: `[시스템] 일정을 취소했습니다. 다음에 다시 예약해주세요.`,
-      sessionId: activeSession,
-    }]);
+    const content = `[시스템] 일정을 취소했습니다. 다음에 다시 예약해주세요.`;
+
+    // mock 모드 — 기존 로컬 흐름 그대로
+    if (!isDbConsultation || !user) {
+      setMessages(prev => [...prev, {
+        id: `decline-${Date.now()}`, sender: "patient", time: timeStr, isRead: false,
+        content,
+        sessionId: activeSession,
+      }]);
+      setVisitGuide(null);
+      setActiveVisitMsgId(null);
+      return;
+    }
+
+    // DB 모드 — 활성 visit_schedules row 취소 + 시스템 메시지
+    const nowIso = new Date().toISOString();
+    const cancelResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        update: (p: { status: "cancelled"; cancelled_at: string }) => {
+          eq: (col: string, val: string) => {
+            eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+          };
+        };
+      })
+      .update({ status: "cancelled", cancelled_at: nowIso })
+      .eq("consultation_id", chatId)
+      .eq("status", "scheduled");
+    if (cancelResp.error) {
+      console.error("[chat] visit_schedules decline UPDATE failed:", cancelResp.error);
+      alert("일정 취소 저장에 실패했어요. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+
+    type SystemMsgPayload = {
+      consultation_id: string;
+      sender_id: string;
+      content: string;
+      message_type: "system";
+      round_id: string | null;
+      is_read: boolean;
+    };
+    const msgPayload: SystemMsgPayload = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content,
+      message_type: "system",
+      round_id: activeRoundId,
+      is_read: false,
+    };
+    void (supabase
+      .from("messages") as unknown as {
+        insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(msgPayload)
+      .then(({ error }) => {
+        if (error) {
+          console.error("[chat] decline visit system message insert failed (non-fatal):", error);
+        }
+      });
+
     setVisitGuide(null);
     setActiveVisitMsgId(null);
   };
@@ -2355,9 +2625,11 @@ function ChatContent() {
           // 시스템 메시지 판정:
           //   DB 모드 → message_type === 'system'
           //   mock 모드 → "[시스템]" prefix 폴백 (mock 메시지에 message_type 미설정)
-          const isSystem =
-            msg.message_type === "system" || msg.content.startsWith("[시스템]");
+          //   단 [방문안내] 는 카드 전용 분기로 라우팅 — isSystem 에서 제외 (DB INSERT 도 message_type='system' 으로 들어가지만 카드로 렌더해야 함)
           const isVisitCard = msg.content.startsWith("[방문안내]");
+          const isSystem =
+            !isVisitCard &&
+            (msg.message_type === "system" || msg.content.startsWith("[시스템]"));
           const isQSetCard = msg.content.startsWith("[추가질문]") && !msg.content.startsWith("[추가질문답변]");
           const isQAnsCard = msg.content.startsWith("[추가질문답변]");
           // 회차 구분자:
@@ -2612,7 +2884,20 @@ function ChatContent() {
 
           if (isVisitCard) {
             const bodyText = msg.content.replace("[방문안내] ", "");
-            const lines = bodyText.split("\n");
+            const rawLines = bodyText.split("\n");
+            // 첫 줄(날짜) + 둘째 줄(시간) 을 "YYYY년 M월 D일 (요일) 시간" 한 줄로 합침.
+            //   요일은 카드 렌더 시점에 표시용으로만 계산 — DB content 형식은 변경 안 함.
+            //   날짜 파싱 실패 시 요일 생략. 시간 줄이 없으면 시간 생략.
+            const displayLines: string[] = (() => {
+              if (rawLines.length === 0) return rawLines;
+              const dateLine = rawLines[0] ?? "";
+              const weekday = extractKrWeekdayFromKoreanDate(dateLine);
+              const timeLine = rawLines[1] ?? "";
+              const headParts: string[] = [dateLine];
+              if (weekday) headParts[0] = `${dateLine} (${weekday})`;
+              const head = timeLine ? `${headParts[0]} ${timeLine}` : headParts[0];
+              return [head, ...rawLines.slice(2)];
+            })();
             const isCancelled = cancelledVisitIds.has(msg.id);
             const isActive = msg.id === activeVisitMsgId && !isCancelled;
             return (
@@ -2647,11 +2932,13 @@ function ChatContent() {
                           }}>취소됨</span>
                         )}
                       </div>
-                      {lines.map((line, li) => (
+                      {displayLines.map((line, li) => (
                         <div key={li} style={{
-                          fontSize: 13, marginTop: li === 0 ? 2 : 1,
+                          fontSize: 14, marginTop: li === 0 ? 4 : 2,
+                          fontWeight: li === 0 ? 600 : 400,
                           color: isCancelled ? "#999" : "#3D4A42",
                           textDecoration: isCancelled ? "line-through" : "none",
+                          lineHeight: 1.5,
                         }}>{line}</div>
                       ))}
                     </div>
