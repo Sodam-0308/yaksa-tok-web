@@ -6,6 +6,13 @@ import Link from "next/link";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
+import {
+  MED_NEAR_THRESHOLD,
+  VISIT_NEAR_THRESHOLD,
+  getTodayLocalISO,
+  daysFromTodayLocal,
+  calcRemainingDays,
+} from "@/lib/nearThresholds";
 import type { Database } from "@/types/database";
 
 type ProfileUpdate = Database["public"]["Tables"]["profiles"]["Update"];
@@ -115,15 +122,9 @@ function mapPatientSupplementRow(row: PatientSupplementRow): Supplement {
   };
 }
 
-/** 오늘 날짜를 로컬(한국시간) 기준 YYYY-MM-DD 문자열로 반환.
- *  toISOString() 은 UTC 라 한국시간 자정 부근에 하루 어긋날 수 있으니 로컬 연/월/일로 조립. */
-function getTodayLocalISO(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+/** I-4 임박 알림 헬퍼 5종 (MED/VISIT_NEAR_THRESHOLD, getTodayLocalISO,
+ *  daysFromTodayLocal, calcRemainingDays) 는 src/lib/nearThresholds.ts 로 추출됨.
+ *  서버 발송 코드와 공유하기 위함 — 로직 변경 시 lib 파일만 수정. */
 
 /** YYYY-MM-DD → "M월 D일" 형식 라벨. 형식 파괴/null 이면 null.
  *  new Date 미사용 (자정 어긋남 회피) — 문자열 분해해서 숫자만 추출. */
@@ -137,46 +138,14 @@ function formatStartLabel(startDate: string | null): string | null {
   return `${month}월 ${day}일`;
 }
 
-/** I-4 임박 알람 기준 — 단위 일. 복용 종료/방문 일정 D-N 이하일 때 배너 노출. */
-const MED_NEAR_THRESHOLD = 3;
-const VISIT_NEAR_THRESHOLD = 2;
-
-/** YYYY-MM-DD → (해당 날짜 - 오늘) 일수. 로컬 자정 기준 (toISOString UTC 미사용).
- *  null/형식이상이면 null. calcRemainingDays 와 동일한 분해 방식. */
-function daysFromTodayLocal(iso: string | null): number | null {
-  if (!iso) return null;
-  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
-  if (!y || !mo || !d) return null;
-  const target = new Date(y, mo - 1, d);
-  if (Number.isNaN(target.getTime())) return null;
-  const todayISO = getTodayLocalISO();
-  const tm = todayISO.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!tm) return null;
-  const today = new Date(Number(tm[1]), Number(tm[2]) - 1, Number(tm[3]));
-  const diffMs = target.getTime() - today.getTime();
-  return Math.round(diffMs / (1000 * 60 * 60 * 24));
-}
-
-/** start_date(YYYY-MM-DD) + days → 종료예정일 기준 남은 일수.
- *  로직: end = start + days. remain = end - today (달력 날짜 차이).
- *  start_date / days 가 없거나 형식이 깨지면 null. */
-function calcRemainingDays(startDate: string | null, days: number | null): number | null {
-  if (!startDate || days == null || days <= 0) return null;
-  const m = startDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  const sy = Number(m[1]); const sm = Number(m[2]); const sd = Number(m[3]);
-  const start = new Date(sy, sm - 1, sd);
-  if (Number.isNaN(start.getTime())) return null;
-  const end = new Date(sy, sm - 1, sd + days);
-  const todayISO = getTodayLocalISO();
-  const tm = todayISO.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!tm) return null;
-  const today = new Date(Number(tm[1]), Number(tm[2]) - 1, Number(tm[3]));
-  // 달력 일수 차이 (시/분/초 무시)
-  const diffMs = end.getTime() - today.getTime();
-  return Math.round(diffMs / (1000 * 60 * 60 * 24));
+/** VAPID public key(urlBase64) → Uint8Array. pushManager.subscribe applicationServerKey 용 표준 변환. */
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  const out = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) out[i] = rawData.charCodeAt(i);
+  return out;
 }
 
 /** 일수 계산기 — 총개수 ÷ (하루횟수 × 한 번에 먹는 양) = 일수(버림).
@@ -514,94 +483,138 @@ function MypageContent() {
     address: string | null;
     lat: number | null;
     lng: number | null;
+    /** visit_schedules.status — 'scheduled' | 'completed'. cancelled 는 쿼리에서 제외. */
+    status: "scheduled" | "completed";
+    /** 약사가 [방문 완료] 누른 날(visit_schedules.visited_date). status='completed' 일 때만 채워짐. */
+    visited_date: string | null;
   };
-  const [nextVisit, setNextVisit] = useState<NextVisit | null>(null);
-  useEffect(() => {
+  const [upcomingVisits, setUpcomingVisits] = useState<NextVisit[]>([]);
+  const [pastVisits, setPastVisits] = useState<NextVisit[]>([]);
+  /** 다가오는 방문이 3건 이상일 때 첫 2건 외 나머지 펼침 여부. */
+  const [showAllUpcoming, setShowAllUpcoming] = useState(false);
+  /** 지난 방문 영역 접힘/펼침. 기본 접힘. */
+  const [showPast, setShowPast] = useState(false);
+  const loadVisits = useCallback(async () => {
     if (!user) {
-      setNextVisit(null);
+      setUpcomingVisits([]);
+      setPastVisits([]);
       return;
     }
-    let cancelled = false;
-    (async () => {
-      const todayIso = getTodayLocalISO();
-      const { data: vsData, error: vsErr } = await supabase
-        .from("visit_schedules")
-        .select("id, pharmacist_id, scheduled_date, scheduled_time, note")
-        .eq("patient_id", user.id)
-        .eq("status", "scheduled")
-        .gte("scheduled_date", todayIso)
-        .order("scheduled_date", { ascending: true })
-        .limit(1);
-      if (cancelled) return;
-      if (vsErr) {
-        console.error("[mypage] visit_schedules load failed:", vsErr);
-        setNextVisit(null);
-        return;
-      }
-      const row = ((vsData ?? []) as unknown as Array<Pick<VisitScheduleRow, "id" | "pharmacist_id" | "scheduled_date" | "scheduled_time" | "note">>)[0];
-      if (!row) {
-        setNextVisit(null);
-        return;
-      }
-      // 약사/약국 정보 매칭 (license_name → profiles.name 폴백)
-      let pharmName: string | null = null;
-      let pharmacyName: string | null = null;
-      let address: string | null = null;
-      let pharmLat: number | null = null;
-      let pharmLng: number | null = null;
+    // scheduled + completed 둘 다 한번에 — cancelled 만 DB 단계에서 제외.
+    //   completed = 약사가 방문 확인한 row → 무조건 "지난 방문"으로 분기 (날짜 무관).
+    const { data: vsData, error: vsErr } = await supabase
+      .from("visit_schedules")
+      .select("id, pharmacist_id, scheduled_date, scheduled_time, note, status, visited_date")
+      .eq("patient_id", user.id)
+      .in("status", ["scheduled", "completed"])
+      .order("scheduled_date", { ascending: true });
+    if (vsErr) {
+      console.error("[mypage] visit_schedules load failed:", vsErr);
+      setUpcomingVisits([]);
+      setPastVisits([]);
+      return;
+    }
+    const rows = (vsData ?? []) as unknown as Array<
+      Pick<VisitScheduleRow, "id" | "pharmacist_id" | "scheduled_date" | "scheduled_time" | "note">
+      & { status: string | null; visited_date: string | null }
+    >;
+    if (rows.length === 0) {
+      setUpcomingVisits([]);
+      setPastVisits([]);
+      return;
+    }
+    // 약사/약국 정보 일괄 조회 — 등장 pharmacist_id 중복 제거 후 IN.
+    //   기존 단건 .eq → 여러 건 .in 로 확장. 폴백 로직(license_name → profiles.name)은 동일.
+    const pharmIds = Array.from(
+      new Set(rows.map((r) => r.pharmacist_id).filter((id): id is string => !!id)),
+    );
+    type PharmInfo = {
+      license_name: string | null;
+      pharmacy_name: string | null;
+      address: string | null;
+      lat: number | null;
+      lng: number | null;
+    };
+    const pharmInfoById = new Map<string, PharmInfo>();
+    if (pharmIds.length > 0) {
       const { data: ppData, error: ppErr } = await supabase
         .from("pharmacist_profiles")
         .select("id, license_name, pharmacy_name, address, lat, lng")
-        .eq("id", row.pharmacist_id)
-        .maybeSingle();
-      if (cancelled) return;
+        .in("id", pharmIds);
       if (ppErr) {
-        console.error("[mypage] next-visit pharmacist_profiles fetch failed:", ppErr);
-      } else if (ppData) {
-        const pp = ppData as {
+        console.error("[mypage] visits pharmacist_profiles fetch failed:", ppErr);
+      } else {
+        for (const pp of (ppData ?? []) as Array<{
+          id: string;
           license_name: string | null;
           pharmacy_name: string | null;
           address: string | null;
           lat: number | string | null;
           lng: number | string | null;
-        };
-        pharmName = (pp.license_name && pp.license_name.trim()) || null;
-        pharmacyName = (pp.pharmacy_name && pp.pharmacy_name.trim()) || null;
-        address = (pp.address && pp.address.trim()) || null;
-        // DB numeric → 숫자 변환 (문자열로 올 수도 있어 Number() 후 isFinite 가드)
-        const latNum = pp.lat != null ? Number(pp.lat) : NaN;
-        const lngNum = pp.lng != null ? Number(pp.lng) : NaN;
-        pharmLat = Number.isFinite(latNum) ? latNum : null;
-        pharmLng = Number.isFinite(lngNum) ? lngNum : null;
-      }
-      if (!pharmName) {
-        const { data: profData, error: profErr } = await supabase
-          .from("profiles")
-          .select("name")
-          .eq("id", row.pharmacist_id)
-          .maybeSingle();
-        if (cancelled) return;
-        if (profErr) {
-          console.error("[mypage] next-visit profiles fallback failed:", profErr);
-        } else if (profData) {
-          const pn = (profData as { name: string | null }).name;
-          if (pn && pn.trim()) pharmName = pn.trim();
+        }>) {
+          // DB numeric → 숫자 변환 (문자열로 올 수도 있어 Number() 후 isFinite 가드)
+          const latNum = pp.lat != null ? Number(pp.lat) : NaN;
+          const lngNum = pp.lng != null ? Number(pp.lng) : NaN;
+          pharmInfoById.set(pp.id, {
+            license_name: (pp.license_name && pp.license_name.trim()) || null,
+            pharmacy_name: (pp.pharmacy_name && pp.pharmacy_name.trim()) || null,
+            address: (pp.address && pp.address.trim()) || null,
+            lat: Number.isFinite(latNum) ? latNum : null,
+            lng: Number.isFinite(lngNum) ? lngNum : null,
+          });
         }
       }
-      setNextVisit({
+    }
+    // profiles.name 폴백 — license_name 없는 약사만 보충 조회.
+    const missingNameIds = pharmIds.filter((id) => !pharmInfoById.get(id)?.license_name);
+    const profileNameById = new Map<string, string>();
+    if (missingNameIds.length > 0) {
+      const { data: profData, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, name")
+        .in("id", missingNameIds);
+      if (profErr) {
+        console.error("[mypage] visits profiles fallback failed:", profErr);
+      } else {
+        for (const p of (profData ?? []) as Array<{ id: string; name: string | null }>) {
+          if (p.name && p.name.trim()) profileNameById.set(p.id, p.name.trim());
+        }
+      }
+    }
+    const mapped: NextVisit[] = rows.map((row) => {
+      const pp = row.pharmacist_id ? pharmInfoById.get(row.pharmacist_id) : null;
+      const pharmName =
+        pp?.license_name
+        ?? (row.pharmacist_id ? profileNameById.get(row.pharmacist_id) ?? null : null);
+      return {
         id: row.id,
         scheduled_date: row.scheduled_date,
         scheduled_time: row.scheduled_time,
         note: row.note,
         pharmacist_name: pharmName,
-        pharmacy_name: pharmacyName,
-        address,
-        lat: pharmLat,
-        lng: pharmLng,
-      });
-    })();
-    return () => { cancelled = true; };
+        pharmacy_name: pp?.pharmacy_name ?? null,
+        address: pp?.address ?? null,
+        lat: pp?.lat ?? null,
+        lng: pp?.lng ?? null,
+        status: row.status === "completed" ? "completed" : "scheduled",
+        visited_date: row.visited_date ?? null,
+      };
+    });
+    // split — completed 는 무조건 past. scheduled 는 오늘(KST) 기준 분리.
+    //   past 는 최근(scheduled_date 큰 값) 먼저. scheduled_date 는 YYYY-MM-DD 라 사전식 비교 안전.
+    const todayIso = getTodayLocalISO();
+    const upcoming = mapped.filter(
+      (v) => v.status === "scheduled" && v.scheduled_date >= todayIso,
+    );
+    const past = mapped
+      .filter((v) => v.status === "completed" || v.scheduled_date < todayIso)
+      .sort((a, b) => (a.scheduled_date < b.scheduled_date ? 1 : a.scheduled_date > b.scheduled_date ? -1 : 0));
+    setUpcomingVisits(upcoming);
+    setPastVisits(past);
   }, [user]);
+  useEffect(() => {
+    loadVisits();
+  }, [loadVisits]);
 
   /* consultations DB 로드 — 환자 본인의 상담 카드 (활성/종료) */
   useEffect(() => {
@@ -810,187 +823,231 @@ function MypageContent() {
   })();
 
   /* ── DB 로드: 본인 patient_supplements (전체) ── */
-  useEffect(() => {
+  const loadSupplements = useCallback(async () => {
     if (!user) {
       setSupplementsLoaded(true);
       return;
     }
-    let cancelled = false;
-    (async () => {
-      const { data, error } = await supabase
-        .from("patient_supplements")
-        .select("id, patient_id, name, time_slots, daily_count, source, source_dosage_guide_id, start_date, days, created_at, updated_at")
-        .eq("patient_id", user.id)
-        .order("created_at", { ascending: true });
-      if (cancelled) return;
-      if (error) {
-        console.error("[mypage] patient_supplements load failed:", error);
-        showMypageToast("영양제를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.");
-        setSupplementsLoaded(true);
-        return;
-      }
-      const rows = (data ?? []) as unknown as PatientSupplementRow[];
-      setSupplements(rows.map(mapPatientSupplementRow));
+    const { data, error } = await supabase
+      .from("patient_supplements")
+      .select("id, patient_id, name, time_slots, daily_count, source, source_dosage_guide_id, start_date, days, created_at, updated_at")
+      .eq("patient_id", user.id)
+      .order("created_at", { ascending: true });
+    if (error) {
+      console.error("[mypage] patient_supplements load failed:", error);
+      showMypageToast("영양제를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.");
       setSupplementsLoaded(true);
-    })();
-    return () => { cancelled = true; };
+      return;
+    }
+    const rows = (data ?? []) as unknown as PatientSupplementRow[];
+    setSupplements(rows.map(mapPatientSupplementRow));
+    setSupplementsLoaded(true);
   }, [user, showMypageToast]);
+  useEffect(() => {
+    loadSupplements();
+  }, [loadSupplements]);
 
   /* ── DB 로드: 본인 dosage_guides (활성 상태만) ──
    *  supplements jsonb 는 약속된 형식 [{ name, time_slots }] 으로 가정.
    *  레거시 형식({name, dosage, timing}) row 가 들어오면 time_slots 비어있게 안전 폴백. */
-  useEffect(() => {
+  const loadDosageGuides = useCallback(async () => {
     if (!user) {
       setDosageGuidesLoaded(true);
       return;
     }
-    let cancelled = false;
-    (async () => {
-      const { data, error } = await supabase
-        .from("dosage_guides")
-        .select("id, supplements, dosage_days, dosage_end_date, custom_guide, dosage_status, sent_at, created_at, pharmacist_id")
-        .eq("patient_id", user.id)
-        .order("created_at", { ascending: false });
-      if (cancelled) return;
-      if (error) {
-        console.error("[mypage] dosage_guides load failed:", error);
-        showMypageToast("복용 가이드를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.");
-        setDosageGuidesLoaded(true);
-        return;
-      }
-      type GuideRow = {
-        id: string;
-        supplements: unknown;
-        dosage_days: number | null;
-        dosage_end_date: string | null;
-        custom_guide: string | null;
-        dosage_status: "active" | "completed" | "stopped";
-        sent_at: string | null;
-        created_at: string;
-        pharmacist_id: string | null;
-      };
-      const rows = (data ?? []) as unknown as GuideRow[];
-
-      // pharmacist_profiles IN 조회 — L385-394 패턴 재사용
-      const pharmIds = Array.from(
-        new Set(rows.map((r) => r.pharmacist_id).filter((id): id is string => !!id)),
-      );
-      const pharmInfoById = new Map<string, { license_name: string | null; pharmacy_name: string | null }>();
-      if (pharmIds.length > 0) {
-        const { data: ppData, error: ppErr } = await supabase
-          .from("pharmacist_profiles")
-          .select("id, license_name, pharmacy_name")
-          .in("id", pharmIds);
-        if (cancelled) return;
-        if (ppErr) {
-          console.error("[mypage] dosage_guides pharmacist_profiles load failed:", ppErr);
-        } else {
-          for (const pp of (ppData ?? []) as { id: string; license_name: string | null; pharmacy_name: string | null }[]) {
-            pharmInfoById.set(pp.id, {
-              license_name: pp.license_name,
-              pharmacy_name: pp.pharmacy_name,
-            });
-          }
-        }
-      }
-
-      // profiles.name 폴백 — license_name 없을 때 사용 (L400 패턴 재사용)
-      const profileNameById = new Map<string, string>();
-      if (pharmIds.length > 0) {
-        const { data: profData, error: profErr } = await supabase
-          .from("profiles")
-          .select("id, name")
-          .in("id", pharmIds);
-        if (cancelled) return;
-        if (profErr) {
-          console.error("[mypage] dosage_guides profiles fetch failed:", profErr);
-        } else {
-          for (const p of (profData ?? []) as { id: string; name: string | null }[]) {
-            if (p.name && p.name.trim()) profileNameById.set(p.id, p.name.trim());
-          }
-        }
-      }
-      const parsed: DosageGuide[] = rows.map((r) => {
-        const rawList = Array.isArray(r.supplements) ? r.supplements : [];
-        type ParsedSupp = {
-          name: string;
-          time_slots: string[];
-          daily_count?: number;
-          dispense_type: "bottle" | "compounded";
-          days: number | null;
-          dosage: string;
-          timing: string;
-          etc_note: string;
-          memo: string;
-          package_note: boolean;
-        };
-        const supps = rawList
-          .map((item): ParsedSupp | null => {
-            if (typeof item !== "object" || item === null) return null;
-            const obj = item as {
-              name?: unknown;
-              time_slots?: unknown;
-              daily_count?: unknown;
-              dispense_type?: unknown;
-              days?: unknown;
-              dosage?: unknown;
-              timing?: unknown;
-              etc_note?: unknown;
-              memo?: unknown;
-              package_note?: unknown;
-            };
-            const name = typeof obj.name === "string" ? obj.name : "";
-            if (!name) return null;
-            const ts = Array.isArray(obj.time_slots)
-              ? obj.time_slots.filter((s): s is string => typeof s === "string")
-              : [];
-            const dc = typeof obj.daily_count === "number" && obj.daily_count > 0 ? obj.daily_count : undefined;
-            const dispense: "bottle" | "compounded" = obj.dispense_type === "compounded" ? "compounded" : "bottle";
-            const days = typeof obj.days === "number" ? obj.days : null;
-            const dosage = typeof obj.dosage === "string" ? obj.dosage : "";
-            const timing = typeof obj.timing === "string" ? obj.timing : "";
-            const etcNote = typeof obj.etc_note === "string" ? obj.etc_note : "";
-            const memo = typeof obj.memo === "string" ? obj.memo : "";
-            // 레거시 row 에 package_note 없으면 true 간주 (소분약은 기본적으로 약포지 안내 노출)
-            const pkgNote = typeof obj.package_note === "boolean" ? obj.package_note : true;
-            return {
-              name,
-              time_slots: ts,
-              daily_count: dc,
-              dispense_type: dispense,
-              days,
-              dosage,
-              timing,
-              etc_note: etcNote,
-              memo,
-              package_note: pkgNote,
-            };
-          })
-          .filter((s): s is ParsedSupp => s !== null);
-        const ppInfo = r.pharmacist_id ? pharmInfoById.get(r.pharmacist_id) : null;
-        const profName = r.pharmacist_id ? profileNameById.get(r.pharmacist_id) : null;
-        const pharmacistName =
-          (ppInfo?.license_name && ppInfo.license_name.trim()) || profName || null;
-        const pharmacyName = (ppInfo?.pharmacy_name && ppInfo.pharmacy_name.trim()) || null;
-        return {
-          id: r.id,
-          supplements: supps,
-          dosage_days: r.dosage_days,
-          dosage_end_date: r.dosage_end_date,
-          custom_guide: r.custom_guide,
-          dosage_status: r.dosage_status,
-          sent_at: r.sent_at,
-          created_at: r.created_at,
-          pharmacist_id: r.pharmacist_id,
-          pharmacist_name: pharmacistName,
-          pharmacy_name: pharmacyName,
-        };
-      });
-      setDosageGuides(parsed);
+    const { data, error } = await supabase
+      .from("dosage_guides")
+      .select("id, supplements, dosage_days, dosage_end_date, custom_guide, dosage_status, sent_at, created_at, pharmacist_id")
+      .eq("patient_id", user.id)
+      .order("created_at", { ascending: false });
+    if (error) {
+      console.error("[mypage] dosage_guides load failed:", error);
+      showMypageToast("복용 가이드를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.");
       setDosageGuidesLoaded(true);
-    })();
-    return () => { cancelled = true; };
+      return;
+    }
+    type GuideRow = {
+      id: string;
+      supplements: unknown;
+      dosage_days: number | null;
+      dosage_end_date: string | null;
+      custom_guide: string | null;
+      dosage_status: "active" | "completed" | "stopped";
+      sent_at: string | null;
+      created_at: string;
+      pharmacist_id: string | null;
+    };
+    const rows = (data ?? []) as unknown as GuideRow[];
+
+    // pharmacist_profiles IN 조회 — L385-394 패턴 재사용
+    const pharmIds = Array.from(
+      new Set(rows.map((r) => r.pharmacist_id).filter((id): id is string => !!id)),
+    );
+    const pharmInfoById = new Map<string, { license_name: string | null; pharmacy_name: string | null }>();
+    if (pharmIds.length > 0) {
+      const { data: ppData, error: ppErr } = await supabase
+        .from("pharmacist_profiles")
+        .select("id, license_name, pharmacy_name")
+        .in("id", pharmIds);
+      if (ppErr) {
+        console.error("[mypage] dosage_guides pharmacist_profiles load failed:", ppErr);
+      } else {
+        for (const pp of (ppData ?? []) as { id: string; license_name: string | null; pharmacy_name: string | null }[]) {
+          pharmInfoById.set(pp.id, {
+            license_name: pp.license_name,
+            pharmacy_name: pp.pharmacy_name,
+          });
+        }
+      }
+    }
+
+    // profiles.name 폴백 — license_name 없을 때 사용 (L400 패턴 재사용)
+    const profileNameById = new Map<string, string>();
+    if (pharmIds.length > 0) {
+      const { data: profData, error: profErr } = await supabase
+        .from("profiles")
+        .select("id, name")
+        .in("id", pharmIds);
+      if (profErr) {
+        console.error("[mypage] dosage_guides profiles fetch failed:", profErr);
+      } else {
+        for (const p of (profData ?? []) as { id: string; name: string | null }[]) {
+          if (p.name && p.name.trim()) profileNameById.set(p.id, p.name.trim());
+        }
+      }
+    }
+    const parsed: DosageGuide[] = rows.map((r) => {
+      const rawList = Array.isArray(r.supplements) ? r.supplements : [];
+      type ParsedSupp = {
+        name: string;
+        time_slots: string[];
+        daily_count?: number;
+        dispense_type: "bottle" | "compounded";
+        days: number | null;
+        dosage: string;
+        timing: string;
+        etc_note: string;
+        memo: string;
+        package_note: boolean;
+      };
+      const supps = rawList
+        .map((item): ParsedSupp | null => {
+          if (typeof item !== "object" || item === null) return null;
+          const obj = item as {
+            name?: unknown;
+            time_slots?: unknown;
+            daily_count?: unknown;
+            dispense_type?: unknown;
+            days?: unknown;
+            dosage?: unknown;
+            timing?: unknown;
+            etc_note?: unknown;
+            memo?: unknown;
+            package_note?: unknown;
+          };
+          const name = typeof obj.name === "string" ? obj.name : "";
+          if (!name) return null;
+          const ts = Array.isArray(obj.time_slots)
+            ? obj.time_slots.filter((s): s is string => typeof s === "string")
+            : [];
+          const dc = typeof obj.daily_count === "number" && obj.daily_count > 0 ? obj.daily_count : undefined;
+          const dispense: "bottle" | "compounded" = obj.dispense_type === "compounded" ? "compounded" : "bottle";
+          const days = typeof obj.days === "number" ? obj.days : null;
+          const dosage = typeof obj.dosage === "string" ? obj.dosage : "";
+          const timing = typeof obj.timing === "string" ? obj.timing : "";
+          const etcNote = typeof obj.etc_note === "string" ? obj.etc_note : "";
+          const memo = typeof obj.memo === "string" ? obj.memo : "";
+          // 레거시 row 에 package_note 없으면 true 간주 (소분약은 기본적으로 약포지 안내 노출)
+          const pkgNote = typeof obj.package_note === "boolean" ? obj.package_note : true;
+          return {
+            name,
+            time_slots: ts,
+            daily_count: dc,
+            dispense_type: dispense,
+            days,
+            dosage,
+            timing,
+            etc_note: etcNote,
+            memo,
+            package_note: pkgNote,
+          };
+        })
+        .filter((s): s is ParsedSupp => s !== null);
+      const ppInfo = r.pharmacist_id ? pharmInfoById.get(r.pharmacist_id) : null;
+      const profName = r.pharmacist_id ? profileNameById.get(r.pharmacist_id) : null;
+      const pharmacistName =
+        (ppInfo?.license_name && ppInfo.license_name.trim()) || profName || null;
+      const pharmacyName = (ppInfo?.pharmacy_name && ppInfo.pharmacy_name.trim()) || null;
+      return {
+        id: r.id,
+        supplements: supps,
+        dosage_days: r.dosage_days,
+        dosage_end_date: r.dosage_end_date,
+        custom_guide: r.custom_guide,
+        dosage_status: r.dosage_status,
+        sent_at: r.sent_at,
+        created_at: r.created_at,
+        pharmacist_id: r.pharmacist_id,
+        pharmacist_name: pharmacistName,
+        pharmacy_name: pharmacyName,
+      };
+    });
+    setDosageGuides(parsed);
+    setDosageGuidesLoaded(true);
   }, [user, showMypageToast]);
+  useEffect(() => {
+    loadDosageGuides();
+  }, [loadDosageGuides]);
+
+  /* ── Realtime 구독: 약사가 보낸 patient_supplements / visit_schedules / dosage_guides
+   *  변화를 본인(patient_id) 한정으로 감지해 해당 load 함수만 재호출.
+   *  payload.new 직접 병합 대신 refetch — pharmacist_profiles + profiles 폴백 JOIN 보존.
+   *  채널 키에 user.id 포함 → 다른 환자 row 와 충돌 없음. */
+  useEffect(() => {
+    if (!user?.id) return;
+    const channel = supabase
+      .channel(`mypage:${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "patient_supplements",
+          filter: `patient_id=eq.${user.id}`,
+        },
+        () => {
+          loadSupplements();
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "visit_schedules",
+          filter: `patient_id=eq.${user.id}`,
+        },
+        () => {
+          loadVisits();
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "dosage_guides",
+          filter: `patient_id=eq.${user.id}`,
+        },
+        () => {
+          loadDosageGuides();
+        },
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user?.id, loadSupplements, loadVisits, loadDosageGuides]);
 
   /* ── DB 로드: 본인 medication_checks (이번 주 + 최근 3일) ── */
   useEffect(() => {
@@ -1145,6 +1202,117 @@ function MypageContent() {
   const [showLogout, setShowLogout] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
 
+  /* ── 웹 푸시 구독 상태 (I-4 A 단계) ──
+   *  pushStatus: unsupported(브라우저 미지원) / loading / unsubscribed / subscribed / denied / error
+   *  pushBusy: enablePush 진행 중 — 버튼 disable 용 */
+  type PushStatus = "unsupported" | "loading" | "unsubscribed" | "subscribed" | "denied" | "error";
+  const [pushStatus, setPushStatus] = useState<PushStatus>("loading");
+  const [pushBusy, setPushBusy] = useState<boolean>(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!("serviceWorker" in navigator) || !("Notification" in window) || !("PushManager" in window)) {
+      setPushStatus("unsupported");
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        if (Notification.permission === "denied") {
+          if (!cancelled) setPushStatus("denied");
+          return;
+        }
+        const reg = await navigator.serviceWorker.getRegistration("/sw.js");
+        const sub = reg ? await reg.pushManager.getSubscription() : null;
+        if (cancelled) return;
+        setPushStatus(sub ? "subscribed" : "unsubscribed");
+      } catch (err) {
+        console.error("[push] initial state check failed:", err);
+        if (!cancelled) setPushStatus("error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const enablePush = useCallback(async () => {
+    if (pushBusy) return;
+    if (typeof window === "undefined") return;
+    if (!("serviceWorker" in navigator) || !("Notification" in window) || !("PushManager" in window)) {
+      setPushStatus("unsupported");
+      return;
+    }
+    if (!user) {
+      showMypageToast("로그인 후 이용해 주세요.");
+      return;
+    }
+    const vapidKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+    if (!vapidKey) {
+      console.error("[push] NEXT_PUBLIC_VAPID_PUBLIC_KEY missing");
+      setPushStatus("error");
+      return;
+    }
+    setPushBusy(true);
+    try {
+      const reg = await navigator.serviceWorker.register("/sw.js");
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") {
+        setPushStatus(perm === "denied" ? "denied" : "unsubscribed");
+        return;
+      }
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        // TS lib 의 BufferSource 가 SharedArrayBuffer 분기를 좁게 정의해 Uint8Array<ArrayBufferLike> 와 불일치 — 안전 캐스팅.
+        applicationServerKey: urlBase64ToUint8Array(vapidKey) as unknown as BufferSource,
+      });
+      const json = sub.toJSON() as {
+        endpoint?: string;
+        keys?: { p256dh?: string; auth?: string };
+      };
+      const endpoint = json.endpoint ?? "";
+      const p256dh = json.keys?.p256dh ?? "";
+      const auth = json.keys?.auth ?? "";
+      if (!endpoint || !p256dh || !auth) {
+        console.error("[push] subscription missing fields", json);
+        setPushStatus("error");
+        return;
+      }
+      type PushSubInsert = {
+        user_id: string;
+        endpoint: string;
+        p256dh: string;
+        auth: string;
+        user_agent: string | null;
+      };
+      const payload: PushSubInsert = {
+        user_id: user.id,
+        endpoint,
+        p256dh,
+        auth,
+        user_agent: typeof navigator !== "undefined" ? navigator.userAgent : null,
+      };
+      const { error } = await (supabase
+        .from("push_subscriptions") as unknown as {
+          upsert: (
+            p: PushSubInsert,
+            opts?: { onConflict?: string },
+          ) => Promise<{ error: { message: string; code?: string } | null }>;
+        })
+        .upsert(payload, { onConflict: "endpoint" });
+      if (error) {
+        console.error("[push] push_subscriptions upsert failed:", error);
+        showMypageToast("알림 구독 저장에 실패했어요. 잠시 후 다시 시도해 주세요.");
+        setPushStatus("error");
+        return;
+      }
+      setPushStatus("subscribed");
+      showMypageToast("브라우저 알림 구독이 등록되었어요");
+    } catch (err) {
+      console.error("[push] enablePush failed:", err);
+      setPushStatus("error");
+    } finally {
+      setPushBusy(false);
+    }
+  }, [pushBusy, user, showMypageToast]);
+
   /* ── 알림 설정 영속화 (사이클 5) ──
    *  profiles.ui_preferences 에서 noti_chat / noti_med / noti_health / noti_visit 로드.
    *  키 없으면 위 useState 기본값 유지. 비로그인이면 SELECT 건너뜀.
@@ -1229,7 +1397,7 @@ function MypageContent() {
 
   /* I-4 임박 알람용 파생 데이터.
    *  nearMeds: 복용 종료가 D-MED_NEAR_THRESHOLD 이하로 남은 영양제. 시작 전(remain < 0) 제외.
-   *  visitDaysLeft: 다음 방문 예정까지의 일수. nextVisit 없으면 null. */
+   *  visitDaysLeft: 가장 가까운 다가오는 방문까지의 일수. upcomingVisits 비면 null. */
   const nearMeds = useMemo(() => {
     return supplements
       .map((s) => ({ s, remain: calcRemainingDays(s.start_date, s.days) }))
@@ -1238,9 +1406,10 @@ function MypageContent() {
       )
       .sort((a, b) => a.remain - b.remain);
   }, [supplements]);
+  const nextUpcomingVisit = upcomingVisits[0] ?? null;
   const visitDaysLeft = useMemo(
-    () => (nextVisit ? daysFromTodayLocal(nextVisit.scheduled_date) : null),
-    [nextVisit],
+    () => (nextUpcomingVisit ? daysFromTodayLocal(nextUpcomingVisit.scheduled_date) : null),
+    [nextUpcomingVisit],
   );
 
   const age = calcAge(editMode ? editBirth : profile.birth);
@@ -1682,10 +1851,10 @@ function MypageContent() {
           const showMedBanner = notiMed && nearMeds.length > 0;
           if (!showVisitBanner && !showMedBanner) return null;
           // 방문 배너용 라벨 — "M월 D일"
-          const visitDateLabel = nextVisit
+          const visitDateLabel = nextUpcomingVisit
             ? (() => {
-                const m = nextVisit.scheduled_date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-                if (!m) return nextVisit.scheduled_date;
+                const m = nextUpcomingVisit.scheduled_date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+                if (!m) return nextUpcomingVisit.scheduled_date;
                 return `${Number(m[2])}월 ${Number(m[3])}일`;
               })()
             : "";
@@ -1742,102 +1911,207 @@ function MypageContent() {
           );
         })()}
 
-        {/* ═══════ 1-1. 다음 방문 예정 ═══════ */}
-        {nextVisit && (() => {
-          // 날짜 라벨: "M월 D일 (요일)" — 한글 요일. 파싱 실패 시 요일 생략.
+        {/* ═══════ 1-1. 방문 일정 ═══════ */}
+        {(upcomingVisits.length > 0 || pastVisits.length > 0) && (() => {
           const WEEKDAY_KR = ["일", "월", "화", "수", "목", "금", "토"] as const;
-          const dateLabel = (() => {
-            const m = nextVisit.scheduled_date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-            if (!m) return nextVisit.scheduled_date;
-            const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
-            const dt = new Date(y, mo - 1, d);
+          // 로컬 날짜 파싱 — toISOString 금지(UTC 어긋남). YYYY-MM-DD 정규식만 사용.
+          const parseLocalDate = (iso: string): Date | null => {
+            const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!m) return null;
+            const dt = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+            return Number.isNaN(dt.getTime()) ? null : dt;
+          };
+          const fmtDateWithDow = (iso: string): string => {
+            const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!m) return iso;
+            const mo = Number(m[2]); const d = Number(m[3]);
+            const dt = parseLocalDate(iso);
             const head = `${mo}월 ${d}일`;
-            if (Number.isNaN(dt.getTime())) return head;
-            return `${head} (${WEEKDAY_KR[dt.getDay()]})`;
-          })();
-          const timeLabel = nextVisit.scheduled_time ?? "";
-          const headline = timeLabel ? `${dateLabel} ${timeLabel}` : dateLabel;
-          const placeParts: string[] = [];
-          if (nextVisit.pharmacy_name) placeParts.push(nextVisit.pharmacy_name);
-          if (nextVisit.pharmacist_name) placeParts.push(`${nextVisit.pharmacist_name} 약사`);
-          const placeLine = placeParts.join(" · ");
-          const hasFooter = !!(nextVisit.note || nextVisit.address);
+            return dt ? `${head} (${WEEKDAY_KR[dt.getDay()]})` : head;
+          };
+          const visibleUpcoming = showAllUpcoming ? upcomingVisits : upcomingVisits.slice(0, 2);
+          const hiddenUpcomingCount = Math.max(upcomingVisits.length - 2, 0);
           return (
             <section className="my-section">
-              <h2 className="my-section-title">다음 방문 예정</h2>
-              <div style={{
-                borderRadius: 14, overflow: "hidden",
-                border: "1.5px solid #B3D1E0", background: "#fff",
-              }}>
-                <div style={{
-                  padding: "14px 16px", background: "#E8F0F5",
-                  display: "flex", alignItems: "center", gap: 10,
-                }}>
-                  <span style={{ fontSize: 22 }}>📅</span>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>{headline}</div>
-                    {placeLine && (
-                      <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 2 }}>{placeLine}</div>
-                    )}
-                  </div>
+              <h2 className="my-section-title">방문 일정</h2>
+
+              {/* 다가오는 방문 */}
+              {upcomingVisits.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {visibleUpcoming.map((v) => {
+                    const dateLabel = fmtDateWithDow(v.scheduled_date);
+                    const timeLabel = v.scheduled_time ?? "";
+                    const headline = timeLabel ? `${dateLabel} ${timeLabel}` : dateLabel;
+                    const placeParts: string[] = [];
+                    if (v.pharmacy_name) placeParts.push(v.pharmacy_name);
+                    if (v.pharmacist_name) placeParts.push(`${v.pharmacist_name} 약사`);
+                    const placeLine = placeParts.join(" · ");
+                    const hasFooter = !!(v.note || v.address);
+                    return (
+                      <div key={v.id} style={{
+                        borderRadius: 14, overflow: "hidden",
+                        border: "1.5px solid #B3D1E0", background: "#fff",
+                      }}>
+                        <div style={{
+                          padding: "14px 16px", background: "#E8F0F5",
+                          display: "flex", alignItems: "center", gap: 10,
+                        }}>
+                          <span style={{ fontSize: 22 }}>📅</span>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>{headline}</div>
+                            {placeLine && (
+                              <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 2 }}>{placeLine}</div>
+                            )}
+                          </div>
+                        </div>
+                        {hasFooter && (
+                          <div style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: 6 }}>
+                            {v.address && (
+                              <div style={{ fontSize: 13, color: "#5E7D6C", lineHeight: 1.5 }}>
+                                {v.address}
+                              </div>
+                            )}
+                            {(v.address || (v.lat != null && v.lng != null)) && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  // "약국명 + 도로명"이면 우리 약국이 정확히 1순위로 잡힌다. 번지·상세주소·구는 제외.
+                                  // 도로명 = 한글/숫자로 끝나는 "OO로" 또는 "OO길" (대로/소로 모두 "로"에 포함, lookahead 로 뒤 한글 차단).
+                                  const name = (v.pharmacy_name ?? "").trim();
+                                  const addr = (v.address ?? "").trim();
+                                  const roadMatch = addr.match(/[가-힣0-9]+(?:로|길)(?![가-힣])/);
+                                  const road = roadMatch ? roadMatch[0] : "";
+                                  const query = [name, road].filter(Boolean).join(" ");
+                                  let url: string | null = null;
+                                  if (query) {
+                                    url = "https://map.kakao.com/?q=" + encodeURIComponent(query);
+                                  } else {
+                                    const lat = v.lat;
+                                    const lng = v.lng;
+                                    if (lat != null && lng != null) {
+                                      url = "https://map.kakao.com/link/map/"
+                                        + encodeURIComponent(name || "약국")
+                                        + "," + lat + "," + lng;
+                                    }
+                                  }
+                                  if (!url) return;
+                                  window.open(url, "_blank");
+                                }}
+                                style={{
+                                  alignSelf: "flex-start",
+                                  display: "inline-flex", alignItems: "center", gap: 4,
+                                  padding: "6px 12px", borderRadius: 8,
+                                  background: "#fff",
+                                  border: "1px solid #B3D1E0",
+                                  color: "#5A8BA8",
+                                  fontSize: 13, fontWeight: 600,
+                                  cursor: "pointer",
+                                  fontFamily: "'Noto Sans KR', sans-serif",
+                                  minHeight: 36,
+                                }}
+                              >
+                                📍 위치 보기
+                              </button>
+                            )}
+                            {v.note && (
+                              <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
+                                메모: {v.note}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {hiddenUpcomingCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllUpcoming((v) => !v)}
+                      style={{
+                        alignSelf: "stretch",
+                        padding: "10px 14px", borderRadius: 10,
+                        background: "#F8F9F7",
+                        border: "1.5px solid rgba(94, 125, 108, 0.14)",
+                        color: "#4A6355",
+                        fontSize: 14, fontWeight: 600,
+                        cursor: "pointer",
+                        fontFamily: "'Noto Sans KR', sans-serif",
+                        minHeight: 44,
+                      }}
+                    >
+                      {showAllUpcoming ? "접기" : `방문 예정 ${hiddenUpcomingCount}건 더 보기`}
+                    </button>
+                  )}
                 </div>
-                {hasFooter && (
-                  <div style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: 6 }}>
-                    {nextVisit.address && (
-                      <div style={{ fontSize: 13, color: "#5E7D6C", lineHeight: 1.5 }}>
-                        {nextVisit.address}
-                      </div>
-                    )}
-                    {(nextVisit.address || (nextVisit.lat != null && nextVisit.lng != null)) && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          // "약국명 + 도로명"이면 우리 약국이 정확히 1순위로 잡힌다. 번지·상세주소·구는 제외.
-                          // 도로명 = 한글/숫자로 끝나는 "OO로" 또는 "OO길" (대로/소로 모두 "로"에 포함, lookahead 로 뒤 한글 차단).
-                          const name = (nextVisit.pharmacy_name ?? "").trim();
-                          const addr = (nextVisit.address ?? "").trim();
-                          const roadMatch = addr.match(/[가-힣0-9]+(?:로|길)(?![가-힣])/);
-                          const road = roadMatch ? roadMatch[0] : "";
-                          const query = [name, road].filter(Boolean).join(" ");
-                          let url: string | null = null;
-                          if (query) {
-                            url = "https://map.kakao.com/?q=" + encodeURIComponent(query);
-                          } else {
-                            const lat = nextVisit.lat;
-                            const lng = nextVisit.lng;
-                            if (lat != null && lng != null) {
-                              url = "https://map.kakao.com/link/map/"
-                                + encodeURIComponent(name || "약국")
-                                + "," + lat + "," + lng;
-                            }
-                          }
-                          if (!url) return;
-                          window.open(url, "_blank");
-                        }}
-                        style={{
-                          alignSelf: "flex-start",
-                          display: "inline-flex", alignItems: "center", gap: 4,
-                          padding: "6px 12px", borderRadius: 8,
+              )}
+
+              {/* 지난 방문 — 접이식 */}
+              {pastVisits.length > 0 && (
+                <div style={{ marginTop: upcomingVisits.length > 0 ? 16 : 0 }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowPast((v) => !v)}
+                    style={{
+                      width: "100%",
+                      padding: "10px 14px", borderRadius: 10,
+                      background: "#F8F9F7",
+                      border: "1.5px solid rgba(94, 125, 108, 0.14)",
+                      color: "#4A6355",
+                      fontSize: 14, fontWeight: 600,
+                      cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                      minHeight: 44,
+                      display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+                    }}
+                  >
+                    <span>지난 방문 {pastVisits.length}건</span>
+                    <span style={{ fontSize: 12, color: "#7FA48E" }}>{showPast ? "▲" : "▼"}</span>
+                  </button>
+                  {showPast && (
+                    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+                      {pastVisits.map((v) => {
+                        // 노쇼 = scheduled 인데 예정일이 지나서 past 로 분류된 row.
+                        //   환자 부담 최소화 정책으로 배지/문구 없이 카드 자체만 흐리게 처리(ChatClient cancelled 카드 톤 참고).
+                        const isNoShow = v.status !== "completed";
+                        return (
+                        <div key={v.id} style={{
+                          padding: "10px 14px", borderRadius: 10,
+                          border: "1px solid rgba(94, 125, 108, 0.14)",
                           background: "#fff",
-                          border: "1px solid #B3D1E0",
-                          color: "#5A8BA8",
-                          fontSize: 13, fontWeight: 600,
-                          cursor: "pointer",
-                          fontFamily: "'Noto Sans KR', sans-serif",
-                          minHeight: 36,
-                        }}
-                      >
-                        📍 위치 보기
-                      </button>
-                    )}
-                    {nextVisit.note && (
-                      <div style={{ fontSize: 14, color: "#3D4A42", lineHeight: 1.5 }}>
-                        메모: {nextVisit.note}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
+                          display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+                          opacity: isNoShow ? 0.55 : 1,
+                        }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: 14, fontWeight: 700, color: "#2C3630" }}>
+                              {fmtDateWithDow(
+                                v.status === "completed" && v.visited_date
+                                  ? v.visited_date
+                                  : v.scheduled_date,
+                              )}
+                            </div>
+                            {v.pharmacy_name ? (
+                              <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 2 }}>{v.pharmacy_name}</div>
+                            ) : v.pharmacist_name ? (
+                              <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 2 }}>{v.pharmacist_name} 약사</div>
+                            ) : null}
+                          </div>
+                          {v.status === "completed" && (
+                            <span style={{
+                              fontSize: 12, fontWeight: 600,
+                              color: "#4A6355",
+                              background: "#EDF4F0",
+                              padding: "4px 10px", borderRadius: 999,
+                              flexShrink: 0,
+                              whiteSpace: "nowrap",
+                            }}>방문 완료</span>
+                          )}
+                        </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
           );
         })()}
@@ -2693,6 +2967,51 @@ function MypageContent() {
           <h2 className="my-section-title">설정</h2>
 
           <div style={{ fontSize: 14, fontWeight: 600, color: "#3D4A42", marginBottom: 8 }}>알림 설정</div>
+
+          {/* 브라우저 푸시 구독 (I-4 A 단계) — 실제 표시는 다음 단계, 여기선 구독 등록만. */}
+          {pushStatus !== "unsupported" && (
+            <div className="my-setting-row" style={{ alignItems: "center" }}>
+              <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+                <span>🔔 브라우저 알림</span>
+                <span style={{ fontSize: 13, color: "#5E7D6C", fontWeight: 500 }}>
+                  {pushStatus === "loading" && "확인 중..."}
+                  {pushStatus === "unsubscribed" && "이 기기에서 알림을 받으려면 구독하세요"}
+                  {pushStatus === "subscribed" && "이 기기에서 알림을 받고 있어요"}
+                  {pushStatus === "denied" && "권한이 거부됐어요. 브라우저 설정에서 허용해 주세요"}
+                  {pushStatus === "error" && "구독 처리 중 문제가 발생했어요"}
+                </span>
+              </span>
+              {pushStatus === "subscribed" ? (
+                <span style={{
+                  display: "inline-flex", alignItems: "center", justifyContent: "center",
+                  minHeight: 36, padding: "0 12px", borderRadius: 10,
+                  background: "#EDF4F0", color: "#4A6355",
+                  fontSize: 14, fontWeight: 700, flexShrink: 0,
+                }}>
+                  구독됨
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={enablePush}
+                  disabled={pushBusy || pushStatus === "denied" || pushStatus === "loading"}
+                  style={{
+                    minHeight: 48, padding: "0 16px", borderRadius: 10,
+                    background: (pushBusy || pushStatus === "denied" || pushStatus === "loading") ? "#B3CCBE" : "#4A6355",
+                    color: "#fff",
+                    border: "none",
+                    fontSize: 14, fontWeight: 700,
+                    cursor: (pushBusy || pushStatus === "denied" || pushStatus === "loading") ? "default" : "pointer",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                    whiteSpace: "nowrap", flexShrink: 0,
+                  }}
+                >
+                  {pushBusy ? "등록 중..." : "브라우저 알림 받기"}
+                </button>
+              )}
+            </div>
+          )}
+
           <div className="my-setting-row">
             <span>💬 채팅 알림</span>
             <button
@@ -2709,8 +3028,21 @@ function MypageContent() {
               <span className="my-toggle-knob" />
             </button>
           </div>
-          <div className="my-setting-row">
-            <span>💊 복약 알림</span>
+          {/* 복약 알림 — 보조 문구를 row 안 column flex 로 넣어 "브라우저 알림" 과 동일한 간격 적용 */}
+          <div className="my-setting-row" style={{ alignItems: "center" }}>
+            <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+              <span>💊 복약 알림</span>
+              {notiMed && pushStatus !== "subscribed" && (
+                <span style={{ fontSize: 14, color: "#C06B45", fontWeight: 500 }}>
+                  브라우저 알림을 먼저 켜야 이 알림을 받을 수 있어요
+                </span>
+              )}
+              {notiMed && pushStatus === "subscribed" && (
+                <span style={{ fontSize: 13, color: "#5E7D6C", fontWeight: 500 }}>
+                  복용 종료가 가까워지면 알려드려요
+                </span>
+              )}
+            </span>
             <button
               className={`my-toggle${notiMed ? " on" : ""}`}
               onClick={() => {
@@ -2741,8 +3073,21 @@ function MypageContent() {
               <span className="my-toggle-knob" />
             </button>
           </div>
-          <div className="my-setting-row">
-            <span>🏥 약국 방문 알림</span>
+          {/* 방문 알림 — 보조 문구를 row 안 column flex 로 넣어 "브라우저 알림" 과 동일한 간격 적용 */}
+          <div className="my-setting-row" style={{ alignItems: "center" }}>
+            <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+              <span>🏥 약국 방문 알림</span>
+              {notiVisit && pushStatus !== "subscribed" && (
+                <span style={{ fontSize: 14, color: "#C06B45", fontWeight: 500 }}>
+                  브라우저 알림을 먼저 켜야 이 알림을 받을 수 있어요
+                </span>
+              )}
+              {notiVisit && pushStatus === "subscribed" && (
+                <span style={{ fontSize: 13, color: "#5E7D6C", fontWeight: 500 }}>
+                  방문 예정이 가까워지면 알려드려요
+                </span>
+              )}
+            </span>
             <button
               className={`my-toggle${notiVisit ? " on" : ""}`}
               onClick={() => {

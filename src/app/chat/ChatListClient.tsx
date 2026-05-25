@@ -70,6 +70,7 @@ function formatPreview(content: string, myRole: "patient" | "pharmacist"): strin
   if (content === "[DOSAGE_GUIDE_SENT]") {
     return myRole === "patient" ? "복용 가이드가 도착했어요" : "복용 가이드 전송 완료";
   }
+  if (content === "[VISIT_CONFIRMED]") return "방문 완료";
   // 접두 토큰 — [추가질문답변] 이 [추가질문] 접두를 포함하므로 답변 먼저 분기
   if (content.startsWith("[추가질문답변]")) return "환자가 답변했어요";
   if (content.startsWith("[추가질문]")) return "추가 질문을 보냈어요";

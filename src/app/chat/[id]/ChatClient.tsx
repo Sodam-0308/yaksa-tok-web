@@ -75,6 +75,8 @@ interface DbMessageRow {
   is_read: boolean;
   created_at: string;
   round_id: string | null;
+  /** system 토큰의 부가 데이터. [방문안내]·[VISIT_CONFIRMED] → { visit_schedule_id }, [DOSAGE_GUIDE_SENT] → { dosage_guide_id } 등. */
+  metadata: Record<string, unknown> | null;
 }
 
 interface DbRound {
@@ -92,7 +94,12 @@ interface DbRound {
  *  향후 새 시스템 토큰 추가 시: 미리보기 문구는 ChatListClient.formatPreview, 메시지 리스트 본문은 이 함수에 추가.
  *  [CONSULT_REJECTED] role 별 분리 사유: 환자 측은 부드럽고 누구 탓도 아닌 톤("진행되지 않았습니다"),
  *  약사 측은 자기 행위에 대한 시스템적 명확 표현("거절하였습니다"). 안내 카드 헤딩 톤과 일관. */
-function formatSystemMessageContent(content: string, role: "patient" | "pharmacist"): string {
+function formatSystemMessageContent(
+  content: string,
+  role: "patient" | "pharmacist",
+  /** 환자 뷰에서 약사 실명 호칭("○○ 약사님")이 필요한 토큰용. 빈 값이면 "약사님" 무명 폴백. */
+  counterpartPharmacistName?: string | null,
+): string {
   if (content === "[CONSULT_REJECTED]") {
     return role === "patient" ? "상담이 진행되지 않았습니다" : "상담을 거절하였습니다";
   }
@@ -106,6 +113,17 @@ function formatSystemMessageContent(content: string, role: "patient" | "pharmaci
   // 사이클 6 — 약사 측 복용 가이드 전송 토큰 (ChartClient confirmSendGuide 에서 INSERT).
   if (content === "[DOSAGE_GUIDE_SENT]") {
     return role === "patient" ? "약사님이 복용 가이드를 보냈어요" : "복용 가이드를 보냈습니다";
+  }
+  // 약사 측 방문 완료 기록 토큰 — ChatClient.handleConfirmVisit 에서 INSERT. [DOSAGE_GUIDE_SENT] 와 동일 패턴.
+  //   환자 뷰는 약사 실명 호칭 우선 ("○○ 약사님이 ..."), 없으면 무명 "약사님" 폴백.
+  if (content === "[VISIT_CONFIRMED]") {
+    if (role === "patient") {
+      const name = counterpartPharmacistName?.trim();
+      return name
+        ? `${name} 약사님이 방문 완료로 기록하셨어요`
+        : "약사님이 방문 완료로 기록하셨어요";
+    }
+    return "방문을 완료로 기록했습니다";
   }
   if (content.startsWith("[시스템] ")) return content.replace("[시스템] ", "");
   return content;
@@ -135,6 +153,8 @@ interface Message {
   message_type?: string;
   // DB 모드 messages.created_at 보존 — 회차 구분자 라벨에 날짜 표시용.
   created_at?: string;
+  // DB 모드 messages.metadata 보존 — [방문안내]·[VISIT_CONFIRMED] 카드가 visit_schedule_id 식별에 사용.
+  metadata?: Record<string, unknown> | null;
 }
 
 const DEMO_MESSAGES: Message[] = [
@@ -545,6 +565,48 @@ function ChatContent() {
   const [rescheduleTimeSlot, setRescheduleTimeSlot] = useState("오전");
   const [rescheduleCustomTime, setRescheduleCustomTime] = useState("");
   const [cancelledVisitIds, setCancelledVisitIds] = useState<Set<string>>(new Set());
+  /** [VISIT_CONFIRMED] 시스템 메시지의 metadata.visit_schedule_id 집합.
+   *  값이 들어있으면 그 visit 카드는 "방문 확인됨" 상태로 렌더 + [방문 확인] 버튼 비활성. */
+  const [completedVisitIds, setCompletedVisitIds] = useState<Set<string>>(new Set());
+  /** [방문 완료] 클릭 시 카드 안에 펼쳐지는 인사 편집 textarea 의 임시 값 — visitId 별.
+   *  키 없음 = 편집 영역 접힘(1단계, [방문 완료] 버튼만), 키 있음 = 펼쳐짐(textarea + 3 버튼). */
+  const [thanksDraft, setThanksDraft] = useState<Record<string, string>>({});
+  /** 인사 기본 문구 — 약사 시점 일반 인사. 환자 이름 보간 없음(고정). */
+  const DEFAULT_THANKS_TEXT = "방문해주셔서 감사합니다. 궁금한 점 있으시면 언제든 채팅 주세요.";
+  const openThanksEditor = (visitId: string) => {
+    setThanksDraft((prev) => (visitId in prev ? prev : { ...prev, [visitId]: DEFAULT_THANKS_TEXT }));
+  };
+  const closeThanksEditor = (visitId: string) => {
+    setThanksDraft((prev) => {
+      if (!(visitId in prev)) return prev;
+      const next = { ...prev };
+      delete next[visitId];
+      return next;
+    });
+  };
+  /** 이 상담의 visit_schedules row 실제 상태 — id → { status, visited_date }.
+   *  message 기반 추적(cancelledVisitIds/completedVisitIds) 만으로는 재진입 시 과거 cancelled/completed 를
+   *  놓치므로, DB 실 상태를 같이 본다. 카드 액션 분기의 최종 진실 소스. */
+  const [visitStatusMap, setVisitStatusMap] = useState<Record<string, { status: string; visited_date: string | null }>>({});
+  const loadVisitStatuses = useCallback(async () => {
+    if (!isDbConsultation) return;
+    const { data, error } = await supabase
+      .from("visit_schedules")
+      .select("id, status, visited_date")
+      .eq("consultation_id", chatId);
+    if (error) {
+      console.error("[chat] visit_schedules status load failed:", error);
+      return;
+    }
+    const next: Record<string, { status: string; visited_date: string | null }> = {};
+    for (const row of (data ?? []) as Array<{ id: string; status: string | null; visited_date: string | null }>) {
+      if (row.id && row.status) next[row.id] = { status: row.status, visited_date: row.visited_date };
+    }
+    setVisitStatusMap(next);
+  }, [chatId, isDbConsultation]);
+  useEffect(() => {
+    loadVisitStatuses();
+  }, [loadVisitStatuses]);
   const [showReplacePrevVisit, setShowReplacePrevVisit] = useState(false);
 
   /* ── 환자 차트 사이드 패널 ── */
@@ -847,6 +909,113 @@ function ChatContent() {
     setVisitGuide(guide);
     setShowVisitPanel(false);
     setActiveVisitMsgId(vsResp.data.id);
+
+    // 5) visitStatusMap 즉시 동기화 — 새 row 옵티미스틱 추가 + 전체 reload.
+    //   마운트 시 한 번만 로드되던 map 이 새 INSERT 를 반영 못 해서 카드의 [방문 완료] 버튼이
+    //   새로고침 전엔 안 뜨던 문제 보강. 옵티미스틱 추가는 즉시 표시 보장, reload 는
+    //   cancel-previous UPDATE(L756-770) 결과까지 진실 동기화.
+    const newVisitId = vsResp.data.id; // closure 안 narrowing 보존
+    setVisitStatusMap((prev) => ({
+      ...prev,
+      [newVisitId]: { status: "scheduled", visited_date: null },
+    }));
+    void loadVisitStatuses();
+  };
+
+  /** 약사 측 [방문 완료] 확정 핸들러 — 카드 인사 편집 영역의 [보내고 완료] / [인사 없이 완료] 양쪽에서 호출.
+   *  thanksMessage:
+   *    - 문자열(trim 후 비어있지 않음) → 약사 명의 text INSERT 후 완료 처리
+   *    - null 또는 trim 결과 빈 문자열 → 인사 없이 완료 처리만
+   *  순서: (인사 있으면) text INSERT → visit_schedules UPDATE → [VISIT_CONFIRMED] system INSERT → 옵티미스틱 + reload → 펼침 닫기.
+   *  인사 INSERT 실패는 완료 처리를 막지 않음(콘솔 경고만).
+   *  mock 모드(비-UUID 채팅)는 미지원. */
+  const handleConfirmVisit = async (visitId: string, thanksMessage: string | null) => {
+    if (!isDbConsultation || !user) return;
+    if (completedVisitIds.has(visitId)) return; // 중복 클릭 방어
+    // 로컬 오늘 YYYY-MM-DD — toISOString 은 UTC 어긋남 위험, 컴포넌트 직접 조합.
+    const d = new Date();
+    const todayIso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+    // 1) 감사 인사 INSERT — 비어있지 않은 문자열일 때만. await 으로 보내고 에러는 콘솔만(완료 처리 계속).
+    const trimmedThanks = thanksMessage?.trim() ?? "";
+    if (trimmedThanks) {
+      const thanksPayload: MessageInsert = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content: trimmedThanks,
+        message_type: "text",
+        round_id: activeRoundId,
+      };
+      const { error: thanksErr } = await (supabase
+        .from("messages") as unknown as {
+          insert: (p: MessageInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(thanksPayload);
+      if (thanksErr) {
+        console.error("[chat] visit thanks message insert failed (non-fatal):", thanksErr);
+      }
+    }
+
+    // 2) visit_schedules UPDATE — 실패 시 완료 처리 중단 + alert.
+    const upResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        update: (p: { status: "completed"; visited_date: string }) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update({ status: "completed", visited_date: todayIso })
+      .eq("id", visitId);
+    if (upResp.error) {
+      console.error("[chat] visit confirm UPDATE failed:", upResp.error);
+      alert("방문 완료 처리에 실패했어요. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+
+    // 3) [VISIT_CONFIRMED] 시스템 메시지 — Realtime 으로 양쪽 채팅에 안내 노출.
+    type SystemMsgPayload = {
+      consultation_id: string;
+      sender_id: string;
+      content: string;
+      message_type: "system";
+      round_id: string | null;
+      is_read: boolean;
+      metadata: { visit_schedule_id: string };
+    };
+    const msgPayload: SystemMsgPayload = {
+      consultation_id: chatId,
+      sender_id: user.id,
+      content: "[VISIT_CONFIRMED]",
+      message_type: "system",
+      round_id: activeRoundId,
+      is_read: true,
+      metadata: { visit_schedule_id: visitId },
+    };
+    void (supabase
+      .from("messages") as unknown as {
+        insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+      })
+      .insert(msgPayload)
+      .then(({ error }) => {
+        if (error) {
+          console.error("[chat] visit confirm system message insert failed (non-fatal):", error);
+        }
+      });
+
+    // 4) 옵티미스틱 + reload — realtime echo 대기 없이 즉시 카드를 "방문 완료됨" 으로 전환.
+    setCompletedVisitIds((prev) => {
+      if (prev.has(visitId)) return prev;
+      const next = new Set(prev);
+      next.add(visitId);
+      return next;
+    });
+    setVisitStatusMap((prev) => ({
+      ...prev,
+      [visitId]: { status: "completed", visited_date: todayIso },
+    }));
+    void loadVisitStatuses();
+
+    // 5) 인사 편집 펼침 영역 닫기 — 카드가 완료 표시로 전환되며 어차피 액션 영역 자체가 사라지지만, 명시 정리.
+    closeThanksEditor(visitId);
   };
 
   const handleReschedule = async () => {
@@ -962,6 +1131,14 @@ function ChatContent() {
     setRescheduleDate("");
     setRescheduleTimeSlot("오전");
     setRescheduleCustomTime("");
+
+    // visitStatusMap 즉시 동기화 — 새 scheduled row 옵티미스틱 + cancel-previous 반영 reload.
+    const newVisitId = vsResp.data.id; // closure 안 narrowing 보존
+    setVisitStatusMap((prev) => ({
+      ...prev,
+      [newVisitId]: { status: "scheduled", visited_date: null },
+    }));
+    void loadVisitStatuses();
   };
 
   const handleDeclineVisit = async () => {
@@ -1028,6 +1205,9 @@ function ChatContent() {
 
     setVisitGuide(null);
     setActiveVisitMsgId(null);
+
+    // visitStatusMap 즉시 동기화 — cancel-previous UPDATE 결과 반영. 취소된 row id 를 핸들러가 모르므로 reload 만.
+    void loadVisitStatuses();
   };
 
   const calcFollowUpDate = (interval: string): string => {
@@ -1241,6 +1421,7 @@ function ChatContent() {
         round_id: row.round_id ?? null,
         message_type: row.message_type,
         created_at: row.created_at,
+        metadata: row.metadata ?? null,
       });
 
       // 상대방이 보낸 미읽음 메시지 일괄 읽음 처리
@@ -1280,7 +1461,7 @@ function ChatContent() {
       // 2) 기존 메시지 로드 (round_id 포함)
       const msgResp = await supabase
         .from("messages")
-        .select("id, consultation_id, sender_id, content, message_type, is_read, created_at, round_id")
+        .select("id, consultation_id, sender_id, content, message_type, is_read, created_at, round_id, metadata")
         .eq("consultation_id", chatId)
         .order("created_at", { ascending: true });
       if (cancelled) return;
@@ -1293,6 +1474,18 @@ function ChatContent() {
       const rows = (msgResp.data ?? []) as unknown as DbMessageRow[];
       setMessages(rows.map(mapRow));
       setDbLoading(false);
+
+      // 2.4) [VISIT_CONFIRMED] 시스템 메시지의 visit_schedule_id 수집 → 카드 상태 초기화.
+      //   재진입 시 약사 측 [방문 확인] 버튼 비활성 / 환자 측 "방문 확인됨" 표시 보장.
+      const confirmedIds = new Set<string>();
+      for (const r of rows) {
+        if (r.content !== "[VISIT_CONFIRMED]") continue;
+        const vsid = r.metadata && typeof (r.metadata as { visit_schedule_id?: unknown }).visit_schedule_id === "string"
+          ? (r.metadata as { visit_schedule_id: string }).visit_schedule_id
+          : null;
+        if (vsid) confirmedIds.add(vsid);
+      }
+      setCompletedVisitIds(confirmedIds);
 
       // 2.5) 진입 시점에 상대방 미읽음 메시지 읽음 처리
       void markCounterpartRead();
@@ -1333,6 +1526,21 @@ function ChatContent() {
                   ? { ...prev, status: "rejected" }
                   : prev,
               );
+            }
+            // [VISIT_CONFIRMED] 가 realtime 으로 도착 = 약사가 방금 방문을 확인한 시점.
+            //   해당 visit_schedule_id 를 completedVisitIds 에 추가 → 카드가 즉시 "방문 확인됨" 상태로 갱신.
+            if (row.content === "[VISIT_CONFIRMED]") {
+              const vsid = row.metadata && typeof (row.metadata as { visit_schedule_id?: unknown }).visit_schedule_id === "string"
+                ? (row.metadata as { visit_schedule_id: string }).visit_schedule_id
+                : null;
+              if (vsid) {
+                setCompletedVisitIds((prev) => {
+                  if (prev.has(vsid)) return prev;
+                  const next = new Set(prev);
+                  next.add(vsid);
+                  return next;
+                });
+              }
             }
             // 상대방이 보낸 메시지면 즉시 읽음 처리 (채팅방 열려있는 동안 배지 누적 방지)
             if (user && row.sender_id !== user.id) {
@@ -2002,8 +2210,10 @@ function ChatContent() {
   }, [searchQuery]);
 
   // DB 모드에서는 세션(차수) 분리가 없으므로 sessionId 필터를 건너뜀
+  //   [VISIT_CONFIRMED] 는 환자 뷰에서 숨김(렌더 .filter 와 동일 규칙) — 검색·하이라이트 인덱스에서도 제외.
   const visibleMessages = messages.filter((m) =>
     !(m.pharmacistOnly && role !== "pharmacist") &&
+    !(m.content === "[VISIT_CONFIRMED]" && role !== "pharmacist") &&
     (isDbConsultation || m.sessionId === activeSession),
   );
   const searchResults = debouncedQuery
@@ -2617,6 +2827,9 @@ function ChatContent() {
         {/* (수락 대기 안내 박스는 입력 영역 바로 위로 이동 — 메시지 누적 시 묻히지 않도록) */}
         {messages.filter((m) => {
           if (m.pharmacistOnly && role !== "pharmacist") return false;
+          // [VISIT_CONFIRMED] 시스템 메시지는 환자 뷰에서 숨김 — 카드의 "방문 완료" 표시와 중복.
+          //   약사 뷰는 처리 확인용으로 유지. (pharmacistOnly 패턴 재사용)
+          if (m.content === "[VISIT_CONFIRMED]" && role !== "pharmacist") return false;
           // mock 모드: 기존 sessionId 필터 보존
           if (!isDbConsultation) return m.sessionId === activeSession;
           // DB 모드: 회차 무관 통합 뷰 — 모든 메시지 시간순 노출
@@ -2873,7 +3086,7 @@ function ChatContent() {
                       <path d="M7 11V7a5 5 0 0110 0v4" />
                     </svg>
                   )}
-                  {formatSystemMessageContent(msg.content, role)}
+                  {formatSystemMessageContent(msg.content, role, dbCounterpartLicenseName || dbCounterpartName)}
                 </div>
                 {role === "pharmacist" && msg.pharmacistOnly && (
                   <span style={{ fontSize: 11, color: "#9AA8A0" }}>내부 메모 (환자에게 안 보임)</span>
@@ -2898,7 +3111,21 @@ function ChatContent() {
               const head = timeLine ? `${headParts[0]} ${timeLine}` : headParts[0];
               return [head, ...rawLines.slice(2)];
             })();
-            const isCancelled = cancelledVisitIds.has(msg.id);
+            // 카드 메시지의 metadata.visit_schedule_id — DB 모드에서 [방문 확인] 핸들러가 visit_schedules row 식별에 사용.
+            //   mock 모드 카드는 metadata 없으므로 visitId=null → 약사 [방문 확인] 버튼 비노출.
+            const visitId: string | null = msg.metadata && typeof (msg.metadata as { visit_schedule_id?: unknown }).visit_schedule_id === "string"
+              ? (msg.metadata as { visit_schedule_id: string }).visit_schedule_id
+              : null;
+            // visitStatusMap 에서 가져온 DB 실 상태. 채팅 message 추적(cancelledVisitIds/completedVisitIds) 과 OR 결합.
+            //   재진입 시 메시지 기반 set 은 비어있으므로, DB 실 상태가 카드 분기의 최종 진실 소스.
+            const actualStatus = visitId ? visitStatusMap[visitId]?.status ?? null : null;
+            // DB 모드(visitId 있음) + 아직 visitStatusMap 미로드 → 액션 영역 잠깐 비움(깜빡임 방지).
+            const visitInfoLoaded = !visitId || (visitId in visitStatusMap);
+            const isCancelled = cancelledVisitIds.has(msg.id) || actualStatus === "cancelled";
+            const isCompleted = !isCancelled && (
+              actualStatus === "completed"
+              || (visitId ? completedVisitIds.has(visitId) : false)
+            );
             const isActive = msg.id === activeVisitMsgId && !isCancelled;
             return (
               <div key={msg.id} style={{
@@ -2931,6 +3158,13 @@ function ChatContent() {
                             display: "inline-block",
                           }}>취소됨</span>
                         )}
+                        {!isCancelled && isCompleted && (
+                          <span style={{
+                            marginLeft: 8, fontSize: 11, fontWeight: 600,
+                            color: "#4A6355", textDecoration: "none",
+                            display: "inline-block",
+                          }}>방문 완료</span>
+                        )}
                       </div>
                       {displayLines.map((line, li) => (
                         <div key={li} style={{
@@ -2943,7 +3177,22 @@ function ChatContent() {
                       ))}
                     </div>
                   </div>
-                  {!isCancelled && isActive && role === "patient" && visitGuide && (
+                  {/* 완료된 방문 — 양쪽 다 액션 자리에 "방문 확인됨" (체크 아이콘 + 세이지, 비활성 텍스트). */}
+                  {!isCancelled && isCompleted && (
+                    <div style={{
+                      padding: "10px", fontSize: 13, fontWeight: 600,
+                      color: "#7FA48E", textAlign: "center",
+                      borderTop: "1px solid #B3CCBE",
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                    }}>
+                      <span aria-hidden>✓</span>
+                      <span>방문 완료됨</span>
+                    </div>
+                  )}
+                  {/* 환자 액션 — DB 모드면 actualStatus==='scheduled' 일 때만 (cancelled/completed 는 위 가드로 차단).
+                     mock 모드(visitId null)는 visitInfoLoaded=true·status 검사 skip 으로 기존 동작 유지. */}
+                  {!isCancelled && !isCompleted && isActive && role === "patient" && visitGuide
+                    && visitInfoLoaded && (!visitId || actualStatus === "scheduled") && (
                     <>
                       <div style={{ display: "flex", borderTop: "1px solid #B3CCBE" }}>
                         <button type="button" onClick={() => setShowReschedule(true)} style={{
@@ -2964,6 +3213,65 @@ function ChatContent() {
                         방문이 어려우시면 미리 일정 변경 또는 취소를 부탁드려요.
                       </div>
                     </>
+                  )}
+                  {/* 약사 [방문 완료] — DB 모드(visitId 있음) + visitStatusMap 로드 완료 + actualStatus==='scheduled' 일 때만.
+                     상담이 종료돼도 status='scheduled' 면 버튼 노출(종료 상담의 예정 방문도 확인 허용 = isActive 무관).
+                     2단계 UX: (1) [방문 완료] → (2) textarea 펼침 + [보내고 완료] / [인사 없이 완료] / [취소]. */}
+                  {!isCancelled && !isCompleted && role === "pharmacist" && visitId
+                    && visitInfoLoaded && actualStatus === "scheduled" && (
+                    <div style={{ borderTop: "1px solid #B3CCBE" }}>
+                      {visitId in thanksDraft ? (
+                        <>
+                          <div style={{ padding: "10px 14px" }}>
+                            <div style={{
+                              fontSize: 13, fontWeight: 600, color: "#3D4A42",
+                              marginBottom: 6,
+                            }}>환자에게 보낼 인사 (수정 가능)</div>
+                            <textarea
+                              value={thanksDraft[visitId]}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setThanksDraft((prev) => ({ ...prev, [visitId]: v }));
+                              }}
+                              rows={3}
+                              placeholder="환자에게 보낼 인사를 적어주세요"
+                              style={{
+                                width: "100%", boxSizing: "border-box",
+                                padding: "10px 12px", borderRadius: 8,
+                                border: "1px solid rgba(94, 125, 108, 0.3)",
+                                fontSize: 14, lineHeight: 1.5, color: "#2C3630",
+                                background: "#fff",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                                resize: "vertical", minHeight: 72,
+                              }}
+                            />
+                          </div>
+                          <div style={{ display: "flex", borderTop: "1px solid #B3CCBE" }}>
+                            <button type="button" onClick={() => handleConfirmVisit(visitId, thanksDraft[visitId] ?? "")} style={{
+                              flex: 1, padding: "10px", fontSize: 13, fontWeight: 700,
+                              color: "#4A6355", background: "transparent", border: "none",
+                              borderRight: "1px solid #B3CCBE", cursor: "pointer",
+                            }}>보내고 완료</button>
+                            <button type="button" onClick={() => handleConfirmVisit(visitId, null)} style={{
+                              flex: 1, padding: "10px", fontSize: 13, fontWeight: 600,
+                              color: "#4A6355", background: "transparent", border: "none",
+                              borderRight: "1px solid #B3CCBE", cursor: "pointer",
+                            }}>인사 없이 완료</button>
+                            <button type="button" onClick={() => closeThanksEditor(visitId)} style={{
+                              flex: 1, padding: "10px", fontSize: 13, fontWeight: 600,
+                              color: "#C06B45", background: "transparent", border: "none",
+                              cursor: "pointer",
+                            }}>취소</button>
+                          </div>
+                        </>
+                      ) : (
+                        <button type="button" onClick={() => openThanksEditor(visitId)} style={{
+                          width: "100%", padding: "10px", fontSize: 13, fontWeight: 600,
+                          color: "#4A6355", background: "transparent", border: "none",
+                          cursor: "pointer",
+                        }}>방문 완료</button>
+                      )}
+                    </div>
                   )}
                 </div>
                 <span style={{ fontSize: 11, color: "#9AA8A0" }}>{msg.time}</span>
