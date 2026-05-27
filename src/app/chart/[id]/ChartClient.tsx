@@ -303,6 +303,8 @@ const MOCK_CONSULTATIONS: Consultation[] = [
   },
 ];
 
+// 디자인 참조용 mock — 실데이터 전환(2026-05-27) 후 useState 초기값에서 분리됨. 보존만, 사용처 없음.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const MOCK_VISITS: VisitRecord[] = [
   {
     id: "visit-2",
@@ -916,8 +918,8 @@ function ChartContent() {
     });
   };
 
-  /* ── 방문 기록 ── */
-  const [visits, setVisits] = useState<VisitRecord[]>(MOCK_VISITS);
+  /* ── 방문 기록 ── 실데이터 전용 (MOCK_VISITS 폴백 제거). visit_records 0건이면 빈 카드 안내가 자연 노출. */
+  const [visits, setVisits] = useState<VisitRecord[]>([]);
   const sortedVisits = [...visits].sort((a, b) => (a.date > b.date ? -1 : 1));
   const [expandedVisits, setExpandedVisits] = useState<Set<string>>(
     new Set(sortedVisits.slice(0, 1).map((v) => v.id))
@@ -1164,7 +1166,7 @@ function ChartContent() {
         pharmacist_photos: string[] | null;
       };
       const rows = ((data ?? []) as unknown) as VrRow[];
-      if (rows.length === 0) return; // mock 폴백 유지 (개발 편의)
+      // 0건이면 setVisits([]) 로 빈 배열 명시 — mock 폴백 제거(2026-05-27).
       const mapped: VisitRecord[] = rows.map((r) => ({
         id: r.id,
         date: r.visit_date,
@@ -1286,9 +1288,67 @@ function ChartContent() {
       return next;
     });
   };
+  /** 방문 기록 항목 수정 — 로컬 state 즉시 갱신(낙관적) + visit_records UPDATE (UUID id 한정).
+   *  VisitRecord 필드 → visit_records 컬럼 매핑:
+   *    complaint→patient_complaint, improvement→patient_improvement,
+   *    pharmacistGuide→pharmacist_guide, pharmacistNote→pharmacist_opinion,
+   *    durationDays→dosage_days, products→purchased_supplements.
+   *  사진(photos)은 persistVisitPhotos 가 별도로 처리. UPDATE 실패는 console.error 만(alert 금지). */
   const updateVisit = (id: string, patch: Partial<VisitRecord>) => {
     setVisits((prev) => prev.map((v) => (v.id === id ? { ...v, ...patch } : v)));
+    if (!isUuid(id)) return; // mock id 면 로컬만
+    type VrUpdate = {
+      patient_complaint?: string | null;
+      patient_improvement?: string | null;
+      pharmacist_guide?: string | null;
+      pharmacist_opinion?: string | null;
+      dosage_days?: number | null;
+      purchased_supplements?: SupplementItem[];
+    };
+    const dbPatch: VrUpdate = {};
+    if ("complaint" in patch) dbPatch.patient_complaint = patch.complaint ?? null;
+    if ("improvement" in patch) dbPatch.patient_improvement = patch.improvement ?? null;
+    if ("pharmacistGuide" in patch) dbPatch.pharmacist_guide = patch.pharmacistGuide ?? null;
+    if ("pharmacistNote" in patch) dbPatch.pharmacist_opinion = patch.pharmacistNote ?? null;
+    if ("durationDays" in patch) dbPatch.dosage_days = patch.durationDays ?? null;
+    if ("products" in patch) dbPatch.purchased_supplements = patch.products ?? [];
+    if (Object.keys(dbPatch).length === 0) return; // 매핑할 컬럼 없으면 skip(예: photos 단독)
+    void (supabase
+      .from("visit_records") as unknown as {
+        update: (p: VrUpdate) => { eq: (col: string, val: string) => Promise<{ error: { message: string } | null }> };
+      })
+      .update(dbPatch)
+      .eq("id", id)
+      .then(({ error }) => {
+        if (error) console.error("[chart] visit_records update failed (non-fatal):", error);
+      });
   };
+  /* 구매 영양제 추가 인풋 — visitId 단위로 한 카드만 추가 모드 활성화. */
+  const [addingProductVisitId, setAddingProductVisitId] = useState<string | null>(null);
+  const [newProductName, setNewProductName] = useState("");
+  const [newProductDosage, setNewProductDosage] = useState("");
+  const startAddProduct = (visitId: string) => {
+    setAddingProductVisitId(visitId);
+    setNewProductName("");
+    setNewProductDosage("");
+  };
+  const cancelAddProduct = () => {
+    setAddingProductVisitId(null);
+    setNewProductName("");
+    setNewProductDosage("");
+  };
+  const saveAddProduct = (v: VisitRecord) => {
+    const name = newProductName.trim();
+    if (!name) return;
+    const newItem: SupplementItem = { name, dosage: newProductDosage.trim(), timing: "" };
+    updateVisit(v.id, { products: [...v.products, newItem] });
+    cancelAddProduct();
+  };
+  const removeProduct = (v: VisitRecord, index: number) => {
+    const next = v.products.filter((_, i) => i !== index);
+    updateVisit(v.id, { products: next });
+  };
+
   const [editingDosageVisitId, setEditingDosageVisitId] = useState<string | null>(null);
   const [editDosageDaysValue, setEditDosageDaysValue] = useState("");
   const startEditDosageDays = (id: string, cur?: number) => {
@@ -1760,7 +1820,7 @@ function ChartContent() {
 
       <div className={`chart-page${showGuidePanel ? " chart-with-panel" : ""}${showChatPanel ? " chart-with-chat-panel" : ""}`}>
         <nav>
-          <button className="nav-back" onClick={() => router.push("/dashboard")} aria-label="뒤로가기">←</button>
+          <button className="nav-back" onClick={() => { if (typeof window !== "undefined" && window.history.length > 1) router.back(); else router.push("/dashboard"); }} aria-label="뒤로가기">←</button>
           <div style={{ flex: 1, textAlign: "center", fontFamily: "'Gothic A1', sans-serif", fontSize: 16, fontWeight: 700, color: COLOR.textDark, marginRight: 36 }}>
             환자 차트
           </div>
@@ -2203,7 +2263,7 @@ function ChartContent() {
 
                       {isOpen && (
                         <div style={{ padding: "0 16px 16px", borderTop: "1px solid rgba(94,125,108,0.1)" }}>
-                          {/* 구매 영양제 */}
+                          {/* 구매 영양제 — 표시 + [+ 추가] + 각 항목 [×] 삭제. 저장은 updateVisit({products}) 경로로 visit_records.purchased_supplements 영속화. */}
                           <div style={{ paddingTop: 14 }}>
                             <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 8 }}>
                               구매 영양제
@@ -2213,23 +2273,107 @@ function ChartContent() {
                                 <div
                                   key={i}
                                   style={{
-                                    padding: 16,
-                                    borderRadius: 12,
+                                    padding: 16, borderRadius: 12,
                                     background: "#EDF4F0",
-                                    marginBottom: i < v.products.length - 1 ? 8 : 0,
+                                    marginBottom: 8,
+                                    display: "flex", alignItems: "flex-start", gap: 10,
                                   }}
                                 >
-                                  <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>
-                                    {p.name}
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>
+                                      {p.name}
+                                    </div>
+                                    {(p.dosage || p.timing) && (
+                                      <div style={{ fontSize: 14, marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                                        {p.dosage && <span style={{ fontWeight: 600, color: COLOR.terra }}>{p.dosage}</span>}
+                                        {p.timing && <span style={{ color: "#3D4A42" }}>{p.timing}</span>}
+                                      </div>
+                                    )}
                                   </div>
-                                  <div style={{ fontSize: 14, marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                                    <span style={{ fontWeight: 600, color: COLOR.terra }}>{p.dosage}</span>
-                                    <span style={{ color: "#3D4A42" }}>{p.timing}</span>
-                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => removeProduct(v, i)}
+                                    aria-label="영양제 삭제"
+                                    style={{
+                                      background: "transparent", border: "none",
+                                      color: "#9AA8A0", fontSize: 18, fontWeight: 600,
+                                      cursor: "pointer", padding: 4, lineHeight: 1,
+                                      flexShrink: 0,
+                                    }}
+                                  >×</button>
                                 </div>
                               ))
                             ) : (
-                              <div style={{ fontSize: 14, color: "#3D4A42" }}>등록된 영양제 없음</div>
+                              <div style={{ fontSize: 14, color: "#3D4A42", marginBottom: 8 }}>등록된 영양제 없음</div>
+                            )}
+                            {addingProductVisitId === v.id ? (
+                              <div style={{
+                                marginTop: v.products.length > 0 ? 0 : 0,
+                                padding: 14, borderRadius: 12, background: "#F8F9F7",
+                                border: `1px dashed ${COLOR.sageLight}`,
+                                display: "flex", flexDirection: "column", gap: 8,
+                              }}>
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  value={newProductName}
+                                  onChange={(e) => setNewProductName(e.target.value)}
+                                  placeholder="영양제 이름 (필수)"
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") saveAddProduct(v);
+                                    if (e.key === "Escape") cancelAddProduct();
+                                  }}
+                                  style={{
+                                    padding: "10px 12px", borderRadius: 8,
+                                    border: `1.5px solid ${COLOR.sageLight}`,
+                                    fontSize: 14, color: "#2C3630", outline: "none",
+                                    fontFamily: "'Noto Sans KR', sans-serif",
+                                  }}
+                                />
+                                <input
+                                  type="text"
+                                  value={newProductDosage}
+                                  onChange={(e) => setNewProductDosage(e.target.value)}
+                                  placeholder="용량·메모 (선택)"
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") saveAddProduct(v);
+                                    if (e.key === "Escape") cancelAddProduct();
+                                  }}
+                                  style={{
+                                    padding: "10px 12px", borderRadius: 8,
+                                    border: `1.5px solid ${COLOR.sageLight}`,
+                                    fontSize: 14, color: "#2C3630", outline: "none",
+                                    fontFamily: "'Noto Sans KR', sans-serif",
+                                  }}
+                                />
+                                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                                  <button type="button" onClick={cancelAddProduct} style={{
+                                    padding: "8px 16px", borderRadius: 6,
+                                    fontSize: 14, fontWeight: 600,
+                                    background: "transparent", color: "#3D4A42",
+                                    border: `1px solid ${COLOR.border}`, cursor: "pointer",
+                                    fontFamily: "'Noto Sans KR', sans-serif",
+                                  }}>취소</button>
+                                  <button type="button" onClick={() => saveAddProduct(v)} disabled={!newProductName.trim()} style={{
+                                    padding: "8px 16px", borderRadius: 6,
+                                    fontSize: 14, fontWeight: 700,
+                                    background: COLOR.sageDeep, color: "#fff",
+                                    border: "none",
+                                    cursor: newProductName.trim() ? "pointer" : "not-allowed",
+                                    opacity: newProductName.trim() ? 1 : 0.5,
+                                    fontFamily: "'Noto Sans KR', sans-serif",
+                                  }}>저장</button>
+                                </div>
+                              </div>
+                            ) : (
+                              <button type="button" onClick={() => startAddProduct(v.id)} style={{
+                                width: "100%", padding: "10px",
+                                borderRadius: 10, background: "#fff",
+                                border: `1px dashed ${COLOR.sageLight}`,
+                                color: COLOR.sageDeep, fontSize: 14, fontWeight: 600,
+                                cursor: "pointer", minHeight: 44,
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}>+ 영양제 추가</button>
                             )}
                           </div>
 

@@ -4,127 +4,24 @@ import React, { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
-
-
-/* ── 타입 ── */
-type PatientStatus = "requested" | "managing" | "inactive";
-
-type SymptomCategory = "digestion" | "fatigue" | "sleep" | "skin" | "immune";
-
-interface PatientConsult {
-  id: string;
-  patientName: string;
-  patientGender: string;
-  birthYear: number;
-  patientStatus: PatientStatus;
-  consultType: "local" | "remote";
-  symptoms: { label: string; category: SymptomCategory }[];
-  aiSummary: string;
-  freeText: string;
-  unreadCount: number;
-  lastMessageAt: string; // relative
-  createdAt: string;
-  prevConsultCount: number;
-  healthScores?: { label: string; before: number; after: number }[];
-  memo?: string;
-  visitDate?: string;
-  nextVisitDate?: string;
-  purchasedMeds?: string[];
-  registrationSource: "app" | "offline";
-  hasAppAccount: boolean;
-  supplementStatus: "taking" | "not_taking" | "completed";
-  consultationCount: number;
-  hasPurchase: boolean;
-  hasVisit: boolean;
-  isRejected?: boolean;
-  rejectedReason?: string;
-  rejectedAt?: string;
-  /** 환자 마지막 메시지 시각 (ISO). 약사 답장 긴급도 계산용. */
-  lastPatientMessageAt?: string;
-  /** 약사가 환자 마지막 메시지를 읽었는지 여부. false면 미답변. */
-  isReadByPharmacist?: boolean;
-  /** AI 문답 답변 (라벨-값). requested 환자 펼침 시 전문 표시. */
-  questionnaire?: Record<string, string>;
-  /** 이전 거절 이력 (재요청 환자 경고용) */
-  previousRejections?: { date: string; reason: string; symptoms: string[] }[];
-}
-
-const CURRENT_YEAR = 2026;
-const TODAY_STR = "2026.04.18";
-/** 24시간 이상 미답변 여부. 환자 마지막 메시지 시간과 약사 읽음 상태 기준. */
-const URGENT_THRESHOLD_HOURS = 24;
-const NOW_ISO = "2026-04-21T10:00:00+09:00"; // Mock "현재" 시각
-
-function hoursSince(iso: string, nowIso = NOW_ISO): number {
-  const then = new Date(iso).getTime();
-  const now = new Date(nowIso).getTime();
-  if (Number.isNaN(then) || Number.isNaN(now)) return 0;
-  return (now - then) / 3_600_000;
-}
-
-function needsUrgentReply(c: PatientConsult): boolean {
-  if (!c.lastPatientMessageAt) return false;
-  if (c.isReadByPharmacist) return false;
-  if (c.isRejected) return false;
-  // 🔥 답장 필요는 이미 수락된(상담 중) 환자에게만 적용.
-  // 상담 요청 대기(requested)나 비활성(inactive)은 대상 아님.
-  if (c.patientStatus !== "managing") return false;
-  return hoursSince(c.lastPatientMessageAt) >= URGENT_THRESHOLD_HOURS;
-}
-
-/** 상담 요청(requested) 대기 24시간 경과 여부 — 수락 기다리는 상태 */
-function needsAcceptUrgent(c: PatientConsult): boolean {
-  if (c.patientStatus !== "requested") return false;
-  if (c.isRejected) return false;
-  // lastPatientMessageAt 있으면 우선, 없으면 createdAt(YYYY.MM.DD)을 timestamp로 변환
-  const iso = c.lastPatientMessageAt ?? `${c.createdAt.replace(/\./g, "-")}T00:00:00+09:00`;
-  return hoursSince(iso) >= URGENT_THRESHOLD_HOURS;
-}
-
-/** 마지막 환자 메시지로부터 경과 시간(시간 단위). 뱃지 색상 단계 계산용. */
-function hoursOfLastPatientMsg(c: PatientConsult): number {
-  if (c.lastPatientMessageAt) return Math.max(0, hoursSince(c.lastPatientMessageAt));
-  const label = c.lastMessageAt ?? "";
-  const hm = label.match(/(\d+)\s*시간/);
-  if (hm) return parseInt(hm[1], 10);
-  if (label === "어제") return 24;
-  const dm = label.match(/(\d+)\s*일/);
-  if (dm) return parseInt(dm[1], 10) * 24;
-  const wm = label.match(/(\d+)\s*주/);
-  if (wm) return parseInt(wm[1], 10) * 24 * 7;
-  return 0;
-}
-
-/** 경과 시간별 뱃지 배경·글씨 색상. 24h+는 pulse 애니메이션 적용. */
-function getUnreadBadgeStyle(hours: number): React.CSSProperties {
-  if (hours < 6) return { background: "#FFD4A8", color: "#8B4513" };
-  if (hours < 12) return { background: "#FF9A4D", color: "#fff" };
-  if (hours < 24) return { background: "#F06820", color: "#fff" };
-  return { background: "#E02020", color: "#fff", animation: "dashUnreadPulse 1s ease-in-out infinite" };
-}
-
-/**
- * 마지막 대화 시각을 정렬용 timestamp(ms)로 변환.
- * lastPatientMessageAt(ISO) 우선, 없으면 lastMessageAt 상대 표현 파싱.
- * 큰 값 = 최신.
- */
-function sortableLastMsgTs(c: PatientConsult): number {
-  const now = new Date(NOW_ISO).getTime();
-  if (c.lastPatientMessageAt) {
-    const t = new Date(c.lastPatientMessageAt).getTime();
-    if (!Number.isNaN(t)) return t;
-  }
-  const label = c.lastMessageAt ?? "";
-  let hoursAgo = 9999;
-  const hm = label.match(/(\d+)\s*시간/);
-  const dm = label.match(/(\d+)\s*일/);
-  const wm = label.match(/(\d+)\s*주/);
-  if (hm) hoursAgo = parseInt(hm[1], 10);
-  else if (label === "어제") hoursAgo = 24;
-  else if (dm) hoursAgo = parseInt(dm[1], 10) * 24;
-  else if (wm) hoursAgo = parseInt(wm[1], 10) * 24 * 7;
-  return now - hoursAgo * 3_600_000;
-}
+import {
+  type PatientConsult,
+  PATIENT_STATUS_CONFIG,
+  SYMPTOM_TAG_CLASS,
+  fetchAllConsultations,
+  getRelationTag,
+  getUnreadBadgeStyle,
+  hoursOfLastPatientMsg,
+  needsUrgentReply,
+  needsAcceptUrgent,
+} from "@/lib/pharmacistConsults";
+import {
+  type FilterKey,
+  type SortKey,
+  applyFilters,
+  sortConsults,
+} from "@/lib/dashboardFilters";
+import { usePharmacistGuard } from "@/lib/usePharmacistGuard";
 
 interface ChatMsg {
   id: string;
@@ -133,75 +30,19 @@ interface ChatMsg {
   time: string;
 }
 
-/* ── 상수 ── */
-const PATIENT_STATUS_CONFIG: Record<PatientStatus, { label: string; emoji: string; bg: string; color: string }> = {
-  requested: { label: "상담 요청",    emoji: "🔔", bg: "#FFF3D6", color: "#B06D00" },
-  managing:  { label: "사후 관리 중", emoji: "💊", bg: "var(--sage-pale, #EDF4F0)", color: "var(--sage-deep, #4A6355)" },
-  inactive:  { label: "",             emoji: "",   bg: "",         color: "" },
-};
-
-const SYMPTOM_TAG_CLASS: Record<SymptomCategory, string> = {
-  digestion: "dash-tag-digestion",
-  fatigue:   "dash-tag-fatigue",
-  sleep:     "dash-tag-sleep",
-  skin:      "dash-tag-skin",
-  immune:    "dash-tag-immune",
-};
-
-/* ── 관계 태그 ── */
-type RelationTag = "regular" | "over" | "none";
-
-function getRelationTag(c: PatientConsult): RelationTag {
-  if (c.hasPurchase && c.hasVisit) return "regular";          // 💚 단골
-  if (!c.hasPurchase && !c.hasVisit && c.consultationCount >= 5) return "over"; // ⏳ 상담만 5회+
-  return "none"; // 일반 (태그 없음)
-}
-
-function getRelationSortPriority(tag: RelationTag): number {
-  if (tag === "regular") return 0;  // 단골 최상위
-  if (tag === "none") return 1;     // 일반 중간
-  return 2;                         // over(상담만5회+) 최하위
-}
-
-type FilterKey = "all" | "requested" | "managing" | "visit_scheduled" | "unread" | "rejected";
-type SortKey = "recent" | "unread";
-type DateRangeKey = "all" | "1w" | "1m" | "3m" | "custom";
-
 /* ── 상태 뱃지 (아이콘만 + 툴팁) ── */
+/** 카드 헤더의 상태 알약(이모지 + 호버 시 툴팁).
+ *  툴팁은 브라우저 기본 title 하나만 — 커스텀 말풍선이 title 과 겹쳐 보이던 문제 회피. */
 function StatusBadge({
   emoji, tooltip, bg, borderColor,
 }: {
   emoji: string; tooltip: string; bg: string; borderColor?: string;
 }) {
-  const [show, setShow] = useState(false);
-  const [pos, setPos] = useState({ top: 0, left: 0 });
-  const ref = useRef<HTMLSpanElement>(null);
-
-  const updatePos = () => {
-    if (!ref.current) return;
-    const rect = ref.current.getBoundingClientRect();
-    setPos({ top: rect.bottom + 6, left: rect.left + rect.width / 2 });
-  };
-
   return (
     <span
-      ref={ref}
       title={tooltip}
-      onMouseEnter={() => { updatePos(); setShow(true); }}
-      onMouseLeave={() => setShow(false)}
-      onClick={(e) => {
-        e.stopPropagation();
-        updatePos();
-        setShow((s) => {
-          const next = !s;
-          if (next) {
-            setTimeout(() => setShow(false), 1800);
-          }
-          return next;
-        });
-      }}
       style={{
-        position: "relative", display: "inline-flex",
+        display: "inline-flex",
         alignItems: "center", justifyContent: "center",
         width: 28, height: 28, borderRadius: 14,
         background: bg, border: borderColor ? `1px solid ${borderColor}` : "none",
@@ -209,29 +50,6 @@ function StatusBadge({
       }}
     >
       {emoji}
-      {show && (
-        <span
-          role="tooltip"
-          style={{
-            position: "fixed", top: pos.top, left: pos.left,
-            transform: "translateX(-50%)",
-            background: "#333", color: "#fff",
-            padding: "6px 10px", borderRadius: 6,
-            fontSize: 12, fontWeight: 500, lineHeight: 1.3,
-            whiteSpace: "nowrap", zIndex: 1000,
-            pointerEvents: "none",
-          }}
-        >
-          <span
-            style={{
-              position: "absolute", top: -4, left: "50%",
-              transform: "translateX(-50%) rotate(45deg)",
-              width: 8, height: 8, background: "#333",
-            }}
-          />
-          {tooltip}
-        </span>
-      )}
     </span>
   );
 }
@@ -344,6 +162,8 @@ function getEffectiveFuTime(fuTime: string, fuCustomTime: string): string {
 }
 
 /* ── 더미 데이터 ── */
+// 디자인 참조용 mock 데이터 — fetchAllConsultations 도입 후 라이브 소스로는 쓰지 않음.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const MOCK_CONSULTS: PatientConsult[] = [
   {
     id: "c-1",
@@ -871,18 +691,6 @@ const MOCK_CONSULTS: PatientConsult[] = [
   },
 ];
 
-/* ── 날짜 유틸 ── */
-function parseDate(str: string): Date {
-  const [y, m, d] = str.split(".").map(Number);
-  return new Date(y, m - 1, d);
-}
-
-function getLatestDate(c: PatientConsult): Date {
-  const created = parseDate(c.createdAt);
-  if (!c.visitDate) return created;
-  const visited = parseDate(c.visitDate);
-  return visited > created ? visited : created;
-}
 
 /* ── 환자 카드 컴포넌트 ── */
 function PatientCard({
@@ -909,7 +717,7 @@ function PatientCard({
   const showStatusBadge = data.patientStatus !== "inactive" && !data.isRejected;
   const relationTag = getRelationTag(data);
   const isOverConsult = relationTag === "over";
-  const age = CURRENT_YEAR - data.birthYear;
+  const age = new Date().getFullYear() - data.birthYear;
   const isRequested = data.patientStatus === "requested" && !data.isRejected;
   const isUrgent = needsUrgentReply(data);         // managing + 24h (답장 필요)
   const isAcceptUrgent = needsAcceptUrgent(data);  // requested + 24h (수락 필요)
@@ -919,14 +727,25 @@ function PatientCard({
 
   const badgeIsApp = data.hasAppAccount;
 
+  // 펼침 직후 카드가 뷰포트에 들어오게 스크롤(접을 땐 이동 안 함).
+  //   rAF 로 한 프레임 미뤄야 펼친 본문이 DOM 에 들어간 뒤 정확한 위치로 스크롤.
+  const articleRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!expanded) return;
+    const id = requestAnimationFrame(() => {
+      articleRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [expanded]);
+
   return (
-    <article style={{
+    <article ref={articleRef} style={{
       padding: 16, background: isOverConsult ? "#FAFAFA" : "#fff",
       border: "1px solid var(--border, rgba(94,125,108,0.14))",
       borderRadius: 12,
     }}>
-      {/* 카드 클릭 영역 */}
-      <div onClick={onToggle} style={{ cursor: "pointer" }}>
+      {/* 카드 헤더 — 클릭 토글 제거(L1348 [상세보기 ▼] 버튼만 토글). 내부 액션 버튼은 stopPropagation 그대로. */}
+      <div>
         {/* ── 상단 줄: 좌(이름+정보+상태) / 우(마지막 대화) ── */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           {/* 왼쪽 */}
@@ -958,6 +777,32 @@ function PatientCard({
                 bg="#FFE5E5"
               />
             )}
+            {data.isNoShow && !data.isRejected && (() => {
+              // 미방문 라벨 — ⚠️ + "미방문 M/D" 글자(모바일 title 안 뜨는 환경 대비, 항상 가시).
+              //   noShowDate 없으면 "미방문" 만. 톤은 기존 주황(⚠️ 배경 #FFF0E6)에 글자색 #E05A1A.
+              const mdShort = (() => {
+                if (!data.noShowDate) return "";
+                const m = data.noShowDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+                if (!m) return "";
+                return `${Number(m[2])}/${Number(m[3])}`;
+              })();
+              const label = mdShort ? `미방문 ${mdShort}` : "미방문";
+              return (
+                <span
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 4,
+                    height: 28, padding: "0 10px", borderRadius: 14,
+                    background: "#FFF0E6", color: "#E05A1A",
+                    fontSize: 13, fontWeight: 600, lineHeight: 1,
+                    whiteSpace: "nowrap", flexShrink: 0, cursor: "default",
+                    boxSizing: "border-box",
+                  }}
+                >
+                  <span aria-hidden style={{ fontSize: 14 }}>⚠️</span>
+                  <span>{label}</span>
+                </span>
+              );
+            })()}
           </div>
           {/* 오른쪽 */}
           <div style={{ display: "inline-flex", alignItems: "center", gap: 8, flexShrink: 0, marginLeft: 12 }}>
@@ -988,25 +833,17 @@ function PatientCard({
         )}
         {/* ── 하단 줄: 좌(복용+태그) / 우(방문일) ── */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          {/* 왼쪽 — 복용 중인 환자에게만 복용 뱃지 표시. 미복용/완료는 숨김 */}
+          {/* 왼쪽 — 복용 중인 환자에게만 복용 뱃지 표시. 증상 태그는 펼침으로 이동(접힌 카드 단순화). */}
           <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap", flex: 1, minWidth: 0, overflow: "hidden" }}>
             {data.supplementStatus === "taking" && (
-              <>
-                <span style={{
-                  display: "inline-block", padding: "4px 10px", borderRadius: 12, fontSize: 13, fontWeight: 500, lineHeight: "18px",
-                  background: "#EAF3DE", color: "#3B6D11",
-                  whiteSpace: "nowrap", flexShrink: 0,
-                }}>
-                  복용 중
-                </span>
-                <span style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", flexShrink: 0 }}>|</span>
-              </>
-            )}
-            {data.symptoms.map((s) => (
-              <span key={s.label} className={`dash-tag ${SYMPTOM_TAG_CLASS[s.category]}`} style={{ fontSize: 14, fontWeight: 500, color: "var(--text-dark, #2C3630)", padding: "4px 10px", whiteSpace: "nowrap", flexShrink: 0 }}>
-                {s.label}
+              <span style={{
+                display: "inline-block", padding: "4px 10px", borderRadius: 12, fontSize: 13, fontWeight: 500, lineHeight: "18px",
+                background: "#EAF3DE", color: "#3B6D11",
+                whiteSpace: "nowrap", flexShrink: 0,
+              }}>
+                복용 중
               </span>
-            ))}
+            )}
           </div>
           {/* 오른쪽 — 거절 / 방문 예정+"방문 전" / 최근 방문+"구매 영양제: 없음" */}
           <div style={{ flexShrink: 0, marginLeft: 12, textAlign: "right" }}>
@@ -1026,16 +863,9 @@ function PatientCard({
                 )}
               </>
             ) : data.visitDate ? (
-              <>
-                <div style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>
-                  최근 방문: {data.visitDate.slice(5).replace(".", "/")}
-                </div>
-                {(!data.purchasedMeds || data.purchasedMeds.length === 0) && (
-                  <div style={{ fontSize: 13, color: "#3D4A42", whiteSpace: "nowrap", marginTop: 2 }}>
-                    구매 영양제: 없음
-                  </div>
-                )}
-              </>
+              <div style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>
+                최근 방문: {data.visitDate.slice(5).replace(".", "/")}
+              </div>
             ) : null}
           </div>
         </div>
@@ -1144,6 +974,28 @@ function PatientCard({
                     <span style={{ color: "#3D4A42" }}>—</span>
                     <span style={{ color: "#2C3630", fontWeight: 500 }}>{v}</span>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 증상 — 접힌 카드에서 옮겨온 항목. 헤더 단순화 + 펼침에서 한 번에 조회. */}
+          {data.symptoms.length > 0 && (
+            <div className="dash-detail-section">
+              <div className="dash-detail-title">증상</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {data.symptoms.map((s) => (
+                  <span
+                    key={s.label}
+                    className={`dash-tag ${SYMPTOM_TAG_CLASS[s.category]}`}
+                    style={{
+                      fontSize: 14, fontWeight: 500,
+                      color: "var(--text-dark, #2C3630)",
+                      padding: "4px 10px",
+                    }}
+                  >
+                    {s.label}
+                  </span>
                 ))}
               </div>
             </div>
@@ -1785,7 +1637,10 @@ function ChatSidePanel({
 function DashboardContent() {
   const router = useRouter();
   const showEmptyState = false;
-  const [filter, setFilter] = useState<FilterKey>("all");
+  // 카드 전용 확장 키 — "visit_check"(예정일 지난 미처리 방문) 은 lib 의 FilterKey 에 없으므로
+  //   여기서 union 으로 한 단계 확장. applyFilters 호출 시 "visit_check" 만 특수 처리.
+  type CardFilterKey = FilterKey | "visit_check";
+  const [filter, setFilter] = useState<CardFilterKey>("all");
   const [sortBy, setSortBy] = useState<SortKey>("recent");
   const [search, setSearch] = useState("");
 
@@ -1827,44 +1682,11 @@ function DashboardContent() {
     questionnaire: { symptoms: string[] | null } | null;
     patient_profile: { birth_year: number | null; gender: string | null } | null;
   }
-  const { user: authUser, loading: authLoading, profile, profileLoading } = useAuth();
+  const { user: authUser } = useAuth();
 
-  /* ── license_name 미등록 약사 가드 ──
-   * 직접 URL 로 /dashboard 에 접근한 약사 중 pharmacist_profiles.license_name 이
-   * NULL/빈값이면 면허증 이름 입력 단계로 보냄. (콜백 라우트와 동일한 정책)
-   *
-   * race condition 방지:
-   *  - auth/profile 로딩 중에는 절대 쿼리 안 던짐 (세션 토큰 stale 로 RLS 일시 거부 회피)
-   *  - profile.role 이 'pharmacist' 일 때만 가드 동작 (환자 계정 보호)
-   *  - 쿼리 에러/row 없음 vs 진짜 빈 값을 구분 — 진짜 빈 값일 때만 redirect
-   */
-  useEffect(() => {
-    if (authLoading || profileLoading) return;
-    if (!authUser) return;
-    if (profile?.role !== "pharmacist") return;
-    let cancelled = false;
-    (async () => {
-      const { data, error } = await supabase
-        .from("pharmacist_profiles")
-        .select("license_name")
-        .eq("id", authUser.id)
-        .maybeSingle<{ license_name: string | null }>();
-      if (cancelled) return;
-      if (error) {
-        console.error("[dashboard guard] license check failed:", error);
-        return;
-      }
-      if (!data) {
-        console.error("[dashboard guard] no pharmacist_profiles row found");
-        return;
-      }
-      const ln = (data.license_name ?? "").trim();
-      if (!ln) {
-        router.replace("/signup/pharmacist?step=license");
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [authUser, router, profile, authLoading, profileLoading]);
+  // license_name 미등록 약사 가드 — lib/usePharmacistGuard 로 추출(2026-05-27).
+  //   /dashboard 와 /dashboard/patients 등 약사 전용 페이지가 동일 hook 호출로 일관 적용.
+  usePharmacistGuard();
 
   const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
   const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
@@ -2112,6 +1934,14 @@ function DashboardContent() {
     setDbActiveLoading(false);
   };
 
+  /** 통합 환자 목록 로더 — src/lib/pharmacistConsults 의 fetchAllConsultations 를 호출해 setConsults 적용.
+   *  본문(쿼리·매핑) 은 모두 lib 으로 이동(2026-05-27). dashboard·환자 목록 페이지에서 공유. */
+  const loadConsults = async (pharmacistId: string) => {
+    const list = await fetchAllConsultations(supabase, pharmacistId);
+    setConsults(list);
+  };
+
+
   useEffect(() => {
     fetchPendingRequests(authUser?.id ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2124,6 +1954,16 @@ function DashboardContent() {
       return;
     }
     fetchActiveConsultations(authUser.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser]);
+
+  // 통합 환자 목록(consults state) — pharmacistId 확정 시 fetch. 미로그인이면 빈 배열.
+  useEffect(() => {
+    if (!authUser) {
+      setConsults([]);
+      return;
+    }
+    loadConsults(authUser.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authUser]);
 
@@ -2287,40 +2127,17 @@ function DashboardContent() {
       fetchActiveConsultations(authUser.id);
     }
   };
-  // 뷰 모드: sessionStorage 복원 전까지 null → 깜빡임 없음
-  const [viewMode, setViewMode] = useState<"card" | "list" | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const saved = window.sessionStorage.getItem("dashboardViewMode");
-    setViewMode(saved === "list" ? "list" : "card");
-  }, []);
-  useEffect(() => {
-    if (!viewMode) return;
-    if (typeof window === "undefined") return;
-    window.sessionStorage.setItem("dashboardViewMode", viewMode);
-  }, [viewMode]);
-
-  /* 추가 필터 (토글, 복수 선택 가능) */
+  // 4단계: 리스트뷰 분리(/dashboard/patients) 이후 카드 전용. viewMode/sessionStorage/리스트 전용 필터 제거.
   const [filterSource, setFilterSource] = useState<"app" | "offline" | null>(null);
-  const [filterVisit, setFilterVisit] = useState<"no_visit" | "has_visit" | null>(null);
-  const [filterSupplement, setFilterSupplement] = useState<"taking" | "not_taking" | "completed" | null>(null);
-  const [filterRelation, setFilterRelation] = useState<"regular" | null>(null);
-  const [showRelationTooltip, setShowRelationTooltip] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
-
-  /* 날짜 범위 필터 */
-  const [dateRange, setDateRange] = useState<DateRangeKey>("all");
-  const [customDateFrom, setCustomDateFrom] = useState("");
-  const [customDateTo, setCustomDateTo] = useState("");
 
   /* AI 검색 */
   const [aiSearchMode, setAiSearchMode] = useState(false);
   const [aiSearchQuery, setAiSearchQuery] = useState("");
   const [aiSearched, setAiSearched] = useState(false);
 
-  /* 환자 데이터 (수락/거절로 변경됨) */
-  const [consults, setConsults] = useState<PatientConsult[]>(MOCK_CONSULTS);
+  /* 환자 데이터 — fetchAllConsultations 결과로 채워짐. MOCK_CONSULTS 정의는 디자인 참조용으로 보존(라이브 사용 안 함). */
+  const [consults, setConsults] = useState<PatientConsult[]>([]);
 
   /* 토스트 */
   const [toast, setToast] = useState<string | null>(null);
@@ -2337,7 +2154,12 @@ function DashboardContent() {
   };
 
   const handleReject = (id: string, reason: string) => {
-    setConsults((prev) => prev.map((c) => c.id === id ? { ...c, isRejected: true, rejectedReason: reason, rejectedAt: TODAY_STR, patientStatus: "inactive" } : c));
+    // 거절일 — mock 시각 상수 제거 후 실제 오늘 날짜로 "YYYY.MM.DD" 형식 채움.
+    const today = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+    })();
+    setConsults((prev) => prev.map((c) => c.id === id ? { ...c, isRejected: true, rejectedReason: reason, rejectedAt: today, patientStatus: "inactive" } : c));
     showToast("거절 처리되었습니다");
   };
 
@@ -2396,109 +2218,32 @@ function DashboardContent() {
     }
   };
 
-  // 필터 + 검색
-  // 새 상담 요청(requested)은 위쪽 영역에서만 표시 — 아래 목록에서 항상 제외
-  let result = consults.filter(
-    (c) => !(c.patientStatus === "requested" && !c.isRejected),
+  // 필터 + 검색 + 정렬 — 카드 전용. 리스트 전용 필터(dateRange/filterVisit/filterSupplement/filterRelation)는
+  //   환자 목록 페이지(/dashboard/patients) 로 이전됨. 여기선 카드 키워드 + 경로 칩만 적용.
+  //   "visit_check" 는 lib FilterKey 에 없는 카드 전용 키 — applyFilters 에는 "all" 로 호출 후 isNoShow 만 후처리.
+  const result = sortConsults(
+    filter === "visit_check"
+      ? applyFilters(consults, {
+          filter: "all", search,
+          dateRange: "all", customDateFrom: "", customDateTo: "",
+          filterSource, filterVisit: null, filterSupplement: null, filterRelation: null,
+        }).filter((c) => c.isNoShow === true)
+      : applyFilters(consults, {
+          filter, search,
+          dateRange: "all", customDateFrom: "", customDateTo: "",
+          filterSource, filterVisit: null, filterSupplement: null, filterRelation: null,
+        }),
+    sortBy,
   );
-  if (filter === "managing") {
-    result = result.filter((c) => c.patientStatus === "managing");
-  } else if (filter === "visit_scheduled") {
-    result = result.filter((c) => !!c.nextVisitDate);
-  } else if (filter === "unread") {
-    result = result.filter((c) => c.unreadCount > 0);
-  } else if (filter === "rejected") {
-    result = result.filter((c) => !!c.isRejected);
-  }
-  if (search.trim()) {
-    const q = search.trim().toLowerCase();
-    result = result.filter(
-      (c) =>
-        c.patientName.includes(q) ||
-        c.symptoms.some((s) => s.label.includes(q)) ||
-        (c.purchasedMeds && c.purchasedMeds.some((m) => m.toLowerCase().includes(q))),
-    );
-  }
-
-  // 날짜 범위 필터
-  if (dateRange !== "all") {
-    const now = new Date(2026, 3, 10);
-    let fromDate: Date | null = null;
-    let toDate: Date | null = null;
-
-    if (dateRange === "1w") {
-      fromDate = new Date(now);
-      fromDate.setDate(fromDate.getDate() - 7);
-    } else if (dateRange === "1m") {
-      fromDate = new Date(now);
-      fromDate.setMonth(fromDate.getMonth() - 1);
-    } else if (dateRange === "3m") {
-      fromDate = new Date(now);
-      fromDate.setMonth(fromDate.getMonth() - 3);
-    } else if (dateRange === "custom") {
-      if (customDateFrom) fromDate = new Date(customDateFrom);
-      if (customDateTo) toDate = new Date(customDateTo);
-    }
-
-    result = result.filter((c) => {
-      const latest = getLatestDate(c);
-      if (fromDate && latest < fromDate) return false;
-      if (toDate && latest > toDate) return false;
-      return true;
-    });
-  }
-
-  // 추가 필터: 등록 경로
-  if (filterSource) {
-    result = result.filter((c) => c.registrationSource === filterSource);
-  }
-  // 추가 필터: 방문 여부
-  if (filterVisit === "no_visit") {
-    result = result.filter((c) => !c.visitDate);
-  } else if (filterVisit === "has_visit") {
-    result = result.filter((c) => !!c.visitDate);
-  }
-  // 추가 필터: 복용 상태
-  if (filterSupplement) {
-    result = result.filter((c) => c.supplementStatus === filterSupplement);
-  }
-  // 추가 필터: 관계 태그
-  if (filterRelation === "regular") {
-    result = result.filter((c) => getRelationTag(c) === "regular");
-  }
-
-  // 정렬 우선순위 (단골 영향 없음):
-  //  1) 🔥 답장 필요 (24시간 미답변)
-  //  2) 읽지 않은 새 메시지 (unreadCount > 0)
-  //  3) 마지막 대화 시간순 (최신이 위)
-  result = [...result].sort((a, b) => {
-    const urgentA = (needsUrgentReply(a) || needsAcceptUrgent(a)) ? 0 : 1;
-    const urgentB = (needsUrgentReply(b) || needsAcceptUrgent(b)) ? 0 : 1;
-    if (urgentA !== urgentB) return urgentA - urgentB;
-
-    const unreadA = a.unreadCount > 0 ? 0 : 1;
-    const unreadB = b.unreadCount > 0 ? 0 : 1;
-    if (unreadA !== unreadB) return unreadA - unreadB;
-
-    if (sortBy === "unread") return b.unreadCount - a.unreadCount;
-
-    // 마지막 대화 시각 desc (최신이 위)
-    return sortableLastMsgTs(b) - sortableLastMsgTs(a);
-  });
 
   // 통계
+  // 통계 카드 3개 소스 — consults(통합 환자 목록) 기반. dbPendingCount 폴백은 통합 도입으로 제거.
   const totalRequested = consults.filter((c) => c.patientStatus === "requested" && !c.isRejected).length;
-  const totalVisitToday = consults.filter((c) => c.nextVisitDate === TODAY_STR).length;
+  const totalVisitToday = consults.filter((c) => c.hasVisitToday).length;
   const totalManaging = consults.filter((c) => c.patientStatus === "managing").length;
   const totalUrgent = consults.filter((c) => needsUrgentReply(c) || needsAcceptUrgent(c)).length;
-
-  const DATE_RANGE_OPTIONS: { key: DateRangeKey; label: string }[] = [
-    { key: "all", label: "전체" },
-    { key: "1w", label: "1주" },
-    { key: "1m", label: "1개월" },
-    { key: "3m", label: "3개월" },
-    { key: "custom", label: "직접 입력" },
-  ];
+  // "방문 체크" 탭 카운트 — 예정일 지났는데 [방문 완료] 미처리 환자 수.
+  const totalNoShow = consults.filter((c) => c.isNoShow === true).length;
 
   return (
     <div className="dash-page" style={{ paddingBottom: 80 }}>
@@ -3236,7 +2981,7 @@ function DashboardContent() {
         <div className="dash-stats-row">
           <div className="dash-stat-card">
             <div style={{ display: "inline-flex", alignItems: "baseline", gap: 8, justifyContent: "center" }}>
-              <span className="dash-stat-num" style={{ color: "#B06D00" }}>🔔 {dbPendingCount ?? totalRequested}</span>
+              <span className="dash-stat-num" style={{ color: "#B06D00" }}>🔔 {totalRequested}</span>
               {totalUrgent > 0 && (
                 <span
                   title="24시간 이상 미답변 환자"
@@ -3348,74 +3093,31 @@ function DashboardContent() {
           </div>
         )}
 
-        {/* 날짜 범위 필터 */}
-        <div style={{
-          display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap",
-          marginTop: 12,
-        }}>
-          <span style={{ fontSize: 14, fontWeight: 700, color: "var(--text-mid)", marginRight: 2 }}>기간</span>
-          {DATE_RANGE_OPTIONS.map((opt) => (
-            <button
-              key={opt.key}
-              type="button"
-              onClick={() => setDateRange(opt.key)}
-              style={{
-                padding: "4px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600,
-                background: dateRange === opt.key ? "var(--sage-deep)" : "var(--sage-bg, #F8F9F7)",
-                color: dateRange === opt.key ? "#fff" : "var(--text-mid)",
-                border: dateRange === opt.key ? "1.5px solid var(--sage-deep)" : "1px solid var(--border, rgba(94,125,108,0.14))",
-                cursor: "pointer", transition: "all 0.15s",
-              }}
-            >{opt.label}</button>
-          ))}
-        </div>
-
-        {/* 직접 입력 날짜 선택 */}
-        {dateRange === "custom" && (
-          <div style={{
-            display: "flex", gap: 8, alignItems: "center", marginTop: 8,
-            flexWrap: "wrap",
-          }}>
-            <input
-              type="date"
-              value={customDateFrom}
-              onChange={(e) => setCustomDateFrom(e.target.value)}
-              style={{
-                padding: "6px 10px", borderRadius: 8, fontSize: 13,
-                border: "1.5px solid var(--sage-light)", color: "var(--text-dark)",
-                outline: "none", fontFamily: "'Noto Sans KR', sans-serif",
-              }}
-            />
-            <span style={{ fontSize: 13, color: "var(--text-mid)" }}>~</span>
-            <input
-              type="date"
-              value={customDateTo}
-              onChange={(e) => setCustomDateTo(e.target.value)}
-              style={{
-                padding: "6px 10px", borderRadius: 8, fontSize: 13,
-                border: "1.5px solid var(--sage-light)", color: "var(--text-dark)",
-                outline: "none", fontFamily: "'Noto Sans KR', sans-serif",
-              }}
-            />
-          </div>
-        )}
-
-        {/* 필터 + 정렬 */}
+        {/* 필터 + 정렬 — 카드 전용 6탭. 기간/거절이력은 환자 목록 페이지(/dashboard/patients) 로 분리됨. */}
         <div className="dash-filter-row">
           <div className="dash-filters">
             {([
               ["all", "전체"],
-              ["managing", "💊 사후 관리"],
+              ["requested", "🔔 새 상담 요청"],
+              ["med_ending_soon", "💊 복용 임박"],
               ["visit_scheduled", "🗓️ 방문 예정"],
+              ["visit_check", "⚠️ 방문 체크"],
               ["unread", "💬 새 메시지"],
-              ["rejected", "❌ 거절 이력"],
-            ] as [FilterKey, string][]).map(([key, label]) => (
+            ] as [CardFilterKey, string][]).map(([key, label]) => (
               <button
                 key={key}
                 className={`dash-filter-tab${filter === key ? " active" : ""}`}
                 onClick={() => setFilter(key)}
               >
                 {label}
+                {key === "visit_check" && totalNoShow > 0 && (
+                  <span style={{
+                    marginLeft: 6, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                    minWidth: 18, height: 18, padding: "0 6px", borderRadius: 9,
+                    background: "#FFF0E6", color: "#E05A1A",
+                    fontSize: 11, fontWeight: 700, lineHeight: 1,
+                  }}>{totalNoShow}</span>
+                )}
               </button>
             ))}
           </div>
@@ -3452,153 +3154,9 @@ function DashboardContent() {
               >{opt.label}</button>
             );
           })}
-          <span style={{ width: 1, height: 20, background: "var(--border, rgba(94,125,108,0.14))", alignSelf: "center", flexShrink: 0 }} />
-          {/* 방문 여부 */}
-          {([
-            { key: "no_visit" as const, label: "방문 전" },
-            { key: "has_visit" as const, label: "방문일자 있음" },
-          ]).map((opt) => {
-            const active = filterVisit === opt.key;
-            return (
-              <button
-                key={opt.key}
-                type="button"
-                onClick={() => setFilterVisit(active ? null : opt.key)}
-                style={{
-                  padding: "4px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600,
-                  background: active ? "var(--sage-pale, #EDF4F0)" : "#F8F9F7",
-                  color: active ? "var(--sage-deep, #4A6355)" : "var(--text-mid, #3D4A42)",
-                  border: active ? "1.5px solid var(--sage-deep, #4A6355)" : "1px solid var(--border, rgba(94,125,108,0.14))",
-                  cursor: "pointer", transition: "all 0.15s",
-                }}
-              >{opt.label}</button>
-            );
-          })}
-          <span style={{ width: 1, height: 20, background: "var(--border, rgba(94,125,108,0.14))", alignSelf: "center", flexShrink: 0 }} />
-          {/* 복용 상태 */}
-          {([
-            { key: "taking" as const, label: "복용 중", bg: "#EAF3DE", color: "#3B6D11", borderColor: "#C0D9A8" },
-            { key: "not_taking" as const, label: "미복용", bg: "#F0F0F0", color: "#666666", borderColor: "#CCCCCC" },
-            { key: "completed" as const, label: "복용 완료", bg: "#F0F0F0", color: "#666666", borderColor: "#CCCCCC" },
-          ]).map((opt) => {
-            const active = filterSupplement === opt.key;
-            return (
-              <button
-                key={opt.key}
-                type="button"
-                onClick={() => setFilterSupplement(active ? null : opt.key)}
-                style={{
-                  padding: "4px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600,
-                  background: active ? opt.bg : "#F8F9F7",
-                  color: active ? opt.color : "var(--text-mid, #3D4A42)",
-                  border: active ? `1.5px solid ${opt.color}` : "1px solid var(--border, rgba(94,125,108,0.14))",
-                  cursor: "pointer", transition: "all 0.15s",
-                }}
-              >{opt.label}</button>
-            );
-          })}
-          <span style={{ width: 1, height: 20, background: "var(--border, rgba(94,125,108,0.14))", alignSelf: "center", flexShrink: 0 }} />
-          {/* 관계 태그 필터 */}
-          {(() => {
-            const active = filterRelation === "regular";
-            return (
-              <button
-                type="button"
-                onClick={() => setFilterRelation(active ? null : "regular")}
-                style={{
-                  padding: "4px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600,
-                  background: active ? "#FAECE7" : "#F8F9F7",
-                  color: active ? "#C06B45" : "var(--text-mid, #3D4A42)",
-                  border: active ? "1.5px solid #C06B45" : "1px solid var(--border, rgba(94,125,108,0.14))",
-                  cursor: "pointer", transition: "all 0.15s",
-                }}
-              >💚 단골</button>
-            );
-          })()}
-          {/* 단골 설명 ⓘ */}
-          <div style={{ position: "relative", display: "inline-flex", alignSelf: "center" }}>
-            <button
-              type="button"
-              onClick={() => setShowRelationTooltip(!showRelationTooltip)}
-              onMouseEnter={() => setShowRelationTooltip(true)}
-              onMouseLeave={() => setShowRelationTooltip(false)}
-              aria-label="단골 태그 설명"
-              style={{
-                width: 22, height: 22, borderRadius: "50%",
-                display: "flex", alignItems: "center", justifyContent: "center",
-                background: "var(--sage-pale, #EDF4F0)", border: "1px solid var(--sage-light, #B3CCBE)",
-                cursor: "pointer", fontSize: 12, fontWeight: 700, color: "var(--sage-deep, #4A6355)",
-                padding: 0, lineHeight: 1,
-              }}
-            >
-              i
-            </button>
-            {showRelationTooltip && (
-              <div style={{
-                position: "absolute", bottom: "calc(100% + 8px)", left: "50%", transform: "translateX(-50%)",
-                width: 200, padding: "10px 14px", borderRadius: 12,
-                background: "#fff", border: "1px solid var(--sage-light, #B3CCBE)",
-                boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
-                fontSize: 13, lineHeight: 1.7, color: "var(--text-mid, #3D4A42)",
-                zIndex: 50,
-              }}>
-                <div>💚 <b>단골</b>: 영양제 구매 이력 있음</div>
-                <div style={{
-                  position: "absolute", bottom: -6, left: "50%", transform: "translateX(-50%) rotate(45deg)",
-                  width: 10, height: 10, background: "#fff",
-                  borderRight: "1px solid var(--sage-light, #B3CCBE)",
-                  borderBottom: "1px solid var(--sage-light, #B3CCBE)",
-                }} />
-              </div>
-            )}
-          </div>
         </div>
 
-        {/* 뷰 토글 */}
-        <div style={{ display: "flex", gap: 0, marginTop: 12 }}>
-          <button
-            type="button"
-            onClick={() => setViewMode("card")}
-            aria-label="카드 뷰"
-            style={{
-              width: 40, height: 40, display: "flex", alignItems: "center", justifyContent: "center",
-              borderRadius: "8px 0 0 8px",
-              background: viewMode === "card" ? "var(--sage-deep, #4A6355)" : "#fff",
-              border: "1.5px solid var(--sage-deep, #4A6355)",
-              cursor: "pointer", transition: "all 0.15s",
-            }}
-          >
-            {/* 2x2 그리드 아이콘 */}
-            <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-              <rect x="1" y="1" width="6.5" height="6.5" rx="1.5" stroke={viewMode === "card" ? "#fff" : "#4A6355"} strokeWidth="1.8" />
-              <rect x="10.5" y="1" width="6.5" height="6.5" rx="1.5" stroke={viewMode === "card" ? "#fff" : "#4A6355"} strokeWidth="1.8" />
-              <rect x="1" y="10.5" width="6.5" height="6.5" rx="1.5" stroke={viewMode === "card" ? "#fff" : "#4A6355"} strokeWidth="1.8" />
-              <rect x="10.5" y="10.5" width="6.5" height="6.5" rx="1.5" stroke={viewMode === "card" ? "#fff" : "#4A6355"} strokeWidth="1.8" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode("list")}
-            aria-label="리스트 뷰"
-            style={{
-              width: 40, height: 40, display: "flex", alignItems: "center", justifyContent: "center",
-              borderRadius: "0 8px 8px 0",
-              background: viewMode === "list" ? "var(--sage-deep, #4A6355)" : "#fff",
-              border: "1.5px solid var(--sage-deep, #4A6355)",
-              borderLeft: "none",
-              cursor: "pointer", transition: "all 0.15s",
-            }}
-          >
-            {/* 가로 3줄 아이콘 */}
-            <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-              <line x1="1" y1="4" x2="17" y2="4" stroke={viewMode === "list" ? "#fff" : "#4A6355"} strokeWidth="2" strokeLinecap="round" />
-              <line x1="1" y1="9" x2="17" y2="9" stroke={viewMode === "list" ? "#fff" : "#4A6355"} strokeWidth="2" strokeLinecap="round" />
-              <line x1="1" y1="14" x2="17" y2="14" stroke={viewMode === "list" ? "#fff" : "#4A6355"} strokeWidth="2" strokeLinecap="round" />
-            </svg>
-          </button>
-        </div>
-
-        {/* 환자 목록 */}
+        {/* 환자 카드 목록 — 카드 뷰 전용. 리스트 뷰는 /dashboard/patients 페이지로 분리됨. */}
         {showEmptyState ? (
           <div style={{
             display: "flex", flexDirection: "column", alignItems: "center",
@@ -3622,11 +3180,7 @@ function DashboardContent() {
           <div className="dash-empty">
             {search ? "검색 결과가 없습니다." : "해당 조건의 상담이 없습니다."}
           </div>
-        ) : viewMode === null ? (
-          /* sessionStorage 복원 전까지 렌더 보류 (깜빡임 방지) */
-          <div aria-hidden="true" style={{ minHeight: 240 }} />
         ) : (
-          viewMode === "card" ? (
           <div className="dash-list">
             {result.map((c) => (
               <div key={c.id}>
@@ -3642,169 +3196,6 @@ function DashboardContent() {
               </div>
             ))}
           </div>
-          ) : (
-          /* 리스트 뷰 — 테이블 */
-          <div style={{ borderRadius: 12, border: "1px solid var(--border, rgba(94,125,108,0.14))", overflow: "hidden" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, tableLayout: "fixed" }}>
-              <thead>
-                <tr style={{ background: "var(--sage-pale, #EDF4F0)" }}>
-                  <th style={{ minWidth: 70, padding: "10px 12px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>이름</th>
-                  <th style={{ width: 45, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>나이</th>
-                  <th className="dash-list-gender-col" style={{ width: 35, padding: "10px 4px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>성별</th>
-                  <th style={{ width: 80, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>상태</th>
-                  <th className="dash-list-visit-col" style={{ width: 80, minWidth: 65, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>방문</th>
-                  <th className="dash-list-action-col" style={{ width: 70, minWidth: 70, padding: "10px 6px", textAlign: "left", fontWeight: 700, color: "var(--text-dark, #2C3630)", fontSize: 13, whiteSpace: "nowrap" }}>액션</th>
-                </tr>
-              </thead>
-              <tbody>
-                {result.map((c) => {
-                  const stCfg = PATIENT_STATUS_CONFIG[c.patientStatus];
-                  const showSt = c.patientStatus !== "inactive" && !c.isRejected;
-                  const rTag = getRelationTag(c);
-                  const isOver = rTag === "over";
-                  const listAge = CURRENT_YEAR - c.birthYear;
-                  const visitLabel = c.nextVisitDate
-                    ? `예약 ${c.nextVisitDate.slice(5).replace(".", "/")}`
-                    : "방문전";
-                  const visitTitle = c.nextVisitDate
-                    ? `방문 예정 ${c.nextVisitDate.slice(5).replace(".", "/")}`
-                    : c.visitDate
-                      ? `최근 방문 ${c.visitDate.slice(5).replace(".", "/")}`
-                      : "방문 이력 없음";
-                  const isReqRow = c.patientStatus === "requested" && !c.isRejected;
-                  const rowHours = hoursOfLastPatientMsg(c);
-                  const actionBtnStyle: React.CSSProperties = {
-                    width: 28, height: 24, padding: 0, borderRadius: 6,
-                    display: "inline-flex", alignItems: "center", justifyContent: "center",
-                    fontSize: 12, fontWeight: 700, cursor: "pointer", lineHeight: 1,
-                  };
-                  return (
-                    <tr
-                      key={c.id}
-                      onClick={() => router.push(`/chart/${c.id}`)}
-                      style={{ cursor: "pointer", borderBottom: "1px solid var(--border, rgba(94,125,108,0.14))", transition: "background 0.15s", background: isOver ? "#FAFAFA" : "transparent" }}
-                      onMouseEnter={(e) => { e.currentTarget.style.background = "var(--sage-pale, #EDF4F0)"; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.background = isOver ? "#FAFAFA" : "transparent"; }}
-                    >
-                      <td
-                        style={{
-                          minWidth: 70,
-                          padding: "12px", fontWeight: 700,
-                          color: "#2C3630",
-                          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                        }}
-                      >
-                        <span style={{ display: "inline-flex", alignItems: "center", minWidth: 0 }}>
-                          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{c.patientName}</span>
-                          {rTag === "regular" && <span aria-hidden="true" style={{ marginLeft: 4, flexShrink: 0 }}>💚</span>}
-                          {c.unreadCount > 0 && (
-                            <span
-                              className="dash-unread-badge"
-                              style={{ flexShrink: 0, marginLeft: 6, ...getUnreadBadgeStyle(rowHours) }}
-                            >
-                              {c.unreadCount}
-                            </span>
-                          )}
-                        </span>
-                      </td>
-                      <td style={{ padding: "12px 6px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{listAge}세</td>
-                      <td className="dash-list-gender-col" style={{ padding: "12px 4px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{c.patientGender}</td>
-                      <td style={{ padding: "12px 6px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
-                          {c.isRejected ? (
-                            <span
-                              title="거절됨"
-                              style={{
-                                display: "inline-flex", alignItems: "center", justifyContent: "center",
-                                padding: "3px 8px", borderRadius: 8,
-                                fontSize: 14, background: "#FFE5E5",
-                              }}
-                            >❌</span>
-                          ) : showSt ? (
-                            <span
-                              title={stCfg.label}
-                              style={{
-                                display: "inline-flex", alignItems: "center", justifyContent: "center",
-                                padding: "3px 8px", borderRadius: 8,
-                                fontSize: 14, background: stCfg.bg,
-                              }}
-                            >{stCfg.emoji}</span>
-                          ) : (
-                            <span style={{ fontSize: 13, color: "var(--text-mid, #3D4A42)" }}>-</span>
-                          )}
-                          {(c.previousRejections?.length ?? 0) > 0 && (
-                            <span
-                              title={`이전 거절 이력 ${c.previousRejections!.length}건`}
-                              style={{
-                                display: "inline-flex", alignItems: "center", justifyContent: "center",
-                                padding: "3px 6px", borderRadius: 8,
-                                fontSize: 13, fontWeight: 600,
-                                background: "#FFF8E1", color: "#B06D00",
-                              }}
-                            >⚠️</span>
-                          )}
-                        </span>
-                      </td>
-                      <td className="dash-list-visit-col" title={visitTitle} style={{ padding: "12px 6px", color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", fontSize: 14, overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {visitLabel}
-                      </td>
-                      <td className="dash-list-action-col" style={{ padding: "12px 6px", whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
-                        {c.isRejected ? (
-                          <span style={{ fontSize: 12, color: "var(--text-mid, #3D4A42)" }}>-</span>
-                        ) : isReqRow ? (
-                          <span style={{ display: "inline-flex", gap: 4, flexShrink: 0 }}>
-                            <button
-                              type="button"
-                              title="수락"
-                              aria-label="수락"
-                              onClick={(e) => { e.stopPropagation(); handleAccept(c.id); }}
-                              style={{
-                                ...actionBtnStyle,
-                                flexShrink: 0,
-                                background: "var(--sage-deep, #4A6355)", color: "#fff",
-                                border: "none",
-                              }}
-                            >✓</button>
-                            <button
-                              type="button"
-                              title="거절"
-                              aria-label="거절"
-                              onClick={(e) => { e.stopPropagation(); openRejectModal(c.id); }}
-                              style={{
-                                ...actionBtnStyle,
-                                flexShrink: 0,
-                                background: "#fff", color: "#D32F2F",
-                                border: "1.5px solid #D32F2F",
-                              }}
-                            >✕</button>
-                          </span>
-                        ) : (
-                          <button
-                            type="button"
-                            title="채팅창 열기"
-                            aria-label="채팅창 열기"
-                            onClick={(e) => { e.stopPropagation(); handleOpenChat(c.id); }}
-                            style={{
-                              ...actionBtnStyle,
-                              background: "var(--sage-pale, #EDF4F0)", color: "var(--sage-deep, #4A6355)",
-                              border: "1px solid var(--sage-light, #B3CCBE)",
-                            }}
-                          >💬</button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {/* 모바일 컬럼 조정 */}
-            <style>{`
-              @media (max-width: 600px) {
-                .dash-list-gender-col { display: none !important; }
-              }
-            `}</style>
-          </div>
-          )
         )}
       </div>
 

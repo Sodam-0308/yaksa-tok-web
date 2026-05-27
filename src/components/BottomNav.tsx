@@ -76,6 +76,20 @@ const PHARMACIST_TABS: Tab[] = [
     ),
   },
   {
+    label: "환자 목록",
+    href: "/dashboard/patients",
+    icon: (c) => (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        {/* 사람 목록 — 위 사람 아이콘 + 가로선 두 줄 */}
+        <circle cx="8" cy="7" r="3" />
+        <path d="M2 21c0-2.8 2.7-5 6-5s6 2.2 6 5" />
+        <line x1="15" y1="9" x2="22" y2="9" />
+        <line x1="15" y1="13" x2="22" y2="13" />
+        <line x1="17" y1="17" x2="22" y2="17" />
+      </svg>
+    ),
+  },
+  {
     label: "피드",
     href: "/feed?role=pharmacist",
     icon: (c) => (
@@ -142,6 +156,8 @@ export default function BottomNav() {
   const isActive = (href: string) => {
     const base = href.split("?")[0];
     if (base === "/") return pathname === "/";
+    // /dashboard 는 sub-route(/dashboard/patients) 와 활성 충돌하지 않도록 정확 비교.
+    if (base === "/dashboard") return pathname === "/dashboard";
     return pathname.startsWith(base);
   };
 

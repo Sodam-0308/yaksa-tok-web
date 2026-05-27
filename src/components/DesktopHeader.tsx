@@ -20,6 +20,7 @@ const PATIENT_TABS: Tab[] = [
 
 const PHARMACIST_TABS: Tab[] = [
   { label: "대시보드", href: "/dashboard" },
+  { label: "환자 목록", href: "/dashboard/patients" },
   { label: "피드", href: "/feed?role=pharmacist" },
   { label: "채팅", href: "/chat?role=pharmacist" },
   { label: "내 정보", href: "/pharmacist/mypage" },
@@ -84,6 +85,8 @@ export default function DesktopHeader({ pathname }: { pathname: string }) {
   const isActive = (href: string) => {
     const base = href.split("?")[0];
     if (base === "/") return pathname === "/";
+    // /dashboard 는 sub-route(/dashboard/patients) 와 활성 충돌하지 않도록 정확 비교.
+    if (base === "/dashboard") return pathname === "/dashboard";
     return pathname.startsWith(base);
   };
 

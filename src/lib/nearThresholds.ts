@@ -7,6 +7,8 @@
 /** I-4 임박 알람 기준 — 단위 일. 복용 종료/방문 일정 D-N 이하일 때 배너/알림 노출. */
 export const MED_NEAR_THRESHOLD = 3;
 export const VISIT_NEAR_THRESHOLD = 2;
+/** 약사 대시보드 복용 종료 임박 기준 — D-N 이하면 isMedEndingSoon. 환자 D-3 보다 길게 잡아 약사가 미리 보이게. */
+export const PHARM_MED_NEAR_DAYS = 7;
 
 /** 오늘 날짜를 로컬(한국시간) 기준 YYYY-MM-DD 문자열로 반환.
  *  toISOString() 은 UTC 라 한국시간 자정 부근에 하루 어긋날 수 있으니 로컬 연/월/일로 조립. */

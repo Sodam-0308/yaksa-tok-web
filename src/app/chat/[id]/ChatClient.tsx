@@ -1016,6 +1016,39 @@ function ChatContent() {
 
     // 5) 인사 편집 펼침 영역 닫기 — 카드가 완료 표시로 전환되며 어차피 액션 영역 자체가 사라지지만, 명시 정리.
     closeThanksEditor(visitId);
+
+    // 6) visit_records INSERT — 차트 "방문 기록" 카드용 row 자동 생성.
+    //   purchased_supplements / complaint / improvement / guide / opinion / dosage_days / dosage_end_date /
+    //   pharmacist_photos 등 나머지 컬럼은 차트에서 약사가 채우도록 null/기본값 유지.
+    //   기존 변수 재사용: chatId(consultation_id), user.id(pharmacist_id), dbConsultation.patient_id,
+    //   activeRoundId, todayIso(=visited_date 와 동일 날짜).
+    //   실패해도 방문 완료 자체는 이미 성공이라 콘솔만 남기고 진행(alert 금지).
+    if (dbConsultation?.patient_id) {
+      type VisitRecordInsert = {
+        consultation_id: string;
+        pharmacist_id: string;
+        patient_id: string;
+        visit_date: string;
+        round_id: string | null;
+      };
+      const vrPayload: VisitRecordInsert = {
+        consultation_id: chatId,
+        pharmacist_id: user.id,
+        patient_id: dbConsultation.patient_id,
+        visit_date: todayIso,
+        round_id: activeRoundId,
+      };
+      void (supabase
+        .from("visit_records") as unknown as {
+          insert: (p: VisitRecordInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(vrPayload)
+        .then(({ error }) => {
+          if (error) {
+            console.error("[chat] visit_records insert failed (non-fatal):", error);
+          }
+        });
+    }
   };
 
   const handleReschedule = async () => {
