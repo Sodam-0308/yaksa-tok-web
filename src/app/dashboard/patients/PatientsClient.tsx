@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, Suspense } from "react";
+import React, { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -32,7 +32,7 @@ const DATE_RANGE_OPTIONS: { key: DateRangeKey; label: string }[] = [
 
 function PatientsContent() {
   const router = useRouter();
-  usePharmacistGuard();
+  const { checking, failed } = usePharmacistGuard();
   const { user: authUser } = useAuth();
 
   // 환자 목록 — lib/pharmacistConsults 의 fetchAllConsultations 로 로드.
@@ -64,6 +64,13 @@ function PatientsContent() {
   const [filterSupplement, setFilterSupplement] = useState<"taking" | "not_taking" | "completed" | null>(null);
   const [filterRelation, setFilterRelation] = useState<"regular" | null>(null);
   const [showRelationTooltip, setShowRelationTooltip] = useState(false);
+  // 방문 후 처리 끊김 통합 칩 — needsPurchaseList/needsDosageGuide/isNoShow/isMedEndingSoon 묶음.
+  //   "todo" 라벨로 둬서 추후 단계 세분화(구매내역만/복용법만) 시 확장 용이.
+  const [filterPostVisit, setFilterPostVisit] = useState<"all" | "todo">("all");
+
+  // 표 가로 스크롤 래퍼 — 실제 오버플로(글씨 잘림) 있을 때만 "옆으로 밀어 보기" 안내 노출(고정 폭 @media 대신).
+  const scrollWrapRef = useRef<HTMLDivElement | null>(null);
+  const [hasOverflow, setHasOverflow] = useState(false);
 
   // 정렬 state — 초기값 "recent" (페이지 진입 시 최근 활동순 desc). 헤더 클릭 시 해당 컬럼 모드로 전환.
   const [sortColumn, setSortColumn] = useState<SortColumn>("recent");
@@ -87,6 +94,16 @@ function PatientsContent() {
     dateRange, customDateFrom, customDateTo,
     filterSource, filterVisit, filterSupplement, filterRelation,
   });
+
+  // 방문 후 처리 끊김 통합 칩 — 공유 applyFilters 는 미변경(로컬 후처리). sort 직전 단계.
+  const postFiltered = filterPostVisit === "todo"
+    ? filtered.filter((c) =>
+        c.needsPurchaseList === true ||
+        c.needsDosageGuide === true ||
+        c.isNoShow === true ||
+        c.isMedEndingSoon === true,
+      )
+    : filtered;
 
   // 컬럼별 비교 함수 — null/없음 값은 항상 맨 밑(현재 정렬 방향과 무관하게)으로 두고 나머지 값에만 dir 적용.
   //   visit/chat 의 "없음(맨 밑)" 규칙은 사용자 지시. asc/desc 토글로 nullsLast 위치도 반대로 옮김(방문 없는 환자 맨 위).
@@ -154,7 +171,7 @@ function PatientsContent() {
     return (ca - cb) * dirMul;
   };
 
-  const result = [...filtered].sort((a, b) => {
+  const result = [...postFiltered].sort((a, b) => {
     if (sortColumn === "name") return compareName(a, b);
     if (sortColumn === "birth") return compareBirth(a, b);
     if (sortColumn === "gender") return compareGender(a, b);
@@ -168,6 +185,59 @@ function PatientsContent() {
   /** 헤더에 현재 정렬 화살표 추가용. */
   const sortArrow = (col: Exclude<SortColumn, "recent">): string =>
     sortColumn === col ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+
+  // 표가 실제로 잘려 가로 스크롤이 생겼는지 측정 — scrollWidth > clientWidth 면 안내 노출.
+  //   ResizeObserver(가능 시) + window resize 폴백. result 변동·가드 통과 시 재측정.
+  useEffect(() => {
+    const el = scrollWrapRef.current;
+    if (!el) { setHasOverflow(false); return; }
+    const measure = () => setHasOverflow(el.scrollWidth > el.clientWidth + 1);
+    measure();
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(() => measure());
+      ro.observe(el);
+    }
+    window.addEventListener("resize", measure);
+    return () => {
+      window.removeEventListener("resize", measure);
+      if (ro) ro.disconnect();
+    };
+  }, [result.length, checking]);
+
+  // 판정 실패(재시도까지 소진) — 영구 "확인 중" 멈춤 대신 안내 + 새로고침.
+  if (failed) {
+    return (
+      <div style={{
+        minHeight: "60vh", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center",
+        fontFamily: "'Noto Sans KR', sans-serif",
+      }}>
+        <div style={{ fontSize: 15, color: "#3D4A42" }}>정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요.</div>
+        <button
+          type="button"
+          onClick={() => location.reload()}
+          style={{
+            marginTop: 16, padding: "10px 24px", borderRadius: 100,
+            background: "#4A6355", color: "#fff", fontSize: 14, fontWeight: 600,
+            border: "none", cursor: "pointer",
+          }}
+        >새로고침</button>
+      </div>
+    );
+  }
+
+  // 가드 통과 확정 전(로딩/리다이렉트 진행 중)에는 본문 대신 로딩 화면.
+  if (checking) {
+    return (
+      <div style={{
+        minHeight: "60vh", display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 15, color: "#3D4A42", fontFamily: "'Noto Sans KR', sans-serif",
+      }}>
+        확인 중…
+      </div>
+    );
+  }
 
   return (
     <div className="dash-page" style={{ paddingBottom: 80 }}>
@@ -331,22 +401,94 @@ function PatientsContent() {
         <div className="dash-filter-row">
           <div className="dash-filters">
             {([
-              ["all", "전체"],
               ["rejected", "❌ 거절 이력"],
             ] as [FilterKey, string][]).map(([key, label]) => (
               <button
                 key={key}
                 className={`dash-filter-tab${filter === key ? " active" : ""}`}
-                onClick={() => setFilter(key)}
+                onClick={() => setFilter(filter === key ? "all" : key)}
               >
                 {label}
               </button>
             ))}
+            <span style={{ width: 1, height: 20, background: "var(--border, rgba(94,125,108,0.14))", alignSelf: "center", flexShrink: 0 }} />
+            {/* 관계 태그 필터 (거절 이력 옆으로 이동) */}
+            {(() => {
+              const active = filterRelation === "regular";
+              return (
+                <button
+                  type="button"
+                  onClick={() => setFilterRelation(active ? null : "regular")}
+                  style={{
+                    padding: "4px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600,
+                    background: active ? "#FAECE7" : "#F8F9F7",
+                    color: active ? "#C06B45" : "var(--text-mid, #3D4A42)",
+                    border: active ? "1.5px solid #C06B45" : "1px solid var(--border, rgba(94,125,108,0.14))",
+                    cursor: "pointer", transition: "all 0.15s",
+                  }}
+                >💚 단골</button>
+              );
+            })()}
+            {/* 단골 설명 ⓘ */}
+            <div style={{ position: "relative", display: "inline-flex", alignSelf: "center" }}>
+              <button
+                type="button"
+                onClick={() => setShowRelationTooltip(!showRelationTooltip)}
+                onMouseEnter={() => setShowRelationTooltip(true)}
+                onMouseLeave={() => setShowRelationTooltip(false)}
+                aria-label="단골 태그 설명"
+                style={{
+                  width: 22, height: 22, borderRadius: "50%",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: "var(--sage-pale, #EDF4F0)", border: "1px solid var(--sage-light, #B3CCBE)",
+                  cursor: "pointer", fontSize: 12, fontWeight: 700, color: "var(--sage-deep, #4A6355)",
+                  padding: 0, lineHeight: 1,
+                }}
+              >
+                i
+              </button>
+              {showRelationTooltip && (
+                <div style={{
+                  position: "absolute", bottom: "calc(100% + 8px)", left: "50%", transform: "translateX(-50%)",
+                  width: 200, padding: "10px 14px", borderRadius: 12,
+                  background: "#fff", border: "1px solid var(--sage-light, #B3CCBE)",
+                  boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
+                  fontSize: 13, lineHeight: 1.7, color: "var(--text-mid, #3D4A42)",
+                  zIndex: 50,
+                }}>
+                  <div>💚 <b>단골</b>: 영양제 구매 이력 있음</div>
+                  <div style={{
+                    position: "absolute", bottom: -6, left: "50%", transform: "translateX(-50%) rotate(45deg)",
+                    width: 10, height: 10, background: "#fff",
+                    borderRight: "1px solid var(--sage-light, #B3CCBE)",
+                    borderBottom: "1px solid var(--sage-light, #B3CCBE)",
+                  }} />
+                </div>
+              )}
+            </div>
+            <span style={{ width: 1, height: 20, background: "var(--border, rgba(94,125,108,0.14))", alignSelf: "center", flexShrink: 0 }} />
+            {/* 방문 후 처리 끊김 통합 칩 — 📝 처리할 일 있음 (토글) */}
+            {(() => {
+              const active = filterPostVisit === "todo";
+              return (
+                <button
+                  type="button"
+                  onClick={() => setFilterPostVisit(active ? "all" : "todo")}
+                  style={{
+                    padding: "4px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600,
+                    background: active ? "#F5E6DC" : "#F8F9F7",
+                    color: active ? "#C06B45" : "var(--text-mid, #3D4A42)",
+                    border: active ? "1.5px solid #C06B45" : "1px solid var(--border, rgba(94,125,108,0.14))",
+                    cursor: "pointer", transition: "all 0.15s",
+                  }}
+                >📝 처리할 일 있음</button>
+              );
+            })()}
           </div>
           {/* 정렬 드롭다운 제거 — 컬럼 헤더 클릭으로 정렬(아래 테이블 thead 참고). 기본 진입은 최근 활동순. */}
         </div>
 
-        {/* 추가 필터: 경로/방문/복용/단골 */}
+        {/* 추가 필터: 경로/방문/복용 (단골·처리할 일 있음은 거절 이력 옆 줄로 이동) */}
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
           {([
             { key: "app" as const, label: "📱 약사톡", bg: "#E6F1FB", color: "#185FA5", borderColor: "#B8D4F0" },
@@ -413,61 +555,6 @@ function PatientsContent() {
               >{opt.label}</button>
             );
           })}
-          <span style={{ width: 1, height: 20, background: "var(--border, rgba(94,125,108,0.14))", alignSelf: "center", flexShrink: 0 }} />
-          {/* 관계 태그 필터 */}
-          {(() => {
-            const active = filterRelation === "regular";
-            return (
-              <button
-                type="button"
-                onClick={() => setFilterRelation(active ? null : "regular")}
-                style={{
-                  padding: "4px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600,
-                  background: active ? "#FAECE7" : "#F8F9F7",
-                  color: active ? "#C06B45" : "var(--text-mid, #3D4A42)",
-                  border: active ? "1.5px solid #C06B45" : "1px solid var(--border, rgba(94,125,108,0.14))",
-                  cursor: "pointer", transition: "all 0.15s",
-                }}
-              >💚 단골</button>
-            );
-          })()}
-          {/* 단골 설명 ⓘ */}
-          <div style={{ position: "relative", display: "inline-flex", alignSelf: "center" }}>
-            <button
-              type="button"
-              onClick={() => setShowRelationTooltip(!showRelationTooltip)}
-              onMouseEnter={() => setShowRelationTooltip(true)}
-              onMouseLeave={() => setShowRelationTooltip(false)}
-              aria-label="단골 태그 설명"
-              style={{
-                width: 22, height: 22, borderRadius: "50%",
-                display: "flex", alignItems: "center", justifyContent: "center",
-                background: "var(--sage-pale, #EDF4F0)", border: "1px solid var(--sage-light, #B3CCBE)",
-                cursor: "pointer", fontSize: 12, fontWeight: 700, color: "var(--sage-deep, #4A6355)",
-                padding: 0, lineHeight: 1,
-              }}
-            >
-              i
-            </button>
-            {showRelationTooltip && (
-              <div style={{
-                position: "absolute", bottom: "calc(100% + 8px)", left: "50%", transform: "translateX(-50%)",
-                width: 200, padding: "10px 14px", borderRadius: 12,
-                background: "#fff", border: "1px solid var(--sage-light, #B3CCBE)",
-                boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
-                fontSize: 13, lineHeight: 1.7, color: "var(--text-mid, #3D4A42)",
-                zIndex: 50,
-              }}>
-                <div>💚 <b>단골</b>: 영양제 구매 이력 있음</div>
-                <div style={{
-                  position: "absolute", bottom: -6, left: "50%", transform: "translateX(-50%) rotate(45deg)",
-                  width: 10, height: 10, background: "#fff",
-                  borderRight: "1px solid var(--sage-light, #B3CCBE)",
-                  borderBottom: "1px solid var(--sage-light, #B3CCBE)",
-                }} />
-              </div>
-            )}
-          </div>
         </div>
 
         {/* 빈 결과 안내 */}
@@ -478,18 +565,29 @@ function PatientsContent() {
         ) : (
           /* 리스트 테이블 — 6컬럼: 이름 / 생년월일(나이) / 성별 / 방문 / 복용 / 마지막 대화. 행 1줄 높이 유지.
              폭 배분: colgroup % 비율 합 100% (table-layout: fixed). th/td 에는 width 안 줌.
-             모바일 600px↓: 성별·마지막 대화 col display:none → fixed 가 나머지 col 비율 그대로 100% 채움. */
-          <div style={{ marginTop: 16, borderRadius: 12, border: "1px solid var(--border, rgba(94,125,108,0.14))", overflow: "hidden", boxSizing: "border-box" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, tableLayout: "fixed" }}>
+             모바일: 컬럼 숨김 대신 가로 스크롤(table minWidth 640) — 좁은 폰에서 좌우로 밀어 6컬럼 전부 확인. */
+          <>
+            {/* 안내 — 표가 실제로 잘려 가로 스크롤이 생겼을 때만 노출(hasOverflow, 고정 폭 아님). */}
+            {hasOverflow && (
+              <div style={{
+                fontSize: 14, color: "#3D4A42", fontFamily: "'Noto Sans KR', sans-serif",
+                marginTop: 16, marginBottom: 6, textAlign: "left", fontWeight: 600,
+              }}>
+                👉 표를 옆으로 밀어서 전체 항목을 볼 수 있어요 →
+              </div>
+            )}
+            <div style={{ marginTop: 16, borderRadius: 12, border: "1px solid var(--border, rgba(94,125,108,0.14))", overflow: "hidden", boxSizing: "border-box" }}>
+              <div ref={scrollWrapRef} style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+                <table style={{ width: "100%", minWidth: 640, borderCollapse: "collapse", fontSize: 14, tableLayout: "fixed" }}>
               <colgroup>
                 {/* 데스크톱 1100px 기준 폭 배분 — 마지막 대화 헤더(6자+화살표) 말줄임 방지 위해
                     25% 확보. 이름/생년월일/성별 폭은 좁히고, 방문/복용은 유지. 합 100%. */}
                 <col style={{ width: "20%" }} />{/* 이름 */}
                 <col style={{ width: "18%" }} />{/* 생년월일 */}
-                <col className="pat-col-gender" style={{ width: "8%" }} />{/* 성별 */}
+                <col style={{ width: "8%" }} />{/* 성별 */}
                 <col style={{ width: "16%" }} />{/* 방문 */}
                 <col style={{ width: "13%" }} />{/* 복용 */}
-                <col className="pat-col-chat" style={{ width: "25%" }} />{/* 마지막 대화 */}
+                <col style={{ width: "25%" }} />{/* 마지막 대화 */}
               </colgroup>
               <thead>
                 <tr style={{ background: "var(--sage-pale, #EDF4F0)" }}>
@@ -511,7 +609,7 @@ function PatientsContent() {
                             onClick={() => handleSortClick("birth")}>
                           생년월일{sortArrow("birth")}
                         </th>
-                        <th className="pat-list-gender-col" style={{ ...baseTh, padding: "10px 4px" }}
+                        <th style={{ ...baseTh, padding: "10px 4px" }}
                             onClick={() => handleSortClick("gender")}>
                           성별{sortArrow("gender")}
                         </th>
@@ -523,7 +621,7 @@ function PatientsContent() {
                             onClick={() => handleSortClick("supplement")}>
                           복용{sortArrow("supplement")}
                         </th>
-                        <th className="pat-list-chat-col" style={baseTh}
+                        <th style={baseTh}
                             onClick={() => handleSortClick("chat")}>
                           마지막 대화{sortArrow("chat")}
                         </th>
@@ -582,7 +680,7 @@ function PatientsContent() {
                   return (
                     <tr
                       key={c.id}
-                      onClick={() => router.push(`/chart/${c.id}`)}
+                      onClick={() => router.push(`/chart/${c.id}?role=pharmacist`)}
                       style={{ cursor: "pointer", borderBottom: "1px solid var(--border, rgba(94,125,108,0.14))", transition: "background 0.15s", background: isOver ? "#FAFAFA" : "transparent" }}
                       onMouseEnter={(e) => { e.currentTarget.style.background = "var(--sage-pale, #EDF4F0)"; }}
                       onMouseLeave={(e) => { e.currentTarget.style.background = isOver ? "#FAFAFA" : "transparent"; }}
@@ -601,7 +699,7 @@ function PatientsContent() {
                         padding: "12px 6px", color: "var(--text-mid, #3D4A42)",
                         whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                       }}>{birthLabel}</td>
-                      <td className="pat-list-gender-col" style={{
+                      <td style={{
                         padding: "12px 4px", color: "var(--text-mid, #3D4A42)",
                         whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                       }}>{c.patientGender || "-"}</td>
@@ -617,7 +715,7 @@ function PatientsContent() {
                           background: suppCfg.bg, color: suppCfg.color,
                         }}>{suppCfg.label}</span>
                       </td>
-                      <td className="pat-list-chat-col" style={{
+                      <td style={{
                         padding: "12px 6px", color: "var(--text-mid, #3D4A42)",
                         whiteSpace: "nowrap", fontSize: 14, overflow: "hidden", textOverflow: "ellipsis",
                       }}>{chatLabel}</td>
@@ -625,18 +723,10 @@ function PatientsContent() {
                   );
                 })}
               </tbody>
-            </table>
-            {/* 모바일 컬럼 조정 — 600px↓ 에서 성별·마지막 대화 숨김(이름·생년월일·방문·복용 우선).
-                col + th + td 3 layer 모두 숨겨야 fixed layout 가 나머지 4컬럼에 잔여 비율 재분배. */}
-            <style>{`
-              @media (max-width: 600px) {
-                .pat-col-gender { display: none !important; }
-                .pat-col-chat { display: none !important; }
-                .pat-list-gender-col { display: none !important; }
-                .pat-list-chat-col { display: none !important; }
-              }
-            `}</style>
-          </div>
+                </table>
+              </div>
+            </div>
+          </>
         )}
       </div>
     </div>

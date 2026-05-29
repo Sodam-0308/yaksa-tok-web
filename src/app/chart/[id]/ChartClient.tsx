@@ -5,6 +5,7 @@ import { useRouter, useSearchParams, useParams } from "next/navigation";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
+import { usePharmacistGuard } from "@/lib/usePharmacistGuard";
 
 /* ══════════════════════════════════════════
    아이콘
@@ -573,6 +574,214 @@ function EditBtn({ onClick, label }: { onClick: () => void; label: string }) {
   );
 }
 
+/* ══════════════════════════════════════════
+   SupplementEditorCard
+   영양제 한 개 입력 카드 — 복용 가이드 폼·구매 영양제 입력 공용.
+   9위젯: 통약/소분 토글 + ✕ / 이름 / 용량 / 설명 / 5칩 시간대 / (조건부)etc_note /
+          (조건부)package_note / 하루 횟수 / 일수 / 메모.
+   내장 정책 (고정 ON):
+    - 5칩 토글 ↔ daily_count 자동 동기화 (칩 개수가 우선)
+    - 소분 전환 시 빈 이름/용량에 COMPOUND_DEFAULT 자동 채움, 통약 복귀 시 자동값 한정 비움
+   외부 의존성 없음. 부모는 (value, onChange, onRemove)만 넘기면 됨.
+   ══════════════════════════════════════════ */
+function SupplementEditorCard({
+  value,
+  onChange,
+  onRemove,
+  memoPlaceholder = "메모 (선택) · 주의·참고사항 (환자에게 표시됩니다)",
+}: {
+  value: SupplementItem;
+  onChange: (next: SupplementItem) => void;
+  onRemove: () => void;
+  memoPlaceholder?: string;
+}) {
+  const s = value;
+  const isCompound = s.dispense_type === "compounded";
+
+  const setDispense = (dispense: "bottle" | "compounded") => {
+    const next: SupplementItem = { ...s, dispense_type: dispense };
+    if (dispense === "compounded") {
+      if (!s.name.trim()) next.name = COMPOUND_DEFAULT_NAME;
+      if (!s.dosage.trim()) next.dosage = COMPOUND_DEFAULT_DOSAGE;
+    } else {
+      if (s.name === COMPOUND_DEFAULT_NAME) next.name = "";
+      if (s.dosage === COMPOUND_DEFAULT_DOSAGE) next.dosage = "";
+    }
+    onChange(next);
+  };
+
+  const setField = (f: "name" | "dosage" | "timing", v: string) => {
+    onChange({ ...s, [f]: v });
+  };
+
+  const toggleSlot = (slot: TimeSlotKr) => {
+    const prev = Array.isArray(s.time_slots) ? s.time_slots : [];
+    const has = prev.includes(slot);
+    const next = has ? prev.filter((x) => x !== slot) : [...prev, slot];
+    const nextDailyCount = next.length > 0 ? next.length : null;
+    const nextEtcNote = next.includes("기타") ? (s.etc_note ?? "") : "";
+    onChange({ ...s, time_slots: next, daily_count: nextDailyCount, etc_note: nextEtcNote });
+  };
+
+  const setEtcNote = (raw: string) => onChange({ ...s, etc_note: raw });
+
+  const setPackageNote = (checked: boolean) => onChange({ ...s, package_note: checked });
+
+  const setDailyCount = (raw: string) => {
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+      onChange({ ...s, daily_count: null });
+      return;
+    }
+    const v = parseInt(trimmed, 10);
+    onChange({ ...s, daily_count: Number.isFinite(v) && v > 0 ? v : null });
+  };
+
+  const setDays = (raw: string) => {
+    const v = parseInt(raw, 10);
+    onChange({ ...s, days: Number.isFinite(v) && v > 0 ? v : null });
+  };
+
+  const setMemo = (raw: string) => {
+    const truncated = raw.length > 200 ? raw.slice(0, 200) : raw;
+    onChange({ ...s, memo: truncated });
+  };
+
+  return (
+    <div style={{ padding: 10, background: COLOR.sageBg, borderRadius: 10, border: `1px solid ${COLOR.border}` }}>
+      {/* 통약/소분 토글 + ✕ 삭제 */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+        <div style={{ display: "inline-flex", borderRadius: 8, overflow: "hidden", border: `1px solid ${COLOR.sageLight}`, flexShrink: 0 }}>
+          <button type="button" onClick={() => setDispense("bottle")}
+            style={{
+              padding: "5px 10px", fontSize: 12, fontWeight: 700,
+              background: !isCompound ? COLOR.sageDeep : COLOR.white,
+              color: !isCompound ? COLOR.white : COLOR.sageDeep,
+              border: "none", cursor: "pointer",
+            }}>
+            통약
+          </button>
+          <button type="button" onClick={() => setDispense("compounded")}
+            style={{
+              padding: "5px 10px", fontSize: 12, fontWeight: 700,
+              background: isCompound ? COLOR.sageDeep : COLOR.white,
+              color: isCompound ? COLOR.white : COLOR.sageDeep,
+              border: "none", borderLeft: `1px solid ${COLOR.sageLight}`,
+              cursor: "pointer",
+            }}>
+            소분 조제약
+          </button>
+        </div>
+        <div style={{ flex: 1 }} />
+        <button type="button" onClick={onRemove} aria-label="삭제"
+          style={{ width: 28, height: 28, borderRadius: 6, background: "transparent", border: `1px solid ${COLOR.border}`, cursor: "pointer", color: COLOR.textMid, flexShrink: 0 }}>
+          ✕
+        </button>
+      </div>
+
+      {/* 이름 */}
+      <input type="text" value={s.name}
+        onChange={(e) => setField("name", e.target.value)}
+        placeholder="이름 (예: 비타민B군)"
+        style={{ width: "100%", padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, marginBottom: 6, boxSizing: "border-box" }} />
+
+      {/* 용량 + 설명 */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+        <input type="text" value={s.dosage}
+          onChange={(e) => setField("dosage", e.target.value)}
+          placeholder="용량 (예: 1정, 2포)"
+          style={{ flex: 1, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, minWidth: 0 }} />
+        <input type="text" value={s.timing}
+          onChange={(e) => setField("timing", e.target.value)}
+          placeholder="설명 (식후, 흔들어서)"
+          style={{ flex: 1.2, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, minWidth: 0 }} />
+      </div>
+
+      {/* 5칩 슬롯 — 통약·소분 공통. "기타" 포함 다중 선택. 칩 개수가 daily_count 자동 결정. */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6, alignItems: "center" }}>
+        {(["아침", "점심", "저녁", "취침 전", "기타"] as const).map((slot) => {
+          const checked = (s.time_slots ?? []).includes(slot);
+          return (
+            <button key={slot} type="button"
+              onClick={() => toggleSlot(slot)}
+              style={{
+                padding: "5px 10px", borderRadius: 100, fontSize: 12, fontWeight: 600,
+                background: checked ? COLOR.sageDeep : COLOR.white,
+                color: checked ? COLOR.white : COLOR.sageDeep,
+                border: `1px solid ${checked ? COLOR.sageDeep : COLOR.sageLight}`,
+                cursor: "pointer",
+              }}>
+              {checked ? "✓ " : ""}{slot}
+            </button>
+          );
+        })}
+        {(s.time_slots ?? []).includes("기타") && (
+          <input type="text" value={s.etc_note ?? ""}
+            onChange={(e) => setEtcNote(e.target.value)}
+            placeholder="예: 오전 11시"
+            maxLength={40}
+            style={{
+              width: 120, padding: "5px 10px",
+              borderRadius: 100,
+              border: `1px solid ${COLOR.sageLight}`,
+              fontSize: 12, outline: "none", background: COLOR.white,
+            }} />
+        )}
+      </div>
+
+      {/* 소분일 때만 약포지 안내 체크박스 */}
+      {isCompound && (
+        <label style={{
+          display: "flex", alignItems: "center", gap: 6,
+          fontSize: 13, color: COLOR.textMid,
+          marginBottom: 6, cursor: "pointer",
+        }}>
+          <input
+            type="checkbox"
+            checked={s.package_note ?? true}
+            onChange={(e) => setPackageNote(e.target.checked)}
+            style={{ width: 16, height: 16, accentColor: COLOR.sageDeep, cursor: "pointer" }}
+          />
+          &apos;약포지에 표시된 대로 복용하세요&apos; 안내 보내기
+        </label>
+      )}
+
+      {/* 하루 N회 + N일분 */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 13, color: COLOR.textMid }}>하루</span>
+          <input type="number" min={1} value={s.daily_count ?? ""}
+            onChange={(e) => setDailyCount(e.target.value)}
+            placeholder="1"
+            style={{ width: 64, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
+          <span style={{ fontSize: 13, color: COLOR.textMid }}>회</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <input type="number" min={1} value={s.days ?? ""}
+            onChange={(e) => setDays(e.target.value)}
+            placeholder="14"
+            style={{ width: 72, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
+          <span style={{ fontSize: 13, color: COLOR.textMid }}>일분</span>
+        </div>
+      </div>
+
+      {/* 메모 — placeholder 만 부모가 분기 (가이드: 환자에게 표시 / 구매 영양제: 약사만 봄) */}
+      <div style={{ marginTop: 8 }}>
+        <input type="text" value={s.memo ?? ""}
+          onChange={(e) => setMemo(e.target.value)}
+          placeholder={memoPlaceholder}
+          maxLength={200}
+          style={{
+            width: "100%", padding: "7px 10px",
+            borderRadius: 6, border: `1px solid ${COLOR.border}`,
+            fontSize: 13, outline: "none", background: COLOR.white,
+            boxSizing: "border-box",
+          }} />
+      </div>
+    </div>
+  );
+}
+
 function ScoreHearts({ score, onChange, size = 18 }: { score: number; onChange?: (v: number) => void; size?: number }) {
   const HEART = "M15 12 Q13 5 9 5 Q5 5 5 9 Q5 13 15 19 Q25 13 25 9 Q25 5 21 5 Q17 5 15 12Z";
   const fullHearts = Math.floor(score / 2);
@@ -667,6 +876,7 @@ function ChartContent() {
       weight_kg: number;
       weight_recorded_at: string;
       budget: string;
+      pharmacist_memo: string | null;
     }>,
   ): Promise<boolean> => {
     if (!chartRowId) return true; // Mock 모드 — 성공 처리
@@ -793,8 +1003,20 @@ function ChartContent() {
   /* ── 약사 메모 (환자 전체) ── */
   const [editingPharmacistMemo, setEditingPharmacistMemo] = useState(false);
   const [pharmacistMemoDraft, setPharmacistMemoDraft] = useState(patient.pharmacistMemo);
-  const savePharmacistMemo = () => {
-    setPatient((p) => ({ ...p, pharmacistMemo: pharmacistMemoDraft }));
+  const [isSavingMemo, setIsSavingMemo] = useState(false);
+  const savePharmacistMemo = async () => {
+    if (isSavingMemo) return; // 더블클릭 방지
+    const trimmed = pharmacistMemoDraft.trim();
+    setIsSavingMemo(true);
+    // 빈 문자열은 null 로 저장(검색·표시 일관성). chartRowId 없으면(Mock) persistChartUpdate 가 true 반환 → 로컬만.
+    const ok = await persistChartUpdate({ pharmacist_memo: trimmed || null });
+    setIsSavingMemo(false);
+    if (!ok) {
+      console.error("[chart] pharmacist_memo 저장 실패");
+      showChartToast("메모 저장 실패. 다시 시도해주세요");
+      return; // 편집 토글 유지 — 재시도 가능
+    }
+    setPatient((p) => ({ ...p, pharmacistMemo: trimmed }));
     setEditingPharmacistMemo(false);
   };
   const cancelPharmacistMemo = () => {
@@ -924,11 +1146,30 @@ function ChartContent() {
   const [expandedVisits, setExpandedVisits] = useState<Set<string>>(
     new Set(sortedVisits.slice(0, 1).map((v) => v.id))
   );
+  /* 가장 최근 방문 자동 펼침 — visits 비동기 로드 완료 후 1회만.
+   *  useState 초기값은 마운트 시 visits=[] 라 빈 Set 이 되므로, 로드 후 useEffect 로 보정.
+   *  ref 가드로 약사가 수동 토글한 뒤에는 다시 덮어쓰지 않음.
+   *  visits 가 비동기로 0→N 으로 채워질 때 첫 N>0 한 번만 발동. (3단계-B, 2026-05-28) */
+  const didAutoExpandLatestRef = useRef(false);
+  useEffect(() => {
+    if (didAutoExpandLatestRef.current) return;
+    if (sortedVisits.length === 0) return;
+    const latestId = sortedVisits[0].id;
+    setExpandedVisits((prev) => {
+      if (prev.has(latestId)) return prev;
+      const next = new Set(prev);
+      next.add(latestId);
+      return next;
+    });
+    didAutoExpandLatestRef.current = true;
+  }, [sortedVisits]);
 
   /* ── visit_records DB 로드 (consultation_id 기준) ── */
   const params = useParams();
   const consultationId = typeof params?.id === "string" ? params.id : null;
   const { user: authUser } = useAuth();
+  // 약사 페이지 접근 가드 — 비로그인/환자/면허없음 리다이렉트. checking=true 동안 본문 대신 로딩 화면.
+  const { checking, failed } = usePharmacistGuard();
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const isUuid = (s: string | null | undefined): s is string => !!s && UUID_RE.test(s);
 
@@ -1323,30 +1564,15 @@ function ChartContent() {
         if (error) console.error("[chart] visit_records update failed (non-fatal):", error);
       });
   };
-  /* 구매 영양제 추가 인풋 — visitId 단위로 한 카드만 추가 모드 활성화. */
-  const [addingProductVisitId, setAddingProductVisitId] = useState<string | null>(null);
-  const [newProductName, setNewProductName] = useState("");
-  const [newProductDosage, setNewProductDosage] = useState("");
-  const startAddProduct = (visitId: string) => {
-    setAddingProductVisitId(visitId);
-    setNewProductName("");
-    setNewProductDosage("");
+  /* 구매 영양제 — SupplementEditorCard 직접 인라인 편집(저장 버튼 없음). 빈 카드 추가/특정 인덱스 제거. */
+  const addProduct = (v: VisitRecord) => {
+    updateVisit(v.id, { products: [...v.products, { ...EMPTY_SUPP }] });
   };
-  const cancelAddProduct = () => {
-    setAddingProductVisitId(null);
-    setNewProductName("");
-    setNewProductDosage("");
+  const updateProductAt = (v: VisitRecord, idx: number, next: SupplementItem) => {
+    updateVisit(v.id, { products: v.products.map((p, j) => (j === idx ? next : p)) });
   };
-  const saveAddProduct = (v: VisitRecord) => {
-    const name = newProductName.trim();
-    if (!name) return;
-    const newItem: SupplementItem = { name, dosage: newProductDosage.trim(), timing: "" };
-    updateVisit(v.id, { products: [...v.products, newItem] });
-    cancelAddProduct();
-  };
-  const removeProduct = (v: VisitRecord, index: number) => {
-    const next = v.products.filter((_, i) => i !== index);
-    updateVisit(v.id, { products: next });
+  const removeProductAt = (v: VisitRecord, idx: number) => {
+    updateVisit(v.id, { products: v.products.filter((_, j) => j !== idx) });
   };
 
   const [editingDosageVisitId, setEditingDosageVisitId] = useState<string | null>(null);
@@ -1592,6 +1818,11 @@ function ChartContent() {
     showGuideSuccess(`복용 가이드를 ${sentPatientName}님께 보냈어요`);
   };
   const addGuideSupp = () => setGuideSupps((p) => [...p, { ...EMPTY_SUPP }]);
+  const removeGuideSupp = (i: number) => setGuideSupps((p) => p.filter((_, idx) => idx !== i));
+  /* ── 아래 헬퍼들은 SupplementEditorCard 내장 로직으로 흡수돼 외부에서 더 이상 호출되지 않음.
+   *    카드 추출 이전 로직 보존용으로 남겨둠 — 회귀 시 비교·복원 참조용. (1단계-C, 2026-05-28)
+   * ── */
+  /* eslint-disable @typescript-eslint/no-unused-vars */
   /** 영양제 행의 텍스트 필드(name/dosage/timing) 갱신. dispense_type/time_slots/days 는 전용 헬퍼 사용. */
   const updateGuideSupp = (i: number, f: "name" | "dosage" | "timing", v: string) =>
     setGuideSupps((p) => p.map((s, idx) => (idx === i ? { ...s, [f]: v } : s)));
@@ -1655,7 +1886,7 @@ function ChartContent() {
   /** 소분 조제약 "약포지에 표시된 대로 복용 안내 보내기" 체크박스 토글. */
   const setGuideSuppPackageNote = (i: number, checked: boolean) =>
     setGuideSupps((p) => p.map((s, idx) => (idx === i ? { ...s, package_note: checked } : s)));
-  const removeGuideSupp = (i: number) => setGuideSupps((p) => p.filter((_, idx) => idx !== i));
+  /* eslint-enable @typescript-eslint/no-unused-vars */
   /** 가이드 전체 종료일 = max(영양제별 days) 기준 자동 계산. 0/null 만 있으면 null. */
   const guideMaxDays = (() => {
     const ns = guideSupps.map((s) => s.days ?? 0).filter((d) => d > 0);
@@ -1714,6 +1945,40 @@ function ChartContent() {
   const sectionTitle: React.CSSProperties = {
     fontSize: 16, fontWeight: 700, color: COLOR.textDark, marginBottom: 14,
   };
+
+  // 판정 실패(재시도까지 소진) — 영구 "확인 중" 멈춤 대신 안내 + 새로고침.
+  if (failed) {
+    return (
+      <div style={{
+        minHeight: "60vh", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center",
+        fontFamily: "'Noto Sans KR', sans-serif",
+      }}>
+        <div style={{ fontSize: 15, color: "#3D4A42" }}>정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요.</div>
+        <button
+          type="button"
+          onClick={() => location.reload()}
+          style={{
+            marginTop: 16, padding: "10px 24px", borderRadius: 100,
+            background: "#4A6355", color: "#fff", fontSize: 14, fontWeight: 600,
+            border: "none", cursor: "pointer",
+          }}
+        >새로고침</button>
+      </div>
+    );
+  }
+
+  // 가드 통과 확정 전(로딩/리다이렉트 진행 중)에는 본문 대신 로딩 화면.
+  if (checking) {
+    return (
+      <div style={{
+        minHeight: "60vh", display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 15, color: "#3D4A42", fontFamily: "'Noto Sans KR', sans-serif",
+      }}>
+        확인 중…
+      </div>
+    );
+  }
 
   return (
     <>
@@ -2048,8 +2313,8 @@ function ChartContent() {
                   rows={4}
                   style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${COLOR.sageLight}`, fontSize: 14, color: COLOR.textDark, outline: "none", resize: "vertical", fontFamily: "'Noto Sans KR', sans-serif", boxSizing: "border-box", background: COLOR.white, lineHeight: 1.65 }} />
                 <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
-                  <button type="button" onClick={cancelPharmacistMemo} style={{ padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: "transparent", color: COLOR.textMid, border: `1px solid ${COLOR.border}`, cursor: "pointer" }}>취소</button>
-                  <button type="button" onClick={savePharmacistMemo} style={{ padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 700, background: COLOR.sageDeep, color: COLOR.white, border: "none", cursor: "pointer" }}>저장</button>
+                  <button type="button" onClick={cancelPharmacistMemo} disabled={isSavingMemo} style={{ padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 600, background: "transparent", color: COLOR.textMid, border: `1px solid ${COLOR.border}`, cursor: isSavingMemo ? "default" : "pointer", opacity: isSavingMemo ? 0.6 : 1 }}>취소</button>
+                  <button type="button" onClick={savePharmacistMemo} disabled={isSavingMemo} style={{ padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 700, background: isSavingMemo ? COLOR.sageLight : COLOR.sageDeep, color: COLOR.white, border: "none", cursor: isSavingMemo ? "default" : "pointer" }}>{isSavingMemo ? "저장 중..." : "저장"}</button>
                 </div>
               </>
             ) : (
@@ -2263,118 +2528,35 @@ function ChartContent() {
 
                       {isOpen && (
                         <div style={{ padding: "0 16px 16px", borderTop: "1px solid rgba(94,125,108,0.1)" }}>
-                          {/* 구매 영양제 — 표시 + [+ 추가] + 각 항목 [×] 삭제. 저장은 updateVisit({products}) 경로로 visit_records.purchased_supplements 영속화. */}
+                          {/* 구매 영양제 — SupplementEditorCard 인라인 편집(저장 버튼 없음, onChange→updateVisit로 즉시 영속화).
+                              메모는 placeholder만 "약사 메모 (선택) · 약사만 봄" 으로 분기(환자 비노출은 2단계: 가이드 복사 시 memo 비움 처리 예정). */}
                           <div style={{ paddingTop: 14 }}>
                             <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 8 }}>
                               구매 영양제
                             </div>
                             {v.products.length > 0 ? (
-                              v.products.map((p, i) => (
-                                <div
-                                  key={i}
-                                  style={{
-                                    padding: 16, borderRadius: 12,
-                                    background: "#EDF4F0",
-                                    marginBottom: 8,
-                                    display: "flex", alignItems: "flex-start", gap: 10,
-                                  }}
-                                >
-                                  <div style={{ flex: 1, minWidth: 0 }}>
-                                    <div style={{ fontSize: 15, fontWeight: 700, color: "#2C3630" }}>
-                                      {p.name}
-                                    </div>
-                                    {(p.dosage || p.timing) && (
-                                      <div style={{ fontSize: 14, marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                                        {p.dosage && <span style={{ fontWeight: 600, color: COLOR.terra }}>{p.dosage}</span>}
-                                        {p.timing && <span style={{ color: "#3D4A42" }}>{p.timing}</span>}
-                                      </div>
-                                    )}
-                                  </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => removeProduct(v, i)}
-                                    aria-label="영양제 삭제"
-                                    style={{
-                                      background: "transparent", border: "none",
-                                      color: "#9AA8A0", fontSize: 18, fontWeight: 600,
-                                      cursor: "pointer", padding: 4, lineHeight: 1,
-                                      flexShrink: 0,
-                                    }}
-                                  >×</button>
-                                </div>
-                              ))
+                              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
+                                {v.products.map((p, idx) => (
+                                  <SupplementEditorCard
+                                    key={idx}
+                                    value={p}
+                                    onChange={(next) => updateProductAt(v, idx, next)}
+                                    onRemove={() => removeProductAt(v, idx)}
+                                    memoPlaceholder="약사 메모 (선택) · 약사만 봄"
+                                  />
+                                ))}
+                              </div>
                             ) : (
                               <div style={{ fontSize: 14, color: "#3D4A42", marginBottom: 8 }}>등록된 영양제 없음</div>
                             )}
-                            {addingProductVisitId === v.id ? (
-                              <div style={{
-                                marginTop: v.products.length > 0 ? 0 : 0,
-                                padding: 14, borderRadius: 12, background: "#F8F9F7",
-                                border: `1px dashed ${COLOR.sageLight}`,
-                                display: "flex", flexDirection: "column", gap: 8,
-                              }}>
-                                <input
-                                  type="text"
-                                  autoFocus
-                                  value={newProductName}
-                                  onChange={(e) => setNewProductName(e.target.value)}
-                                  placeholder="영양제 이름 (필수)"
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") saveAddProduct(v);
-                                    if (e.key === "Escape") cancelAddProduct();
-                                  }}
-                                  style={{
-                                    padding: "10px 12px", borderRadius: 8,
-                                    border: `1.5px solid ${COLOR.sageLight}`,
-                                    fontSize: 14, color: "#2C3630", outline: "none",
-                                    fontFamily: "'Noto Sans KR', sans-serif",
-                                  }}
-                                />
-                                <input
-                                  type="text"
-                                  value={newProductDosage}
-                                  onChange={(e) => setNewProductDosage(e.target.value)}
-                                  placeholder="용량·메모 (선택)"
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") saveAddProduct(v);
-                                    if (e.key === "Escape") cancelAddProduct();
-                                  }}
-                                  style={{
-                                    padding: "10px 12px", borderRadius: 8,
-                                    border: `1.5px solid ${COLOR.sageLight}`,
-                                    fontSize: 14, color: "#2C3630", outline: "none",
-                                    fontFamily: "'Noto Sans KR', sans-serif",
-                                  }}
-                                />
-                                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                                  <button type="button" onClick={cancelAddProduct} style={{
-                                    padding: "8px 16px", borderRadius: 6,
-                                    fontSize: 14, fontWeight: 600,
-                                    background: "transparent", color: "#3D4A42",
-                                    border: `1px solid ${COLOR.border}`, cursor: "pointer",
-                                    fontFamily: "'Noto Sans KR', sans-serif",
-                                  }}>취소</button>
-                                  <button type="button" onClick={() => saveAddProduct(v)} disabled={!newProductName.trim()} style={{
-                                    padding: "8px 16px", borderRadius: 6,
-                                    fontSize: 14, fontWeight: 700,
-                                    background: COLOR.sageDeep, color: "#fff",
-                                    border: "none",
-                                    cursor: newProductName.trim() ? "pointer" : "not-allowed",
-                                    opacity: newProductName.trim() ? 1 : 0.5,
-                                    fontFamily: "'Noto Sans KR', sans-serif",
-                                  }}>저장</button>
-                                </div>
-                              </div>
-                            ) : (
-                              <button type="button" onClick={() => startAddProduct(v.id)} style={{
-                                width: "100%", padding: "10px",
-                                borderRadius: 10, background: "#fff",
-                                border: `1px dashed ${COLOR.sageLight}`,
-                                color: COLOR.sageDeep, fontSize: 14, fontWeight: 600,
-                                cursor: "pointer", minHeight: 44,
-                                fontFamily: "'Noto Sans KR', sans-serif",
-                              }}>+ 영양제 추가</button>
-                            )}
+                            <button type="button" onClick={() => addProduct(v)} style={{
+                              width: "100%", padding: "10px",
+                              borderRadius: 10, background: "#fff",
+                              border: `1px dashed ${COLOR.sageLight}`,
+                              color: COLOR.sageDeep, fontSize: 14, fontWeight: 600,
+                              cursor: "pointer", minHeight: 44,
+                              fontFamily: "'Noto Sans KR', sans-serif",
+                            }}>+ 영양제 추가</button>
                           </div>
 
                           <div style={dividerStyle} />
@@ -3079,142 +3261,16 @@ function ChartContent() {
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 10 }}>
-                {guideSupps.map((s, i) => {
-                  const isCompound = s.dispense_type === "compounded";
-                  return (
-                  <div key={i} style={{ padding: 10, background: COLOR.sageBg, borderRadius: 10, border: `1px solid ${COLOR.border}` }}>
-                    {/* 통약/소분 토글 + ✕ 삭제 */}
-                    <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
-                      <div style={{ display: "inline-flex", borderRadius: 8, overflow: "hidden", border: `1px solid ${COLOR.sageLight}`, flexShrink: 0 }}>
-                        <button type="button" onClick={() => setGuideSuppDispense(i, "bottle")}
-                          style={{
-                            padding: "5px 10px", fontSize: 12, fontWeight: 700,
-                            background: !isCompound ? COLOR.sageDeep : COLOR.white,
-                            color: !isCompound ? COLOR.white : COLOR.sageDeep,
-                            border: "none", cursor: "pointer",
-                          }}>
-                          통약
-                        </button>
-                        <button type="button" onClick={() => setGuideSuppDispense(i, "compounded")}
-                          style={{
-                            padding: "5px 10px", fontSize: 12, fontWeight: 700,
-                            background: isCompound ? COLOR.sageDeep : COLOR.white,
-                            color: isCompound ? COLOR.white : COLOR.sageDeep,
-                            border: "none", borderLeft: `1px solid ${COLOR.sageLight}`,
-                            cursor: "pointer",
-                          }}>
-                          소분 조제약
-                        </button>
-                      </div>
-                      <div style={{ flex: 1 }} />
-                      <button type="button" onClick={() => removeGuideSupp(i)} aria-label="삭제"
-                        style={{ width: 28, height: 28, borderRadius: 6, background: "transparent", border: `1px solid ${COLOR.border}`, cursor: "pointer", color: COLOR.textMid, flexShrink: 0 }}>
-                        ✕
-                      </button>
-                    </div>
-
-                    {/* 이름 input */}
-                    <input type="text" value={s.name}
-                      onChange={(e) => updateGuideSupp(i, "name", e.target.value)}
-                      placeholder="이름 (예: 비타민B군)"
-                      style={{ width: "100%", padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, marginBottom: 6, boxSizing: "border-box" }} />
-
-                    {/* 용량 + 부가 설명 — 통약·소분 공통. 소분은 기본값 "1포"로 채워져 있고 수정 가능. */}
-                    <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-                      <input type="text" value={s.dosage}
-                        onChange={(e) => updateGuideSupp(i, "dosage", e.target.value)}
-                        placeholder="용량 (예: 1정, 2포)"
-                        style={{ flex: 1, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, minWidth: 0 }} />
-                      <input type="text" value={s.timing}
-                        onChange={(e) => updateGuideSupp(i, "timing", e.target.value)}
-                        placeholder="설명 (식후, 흔들어서)"
-                        style={{ flex: 1.2, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white, minWidth: 0 }} />
-                    </div>
-
-                    {/* 5칩 슬롯 체크박스 — 통약·소분 공통. "기타" 포함 다중 선택. 칩 개수가 daily_count 자동 결정. */}
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6, alignItems: "center" }}>
-                      {(["아침", "점심", "저녁", "취침 전", "기타"] as const).map((slot) => {
-                        const checked = (s.time_slots ?? []).includes(slot);
-                        return (
-                          <button key={slot} type="button"
-                            onClick={() => toggleGuideSuppSlot(i, slot)}
-                            style={{
-                              padding: "5px 10px", borderRadius: 100, fontSize: 12, fontWeight: 600,
-                              background: checked ? COLOR.sageDeep : COLOR.white,
-                              color: checked ? COLOR.white : COLOR.sageDeep,
-                              border: `1px solid ${checked ? COLOR.sageDeep : COLOR.sageLight}`,
-                              cursor: "pointer",
-                            }}>
-                            {checked ? "✓ " : ""}{slot}
-                          </button>
-                        );
-                      })}
-                      {/* "기타" 선택 시 짧은 설명 input */}
-                      {(s.time_slots ?? []).includes("기타") && (
-                        <input type="text" value={s.etc_note ?? ""}
-                          onChange={(e) => setGuideSuppEtcNote(i, e.target.value)}
-                          placeholder="예: 오전 11시"
-                          maxLength={40}
-                          style={{
-                            width: 120, padding: "5px 10px",
-                            borderRadius: 100,
-                            border: `1px solid ${COLOR.sageLight}`,
-                            fontSize: 12, outline: "none", background: COLOR.white,
-                          }} />
-                      )}
-                    </div>
-
-                    {isCompound && (
-                      <label style={{
-                        display: "flex", alignItems: "center", gap: 6,
-                        fontSize: 13, color: COLOR.textMid,
-                        marginBottom: 6, cursor: "pointer",
-                      }}>
-                        <input
-                          type="checkbox"
-                          checked={s.package_note ?? true}
-                          onChange={(e) => setGuideSuppPackageNote(i, e.target.checked)}
-                          style={{ width: 16, height: 16, accentColor: COLOR.sageDeep, cursor: "pointer" }}
-                        />
-                        '약포지에 표시된 대로 복용하세요' 안내 보내기
-                      </label>
-                    )}
-
-                    {/* 하루 횟수 + 일수 나란히 */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span style={{ fontSize: 13, color: COLOR.textMid }}>하루</span>
-                        <input type="number" min={1} value={s.daily_count ?? ""}
-                          onChange={(e) => setGuideSuppDailyCount(i, e.target.value)}
-                          placeholder="1"
-                          style={{ width: 64, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
-                        <span style={{ fontSize: 13, color: COLOR.textMid }}>회</span>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <input type="number" min={1} value={s.days ?? ""}
-                          onChange={(e) => setGuideSuppDays(i, e.target.value)}
-                          placeholder="14"
-                          style={{ width: 72, padding: "7px 10px", borderRadius: 6, border: `1px solid ${COLOR.border}`, fontSize: 14, outline: "none", background: COLOR.white }} />
-                        <span style={{ fontSize: 13, color: COLOR.textMid }}>일분</span>
-                      </div>
-                    </div>
-
-                    {/* 영양제별 메모 — 환자에게도 표시. 200자 제한. */}
-                    <div style={{ marginTop: 8 }}>
-                      <input type="text" value={s.memo ?? ""}
-                        onChange={(e) => setGuideSuppMemo(i, e.target.value)}
-                        placeholder="메모 (선택) · 주의·참고사항 (환자에게 표시됩니다)"
-                        maxLength={200}
-                        style={{
-                          width: "100%", padding: "7px 10px",
-                          borderRadius: 6, border: `1px solid ${COLOR.border}`,
-                          fontSize: 13, outline: "none", background: COLOR.white,
-                          boxSizing: "border-box",
-                        }} />
-                    </div>
-                  </div>
-                  );
-                })}
+                {guideSupps.map((s, i) => (
+                  <SupplementEditorCard
+                    key={i}
+                    value={s}
+                    onChange={(next) =>
+                      setGuideSupps((arr) => arr.map((x, j) => (j === i ? next : x)))
+                    }
+                    onRemove={() => removeGuideSupp(i)}
+                  />
+                ))}
               </div>
               <button type="button" onClick={addGuideSupp}
                 style={{ width: "100%", padding: "8px 0", borderRadius: 8, fontSize: 13, fontWeight: 600, background: COLOR.sagePale, color: COLOR.sageDeep, border: `1px dashed ${COLOR.sageLight}`, cursor: "pointer", marginBottom: 18 }}>

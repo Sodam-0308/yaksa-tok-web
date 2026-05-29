@@ -494,6 +494,8 @@ function MypageContent() {
   const [showAllUpcoming, setShowAllUpcoming] = useState(false);
   /** 지난 방문 영역 접힘/펼침. 기본 접힘. */
   const [showPast, setShowPast] = useState(false);
+  /** 지난 방문 페이지네이션 — 5건씩, 0-base 페이지 인덱스. 접었다 펼치면 0으로 리셋. */
+  const [pastVisitPage, setPastVisitPage] = useState(0);
   const loadVisits = useCallback(async () => {
     if (!user) {
       setUpcomingVisits([]);
@@ -1931,6 +1933,17 @@ function MypageContent() {
           };
           const visibleUpcoming = showAllUpcoming ? upcomingVisits : upcomingVisits.slice(0, 2);
           const hiddenUpcomingCount = Math.max(upcomingVisits.length - 2, 0);
+          // 지난 방문 — 최신순 정렬(원본 미변형). 키: 완료면 visited_date, 없으면 scheduled_date. YYYY-MM-DD 사전순=날짜순.
+          //   Array.sort 는 안정 정렬이라 같은 날짜는 기존 순서 유지.
+          const PAST_VISIT_PER_PAGE = 5;
+          const pastVisitKey = (v: NextVisit): string =>
+            (v.status === "completed" && v.visited_date) ? v.visited_date : v.scheduled_date;
+          const sortedPastVisits = [...pastVisits].sort((a, b) => pastVisitKey(b).localeCompare(pastVisitKey(a)));
+          const pastTotalPages = Math.ceil(sortedPastVisits.length / PAST_VISIT_PER_PAGE);
+          const pagedPastVisits = sortedPastVisits.slice(
+            pastVisitPage * PAST_VISIT_PER_PAGE,
+            pastVisitPage * PAST_VISIT_PER_PAGE + PAST_VISIT_PER_PAGE,
+          );
           return (
             <section className="my-section">
               <h2 className="my-section-title">방문 일정</h2>
@@ -2050,7 +2063,7 @@ function MypageContent() {
                 <div style={{ marginTop: upcomingVisits.length > 0 ? 16 : 0 }}>
                   <button
                     type="button"
-                    onClick={() => setShowPast((v) => !v)}
+                    onClick={() => { setShowPast((v) => !v); setPastVisitPage(0); }}
                     style={{
                       width: "100%",
                       padding: "10px 14px", borderRadius: 10,
@@ -2069,7 +2082,7 @@ function MypageContent() {
                   </button>
                   {showPast && (
                     <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
-                      {pastVisits.map((v) => {
+                      {pagedPastVisits.map((v) => {
                         // 노쇼 = scheduled 인데 예정일이 지나서 past 로 분류된 row.
                         //   환자 부담 최소화 정책으로 배지/문구 없이 카드 자체만 흐리게 처리(ChatClient cancelled 카드 톤 참고).
                         const isNoShow = v.status !== "completed";
@@ -2108,6 +2121,40 @@ function MypageContent() {
                         </div>
                         );
                       })}
+                      {pastTotalPages > 1 && (
+                        <div style={{
+                          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                          marginTop: 4,
+                        }}>
+                          <button
+                            type="button"
+                            onClick={() => setPastVisitPage((p) => Math.max(p - 1, 0))}
+                            disabled={pastVisitPage === 0}
+                            aria-label="이전 페이지"
+                            style={{
+                              background: "none", border: "none", padding: "6px 18px",
+                              fontSize: 26, lineHeight: 1,
+                              color: pastVisitPage === 0 ? "#B3CCBE" : "#5E7D6C",
+                              cursor: pastVisitPage === 0 ? "default" : "pointer",
+                            }}
+                          >‹</button>
+                          <span style={{ fontSize: 14, color: "#3D4A42", fontFamily: "'Noto Sans KR', sans-serif" }}>
+                            {pastVisitPage + 1} / {pastTotalPages}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setPastVisitPage((p) => Math.min(p + 1, pastTotalPages - 1))}
+                            disabled={pastVisitPage >= pastTotalPages - 1}
+                            aria-label="다음 페이지"
+                            style={{
+                              background: "none", border: "none", padding: "6px 18px",
+                              fontSize: 26, lineHeight: 1,
+                              color: pastVisitPage >= pastTotalPages - 1 ? "#B3CCBE" : "#5E7D6C",
+                              cursor: pastVisitPage >= pastTotalPages - 1 ? "default" : "pointer",
+                            }}
+                          >›</button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

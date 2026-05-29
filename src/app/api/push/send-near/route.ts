@@ -177,7 +177,18 @@ async function runSendNear(): Promise<RunResult> {
   return result;
 }
 
-export async function POST() {
+export async function POST(req: Request) {
+  // 보호 게이트 — CRON_SECRET Bearer 토큰 검증. 미설정 시 무인증 통과 금지(500).
+  const expected = process.env.CRON_SECRET;
+  if (!expected) {
+    return NextResponse.json({ error: "CRON_SECRET not configured" }, { status: 500 });
+  }
+  const auth = req.headers.get("authorization") ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  if (token !== expected) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+
   try {
     const result = await runSendNear();
     return NextResponse.json(result, { status: 200 });
@@ -186,10 +197,4 @@ export async function POST() {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });
   }
-}
-
-/** ⚠️ 임시 테스트용 — 배포 전 GET 제거 또는 토큰/관리자 보호 필요.
- *  브라우저 주소창에서 GET 한 번에 트리거 가능. */
-export async function GET() {
-  return POST();
 }

@@ -14,6 +14,7 @@ import {
   hoursOfLastPatientMsg,
   needsUrgentReply,
   needsAcceptUrgent,
+  upsertChartMemo,
 } from "@/lib/pharmacistConsults";
 import {
   type FilterKey,
@@ -701,6 +702,7 @@ function PatientCard({
   chatOpen,
   onAccept,
   onReject,
+  onMemoSaved,
 }: {
   data: PatientConsult;
   expanded: boolean;
@@ -709,23 +711,75 @@ function PatientCard({
   chatOpen: boolean;
   onAccept: (id: string) => void;
   onReject: (id: string) => void;
+  onMemoSaved: (memo: string) => void;
 }) {
   const router = useRouter();
-  const [memo, setMemo] = useState(data.memo ?? "");
-  const [showMemo, setShowMemo] = useState(false);
+  const { user: authUser } = useAuth();
   const statusCfg = PATIENT_STATUS_CONFIG[data.patientStatus];
-  const showStatusBadge = data.patientStatus !== "inactive" && !data.isRejected;
   const relationTag = getRelationTag(data);
   const isOverConsult = relationTag === "over";
   const age = new Date().getFullYear() - data.birthYear;
   const isRequested = data.patientStatus === "requested" && !data.isRejected;
   const isUrgent = needsUrgentReply(data);         // managing + 24h (답장 필요)
   const isAcceptUrgent = needsAcceptUrgent(data);  // requested + 24h (수락 필요)
-  const [freeTextExpanded, setFreeTextExpanded] = useState(false);
   const [rejectionHistoryExpanded, setRejectionHistoryExpanded] = useState(false);
+  // 약사 메모 — 차트(pharmacist_charts.pharmacist_memo)와 단일 소스. data.memo = 표시값/편집 시작값.
+  const [editingMemo, setEditingMemo] = useState(false);
+  const [draftMemo, setDraftMemo] = useState(data.memo ?? "");
+  const [isSavingMemo, setIsSavingMemo] = useState(false);
+  const saveMemo = async () => {
+    if (isSavingMemo) return;
+    if (!authUser) { alert("로그인이 필요합니다"); return; }
+    const normalized = draftMemo.trim() || null;
+    setIsSavingMemo(true);
+    const { error } = await upsertChartMemo(supabase, {
+      pharmacistId: authUser.id,
+      consultationId: data.id,
+      patientId: data.patientId ?? null,
+      patientName: data.patientName,
+      memo: normalized,
+    });
+    setIsSavingMemo(false);
+    if (error) {
+      console.error("[dashboard] 메모 저장 실패:", error);
+      alert("메모 저장 실패");
+      return; // 편집 모드 유지 — 재시도 가능
+    }
+    onMemoSaved(normalized ?? "");
+    setEditingMemo(false);
+  };
   const hasPrevRejections = (data.previousRejections?.length ?? 0) > 0;
 
   const badgeIsApp = data.hasAppAccount;
+
+  // 펼침 "해야 할 일" 신호 배지 — 접힌 헤더에서 옮겨온 7종(+거절). 공통 pill 스타일.
+  const signalPillBase: React.CSSProperties = {
+    display: "inline-flex", alignItems: "center", gap: 4,
+    height: 28, padding: "0 10px", borderRadius: 14,
+    fontSize: 13, fontWeight: 600, lineHeight: 1,
+    whiteSpace: "nowrap", cursor: "default", boxSizing: "border-box",
+  };
+  const noShowMd = (() => {
+    if (!data.noShowDate) return "";
+    const m = data.noShowDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    return m ? `${Number(m[2])}/${Number(m[3])}` : "";
+  })();
+  const hasAnySignal =
+    isRequested ||
+    (!!data.isMedEndingSoon && !data.isRejected) ||
+    (!!data.isNoShow && !data.isRejected) ||
+    (!!data.needsPurchaseList && !data.isRejected) ||
+    (!!data.needsDosageGuide && !data.isRejected) ||
+    data.unreadCount > 0 ||
+    !!data.isRejected;
+
+  // 접힘 신호 아이콘 — 복용중 칩 우측에 이어 붙임. 펼침 그룹과 같은 신호(사후관리 제외), 이모지+짧은 숫자/날짜만.
+  //   복용 임박(💊)과 복용법 발송(💊)은 같은 이모지라 색으로 분리: 임박=terra, 발송=sage.
+  const iconPillBase: React.CSSProperties = {
+    display: "inline-flex", alignItems: "center", gap: 2,
+    padding: "1px 6px", borderRadius: 999, fontSize: 12, fontWeight: 600,
+    lineHeight: 1.5, whiteSpace: "nowrap", flexShrink: 0, cursor: "default",
+  };
 
   // 펼침 직후 카드가 뷰포트에 들어오게 스크롤(접을 땐 이동 안 함).
   //   rAF 로 한 프레임 미뤄야 펼친 본문이 DOM 에 들어간 뒤 정확한 위치로 스크롤.
@@ -763,58 +817,10 @@ function PatientCard({
             {data.consultType === "remote" && (
               <span className="dash-badge-remote" style={{ lineHeight: 1.5, flexShrink: 0 }}>원격</span>
             )}
-            {showStatusBadge && (
-              <StatusBadge
-                emoji={statusCfg.emoji}
-                tooltip={statusCfg.label}
-                bg={statusCfg.bg}
-              />
-            )}
-            {data.isRejected && (
-              <StatusBadge
-                emoji="❌"
-                tooltip={`거절됨 - ${data.rejectedReason ?? ""}`}
-                bg="#FFE5E5"
-              />
-            )}
-            {data.isNoShow && !data.isRejected && (() => {
-              // 미방문 라벨 — ⚠️ + "미방문 M/D" 글자(모바일 title 안 뜨는 환경 대비, 항상 가시).
-              //   noShowDate 없으면 "미방문" 만. 톤은 기존 주황(⚠️ 배경 #FFF0E6)에 글자색 #E05A1A.
-              const mdShort = (() => {
-                if (!data.noShowDate) return "";
-                const m = data.noShowDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-                if (!m) return "";
-                return `${Number(m[2])}/${Number(m[3])}`;
-              })();
-              const label = mdShort ? `미방문 ${mdShort}` : "미방문";
-              return (
-                <span
-                  style={{
-                    display: "inline-flex", alignItems: "center", gap: 4,
-                    height: 28, padding: "0 10px", borderRadius: 14,
-                    background: "#FFF0E6", color: "#E05A1A",
-                    fontSize: 13, fontWeight: 600, lineHeight: 1,
-                    whiteSpace: "nowrap", flexShrink: 0, cursor: "default",
-                    boxSizing: "border-box",
-                  }}
-                >
-                  <span aria-hidden style={{ fontSize: 14 }}>⚠️</span>
-                  <span>{label}</span>
-                </span>
-              );
-            })()}
           </div>
           {/* 오른쪽 */}
           <div style={{ display: "inline-flex", alignItems: "center", gap: 8, flexShrink: 0, marginLeft: 12 }}>
             <span style={{ fontSize: 13, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap", lineHeight: 1.5 }}>마지막 대화: {data.lastMessageAt}</span>
-            {data.unreadCount > 0 && (
-              <span
-                className="dash-unread-badge"
-                style={{ flexShrink: 0, ...getUnreadBadgeStyle(hoursOfLastPatientMsg(data)) }}
-              >
-                {data.unreadCount}
-              </span>
-            )}
           </div>
         </div>
         {/* ⚠️ 거절 이력 경고 배너 (접힘/펼침 공통, 이름 줄 아래) */}
@@ -833,8 +839,8 @@ function PatientCard({
         )}
         {/* ── 하단 줄: 좌(복용+태그) / 우(방문일) ── */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          {/* 왼쪽 — 복용 중인 환자에게만 복용 뱃지 표시. 증상 태그는 펼침으로 이동(접힌 카드 단순화). */}
-          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "nowrap", flex: 1, minWidth: 0, overflow: "hidden" }}>
+          {/* 왼쪽 — 복용중 칩 + 신호 아이콘 줄(같은 row, 줄바꿈 허용). 아이콘 분기는 칩 조건 밖이라 미복용 환자도 노출. */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap", flex: 1, minWidth: 0, overflow: "visible" }}>
             {data.supplementStatus === "taking" && (
               <span style={{
                 display: "inline-block", padding: "4px 10px", borderRadius: 12, fontSize: 13, fontWeight: 500, lineHeight: "18px",
@@ -844,24 +850,40 @@ function PatientCard({
                 복용 중
               </span>
             )}
+            {isRequested && (
+              <span title="새 상담 요청" style={{ ...iconPillBase, background: statusCfg.bg, color: statusCfg.color }}>🔔</span>
+            )}
+            {data.isMedEndingSoon && (
+              <span title="복용 임박" style={{ ...iconPillBase, background: "#F5E6DC", color: "#C06B45" }}>
+                💊{data.minRemainingDays != null ? ` D-${data.minRemainingDays}` : ""}
+              </span>
+            )}
+            {data.isNoShow && (
+              <span title="미방문" style={{ ...iconPillBase, background: "#FFF0E6", color: "#E05A1A" }}>
+                ⚠️{noShowMd ? ` ${noShowMd}` : ""}
+              </span>
+            )}
+            {data.needsPurchaseList && (
+              <span title="구매내역 작성" style={{ ...iconPillBase, background: "#F5E6DC", color: "#C06B45" }}>📝</span>
+            )}
+            {data.needsDosageGuide && (
+              <span title="복용법 발송" style={{ ...iconPillBase, background: "#EDF4F0", color: "#4A6355" }}>💊</span>
+            )}
+            {data.unreadCount > 0 && (
+              <span title="새 메시지" style={{ ...iconPillBase, ...getUnreadBadgeStyle(hoursOfLastPatientMsg(data)) }}>
+                💬 {data.unreadCount}
+              </span>
+            )}
+            {data.isRejected && (
+              <span title="거절" style={{ ...iconPillBase, background: "#FFE5E5", color: "#D32F2F" }}>❌</span>
+            )}
           </div>
-          {/* 오른쪽 — 거절 / 방문 예정+"방문 전" / 최근 방문+"구매 영양제: 없음" */}
+          {/* 오른쪽 — 거절 / 최근 방문 (방문 예정 라벨은 펼침 신호 그룹으로 이동) */}
           <div style={{ flexShrink: 0, marginLeft: 12, textAlign: "right" }}>
             {data.isRejected ? (
               <span style={{ fontSize: 13, color: "#D32F2F", fontWeight: 600, whiteSpace: "nowrap" }}>
                 거절: {data.rejectedAt?.slice(5).replace(".", "/")}
               </span>
-            ) : data.nextVisitDate ? (
-              <>
-                <div style={{ fontSize: 14, color: "var(--sage-deep, #4A6355)", fontWeight: 600, whiteSpace: "nowrap" }}>
-                  🗓️ 방문 예정: {data.nextVisitDate.slice(5).replace(".", "/")}
-                </div>
-                {!data.visitDate && (
-                  <div style={{ fontSize: 13, color: "#3D4A42", whiteSpace: "nowrap", marginTop: 2 }}>
-                    방문 전
-                  </div>
-                )}
-              </>
             ) : data.visitDate ? (
               <div style={{ fontSize: 14, color: "var(--text-mid, #3D4A42)", whiteSpace: "nowrap" }}>
                 최근 방문: {data.visitDate.slice(5).replace(".", "/")}
@@ -895,6 +917,58 @@ function PatientCard({
                   ? "환자가 24시간 이상 수락을 기다리고 있어요"
                   : "환자가 24시간 이상 답변을 기다리고 있어요"}
               </span>
+            </div>
+          )}
+
+          {/* 해야 할 일 — 접힌 헤더에서 옮겨온 신호 배지 7종(+거절).
+              환자에게 해당하는 것만, 여러 개 동시 노출. 0개면 섹션 전체 미렌더. */}
+          {hasAnySignal && (
+            <div className="dash-detail-section">
+              <div className="dash-detail-title">해야 할 일</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {isRequested && (
+                  <span style={{ ...signalPillBase, background: statusCfg.bg, color: statusCfg.color }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>🔔</span>
+                    <span>새 상담 요청</span>
+                  </span>
+                )}
+                {data.isMedEndingSoon && !data.isRejected && (
+                  <span style={{ ...signalPillBase, background: "#F5E6DC", color: "#C06B45" }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>💊</span>
+                    <span>복용 임박{data.minRemainingDays != null ? ` D-${data.minRemainingDays}` : ""}</span>
+                  </span>
+                )}
+                {data.isNoShow && !data.isRejected && (
+                  <span style={{ ...signalPillBase, background: "#FFF0E6", color: "#E05A1A" }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>⚠️</span>
+                    <span>{noShowMd ? `미방문 ${noShowMd}` : "미방문"}</span>
+                  </span>
+                )}
+                {data.needsPurchaseList && !data.isRejected && (
+                  <span style={{ ...signalPillBase, background: "#F5E6DC", color: "#C06B45" }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>📝</span>
+                    <span>구매내역 작성</span>
+                  </span>
+                )}
+                {data.needsDosageGuide && !data.isRejected && (
+                  <span style={{ ...signalPillBase, background: "#F5E6DC", color: "#C06B45" }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>💊</span>
+                    <span>복용법 발송</span>
+                  </span>
+                )}
+                {data.unreadCount > 0 && (
+                  <span style={{ ...signalPillBase, ...getUnreadBadgeStyle(hoursOfLastPatientMsg(data)) }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>💬</span>
+                    <span>새 메시지 {data.unreadCount}</span>
+                  </span>
+                )}
+                {data.isRejected && (
+                  <span style={{ ...signalPillBase, background: "#FFE5E5", color: "#D32F2F" }}>
+                    <span aria-hidden style={{ fontSize: 14 }}>❌</span>
+                    <span>거절</span>
+                  </span>
+                )}
+              </div>
             </div>
           )}
           {/* 첫 상담 날짜 */}
@@ -1001,42 +1075,6 @@ function PatientCard({
             </div>
           )}
 
-          {/* 자유 서술 (펼침 가능) */}
-          <div className="dash-detail-section">
-            <div className="dash-detail-title">자유 서술</div>
-            <div
-              style={{
-                fontSize: 14, color: "#2C3630",
-                ...(freeTextExpanded
-                  ? { wordBreak: "break-word" as const }
-                  : {
-                      overflow: "hidden",
-                      display: "-webkit-box",
-                      WebkitLineClamp: 2,
-                      WebkitBoxOrient: "vertical" as const,
-                      wordBreak: "break-word" as const,
-                    }),
-              }}
-            >
-              {data.freeText}
-            </div>
-            {(data.freeText.length > 60 || data.freeText.includes("\n")) && (
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); setFreeTextExpanded((v) => !v); }}
-                style={{
-                  marginTop: 4, padding: "2px 0",
-                  fontSize: 14, fontWeight: 600,
-                  color: "#5E7D6C",
-                  background: "none", border: "none",
-                  cursor: "pointer", fontFamily: "'Noto Sans KR', sans-serif",
-                }}
-              >
-                {freeTextExpanded ? "접기" : "더 보기"}
-              </button>
-            )}
-          </div>
-
           {/* 최근 방문 (날짜 + 구매 영양제 통합) */}
           {data.visitDate && (
             <div className="dash-detail-section">
@@ -1053,25 +1091,71 @@ function PatientCard({
             </div>
           )}
 
-          {/* 약사 메모 */}
+          {/* 약사 메모 — 차트(pharmacist_charts.pharmacist_memo)와 단일 소스. 편집/보기 토글. */}
           <div className="dash-detail-section">
-            <div className="dash-detail-title">
-              내 메모
-              <button className="dash-memo-toggle" onClick={() => setShowMemo(!showMemo)}>
-                {showMemo ? "접기" : "작성"}
-              </button>
+            <div className="dash-detail-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span>내 메모</span>
+              {!editingMemo && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setDraftMemo(data.memo ?? ""); setEditingMemo(true); }}
+                  style={{
+                    padding: "4px 12px", borderRadius: 6, fontSize: 13, fontWeight: 600,
+                    background: "#fff", color: "var(--sage-deep, #4A6355)",
+                    border: "1px solid var(--sage-light, #B3CCBE)", cursor: "pointer",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >수정</button>
+              )}
             </div>
-            {showMemo && (
-              <textarea
-                className="dash-memo-input"
-                placeholder="환자에게 보이지 않는 내부 메모입니다."
-                value={memo}
-                onChange={(e) => setMemo(e.target.value)}
-                rows={3}
-              />
-            )}
-            {!showMemo && memo && (
-              <div className="dash-memo-preview">{memo}</div>
+            {editingMemo ? (
+              <div>
+                <textarea
+                  value={draftMemo}
+                  onChange={(e) => setDraftMemo(e.target.value)}
+                  placeholder="환자에게 보이지 않는 내부 메모입니다."
+                  rows={4}
+                  style={{
+                    width: "100%", padding: "10px 12px", borderRadius: 8,
+                    border: "1.5px solid var(--sage-light, #B3CCBE)", fontSize: 14,
+                    color: "var(--text-dark, #2C3630)", outline: "none", resize: "vertical",
+                    fontFamily: "'Noto Sans KR', sans-serif", boxSizing: "border-box",
+                    background: "#fff", lineHeight: 1.65,
+                  }}
+                />
+                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); setEditingMemo(false); }}
+                    disabled={isSavingMemo}
+                    style={{
+                      padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 600,
+                      background: "transparent", color: "var(--text-mid, #3D4A42)",
+                      border: "1px solid var(--border, rgba(94,125,108,0.14))",
+                      cursor: isSavingMemo ? "default" : "pointer", opacity: isSavingMemo ? 0.6 : 1,
+                    }}
+                  >취소</button>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); saveMemo(); }}
+                    disabled={isSavingMemo}
+                    style={{
+                      padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 700,
+                      background: isSavingMemo ? "var(--sage-light, #B3CCBE)" : "var(--sage-deep, #4A6355)",
+                      color: "#fff", border: "none", cursor: isSavingMemo ? "default" : "pointer",
+                    }}
+                  >{isSavingMemo ? "저장 중..." : "저장"}</button>
+                </div>
+              </div>
+            ) : (
+              <div style={{
+                fontSize: 14, lineHeight: 1.65, whiteSpace: "pre-wrap",
+                color: data.memo ? "var(--text-dark, #2C3630)" : "var(--text-placeholder, #7A8A80)",
+                padding: "10px 14px", borderRadius: 10,
+                background: "var(--sage-bg, #F8F9F7)", border: "1px solid var(--border, rgba(94,125,108,0.14))",
+              }}>
+                {data.memo || "메모를 추가하세요"}
+              </div>
             )}
           </div>
 
@@ -1122,14 +1206,14 @@ function PatientCard({
               >채팅창 열기</button>
               <button
                 type="button"
-                onClick={(e) => { e.stopPropagation(); router.push(`/chart/${data.id}${chatOpen ? "?chatOpen=true" : ""}`); }}
+                onClick={(e) => { e.stopPropagation(); router.push(`/chart/${data.id}?role=pharmacist${chatOpen ? "&chatOpen=true" : ""}`); }}
                 style={{
                   flex: 1, padding: "12px 0", borderRadius: 10,
                   fontSize: 14, fontWeight: 700,
                   background: "#fff", color: "var(--sage-deep, #4A6355)",
                   border: "1.5px solid var(--sage-light, #B3CCBE)", cursor: "pointer",
                 }}
-              >차트 보기</button>
+              >차트 열기</button>
             </div>
           )}
         </div>
@@ -1637,9 +1721,9 @@ function ChatSidePanel({
 function DashboardContent() {
   const router = useRouter();
   const showEmptyState = false;
-  // 카드 전용 확장 키 — "visit_check"(예정일 지난 미처리 방문) 은 lib 의 FilterKey 에 없으므로
-  //   여기서 union 으로 한 단계 확장. applyFilters 호출 시 "visit_check" 만 특수 처리.
-  type CardFilterKey = FilterKey | "visit_check";
+  // 카드 전용 확장 키 — "visit_check"(예정일 지난 미처리 방문) / "post_visit"(방문 후 구매리스트·복용가이드 미처리)
+  //   은 lib 의 FilterKey 에 없으므로 여기서 union 으로 확장. applyFilters 호출 시 둘만 특수 처리.
+  type CardFilterKey = FilterKey | "visit_check" | "post_visit";
   const [filter, setFilter] = useState<CardFilterKey>("all");
   const [sortBy, setSortBy] = useState<SortKey>("recent");
   const [search, setSearch] = useState("");
@@ -1684,9 +1768,9 @@ function DashboardContent() {
   }
   const { user: authUser } = useAuth();
 
-  // license_name 미등록 약사 가드 — lib/usePharmacistGuard 로 추출(2026-05-27).
+  // 약사 페이지 접근 가드 — 비로그인/환자/면허없음 리다이렉트. checking=true 동안 본문 대신 로딩 화면.
   //   /dashboard 와 /dashboard/patients 등 약사 전용 페이지가 동일 hook 호출로 일관 적용.
-  usePharmacistGuard();
+  const { checking, failed } = usePharmacistGuard();
 
   const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
   const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
@@ -1967,6 +2051,18 @@ function DashboardContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authUser]);
 
+  // 차트에서 메모 수정 후 대시보드 복귀 시 stale 방지 — 탭이 visible 로 돌아오면 재fetch.
+  //   (같은 탭 SPA 내부 이동은 안 잡힐 수 있음 — 부족하면 다음 단계에서 pathname 감지로 보강)
+  useEffect(() => {
+    if (!authUser) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") loadConsults(authUser.id);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser]);
+
   const updatePendingStatus = async (
     id: string,
     nextStatus: "accepted" | "rejected",
@@ -2228,6 +2324,12 @@ function DashboardContent() {
           dateRange: "all", customDateFrom: "", customDateTo: "",
           filterSource, filterVisit: null, filterSupplement: null, filterRelation: null,
         }).filter((c) => c.isNoShow === true)
+      : filter === "post_visit"
+      ? applyFilters(consults, {
+          filter: "all", search,
+          dateRange: "all", customDateFrom: "", customDateTo: "",
+          filterSource, filterVisit: null, filterSupplement: null, filterRelation: null,
+        }).filter((c) => c.needsPurchaseList || c.needsDosageGuide)
       : applyFilters(consults, {
           filter, search,
           dateRange: "all", customDateFrom: "", customDateTo: "",
@@ -2237,13 +2339,48 @@ function DashboardContent() {
   );
 
   // 통계
-  // 통계 카드 3개 소스 — consults(통합 환자 목록) 기반. dbPendingCount 폴백은 통합 도입으로 제거.
+  // 통계 카드 소스 — consults(통합 환자 목록) 기반. dbPendingCount 폴백은 통합 도입으로 제거.
   const totalRequested = consults.filter((c) => c.patientStatus === "requested" && !c.isRejected).length;
   const totalVisitToday = consults.filter((c) => c.hasVisitToday).length;
-  const totalManaging = consults.filter((c) => c.patientStatus === "managing").length;
   const totalUrgent = consults.filter((c) => needsUrgentReply(c) || needsAcceptUrgent(c)).length;
   // "방문 체크" 탭 카운트 — 예정일 지났는데 [방문 완료] 미처리 환자 수.
   const totalNoShow = consults.filter((c) => c.isNoShow === true).length;
+  // "방문 후 처리" 탭 카운트 — 구매리스트 미작성 또는 복용가이드 미발송 환자 수.
+  const totalPostVisit = consults.filter((c) => c.needsPurchaseList || c.needsDosageGuide).length;
+
+  // 판정 실패(재시도까지 소진) — 영구 "확인 중" 멈춤 대신 안내 + 새로고침.
+  if (failed) {
+    return (
+      <div style={{
+        minHeight: "60vh", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center",
+        fontFamily: "'Noto Sans KR', sans-serif",
+      }}>
+        <div style={{ fontSize: 15, color: "#3D4A42" }}>정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요.</div>
+        <button
+          type="button"
+          onClick={() => location.reload()}
+          style={{
+            marginTop: 16, padding: "10px 24px", borderRadius: 100,
+            background: "#4A6355", color: "#fff", fontSize: 14, fontWeight: 600,
+            border: "none", cursor: "pointer",
+          }}
+        >새로고침</button>
+      </div>
+    );
+  }
+
+  // 가드 통과 확정 전(로딩/리다이렉트 진행 중)에는 본문 대신 로딩 화면 — 비로그인/환자에게 약사 본문 깜빡임 방지.
+  if (checking) {
+    return (
+      <div style={{
+        minHeight: "60vh", display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 15, color: "#3D4A42", fontFamily: "'Noto Sans KR', sans-serif",
+      }}>
+        확인 중…
+      </div>
+    );
+  }
 
   return (
     <div className="dash-page" style={{ paddingBottom: 80 }}>
@@ -3000,10 +3137,6 @@ function DashboardContent() {
             <div className="dash-stat-num" style={{ color: "#5A8BA8" }}>🗓️ {totalVisitToday}</div>
             <div className="dash-stat-label" style={{ fontSize: 13 }}>오늘 방문 예정</div>
           </div>
-          <div className="dash-stat-card">
-            <div className="dash-stat-num" style={{ color: "var(--sage-deep)" }}>💊 {totalManaging}</div>
-            <div className="dash-stat-label" style={{ fontSize: 13 }}>사후 관리 중</div>
-          </div>
         </div>
 
         {/* 검색 모드 토글 */}
@@ -3102,6 +3235,7 @@ function DashboardContent() {
               ["med_ending_soon", "💊 복용 임박"],
               ["visit_scheduled", "🗓️ 방문 예정"],
               ["visit_check", "⚠️ 방문 체크"],
+              ["post_visit", "📝 방문 후 처리"],
               ["unread", "💬 새 메시지"],
             ] as [CardFilterKey, string][]).map(([key, label]) => (
               <button
@@ -3117,6 +3251,14 @@ function DashboardContent() {
                     background: "#FFF0E6", color: "#E05A1A",
                     fontSize: 11, fontWeight: 700, lineHeight: 1,
                   }}>{totalNoShow}</span>
+                )}
+                {key === "post_visit" && totalPostVisit > 0 && (
+                  <span style={{
+                    marginLeft: 6, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                    minWidth: 18, height: 18, padding: "0 6px", borderRadius: 9,
+                    background: "#FFF0E6", color: "#E05A1A",
+                    fontSize: 11, fontWeight: 700, lineHeight: 1,
+                  }}>{totalPostVisit}</span>
                 )}
               </button>
             ))}
@@ -3192,6 +3334,7 @@ function DashboardContent() {
                   chatOpen={chatPanelId !== null}
                   onAccept={handleAccept}
                   onReject={openRejectModal}
+                  onMemoSaved={(memo) => setConsults((prev) => prev.map((x) => (x.id === c.id ? { ...x, memo } : x)))}
                 />
               </div>
             ))}

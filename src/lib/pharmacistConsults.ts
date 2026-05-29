@@ -9,7 +9,7 @@
  * 실시간(Date.now() / new Date().getFullYear())으로 교체했음.
  */
 import type { CSSProperties } from "react";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient, PostgrestError } from "@supabase/supabase-js";
 import { calcRemainingDays, getTodayLocalISO, PHARM_MED_NEAR_DAYS } from "./nearThresholds";
 
 /* ── 기본 타입 ── */
@@ -20,6 +20,8 @@ export type RelationTag = "regular" | "over" | "none";
 
 export interface PatientConsult {
   id: string;
+  /** consultations.patient_id — 대시보드에서 pharmacist_charts upsert(메모 저장) 키로 사용. mock 보존 위해 optional. */
+  patientId?: string | null;
   patientName: string;
   patientGender: string;
   birthYear: number;
@@ -66,6 +68,12 @@ export interface PatientConsult {
   isMedEndingSoon?: boolean;
   /** 오늘(KST) 방문 예정 — 통계 카드 "오늘 방문 예정" 카운트용. */
   hasVisitToday?: boolean;
+  /** 방문 후 처리 끊김 — 구매 영양제 리스트 미작성.
+   *  visit_records 중 purchased_supplements 가 null/빈 배열인 행이 1건 이상. */
+  needsPurchaseList?: boolean;
+  /** 방문 후 처리 끊김 — 구매는 작성됐는데 복용 가이드 미발송.
+   *  구매 작성된 마지막 방문일 이후 dosage_guides 발송이 0건. */
+  needsDosageGuide?: boolean;
   /** 환자 생년월일 (YYYY-MM-DD). patient_profiles.birth_date 가 있을 때만 채워짐.
    *  ※ 현재 patient_profiles 스키마에는 birth_date 컬럼이 없으므로 항상 null — 컬럼 추가 시 매핑 한 줄로 활성화. */
   birthDate?: string | null;
@@ -258,7 +266,7 @@ export async function fetchAllConsultations(
     .map((c) => c.questionnaire_id)
     .filter((v): v is string => !!v);
 
-  const [profilesRes, patientProfRes, qRes, visitRes, suppRes, msgRes] = await Promise.all([
+  const [profilesRes, patientProfRes, qRes, visitRes, suppRes, msgRes, vrRes, dgRes, pcRes] = await Promise.all([
     patientIds.length > 0
       ? supabase.from("profiles").select("id, name, avatar_url").in("id", patientIds)
       : Promise.resolve({ data: [] as unknown[], error: null }),
@@ -289,6 +297,27 @@ export async function fetchAllConsultations(
           .select("consultation_id, created_at")
           .in("consultation_id", consultationIds)
       : Promise.resolve({ data: [] as unknown[], error: null }),
+    // 방문 후 처리 끊김 판정 — 구매 영양제 리스트 작성 여부.
+    consultationIds.length > 0
+      ? supabase
+          .from("visit_records")
+          .select("id, consultation_id, visit_date, purchased_supplements")
+          .in("consultation_id", consultationIds)
+      : Promise.resolve({ data: [] as unknown[], error: null }),
+    // 방문 후 처리 끊김 판정 — 복용 가이드 발송 여부(본문 불필요, created_at 만).
+    consultationIds.length > 0
+      ? supabase
+          .from("dosage_guides")
+          .select("id, consultation_id, created_at")
+          .in("consultation_id", consultationIds)
+      : Promise.resolve({ data: [] as unknown[], error: null }),
+    // 약사 메모 — 차트(pharmacist_charts.pharmacist_memo)와 단일 소스. RLS 가 pharmacist_id 자동 필터.
+    consultationIds.length > 0
+      ? supabase
+          .from("pharmacist_charts")
+          .select("consultation_id, pharmacist_memo")
+          .in("consultation_id", consultationIds)
+      : Promise.resolve({ data: [] as unknown[], error: null }),
   ]);
 
   for (const [name, res] of [
@@ -298,10 +327,20 @@ export async function fetchAllConsultations(
     ["visit_schedules", visitRes],
     ["patient_supplements", suppRes],
     ["messages", msgRes],
+    ["visit_records", vrRes],
+    ["dosage_guides", dgRes],
+    ["pharmacist_charts", pcRes],
   ] as const) {
     if ("error" in res && res.error) {
       console.error(`[pharmacistConsults] ${name} fetch failed:`, res.error);
     }
+  }
+
+  // consultation_id → pharmacist_memo. row 없는 consultation 은 Map 에 없음(undefined → 매핑 시 "").
+  const chartMemoByCons = new Map<string, string | null>();
+  for (const pc of (pcRes.data ?? []) as Array<{ consultation_id: string | null; pharmacist_memo: string | null }>) {
+    if (!pc.consultation_id) continue;
+    chartMemoByCons.set(pc.consultation_id, pc.pharmacist_memo);
   }
 
   const lastMsgByCons = new Map<string, string>();
@@ -341,6 +380,24 @@ export async function fetchAllConsultations(
     suppsByPatient.set(s.patient_id, arr);
   }
 
+  // 방문 후 처리 끊김 — consultation_id 별 visit_records / dosage_guides 모음.
+  type VisitRecRow = { id: string; consultation_id: string; visit_date: string | null; purchased_supplements: unknown };
+  const visitRecsByCons = new Map<string, VisitRecRow[]>();
+  for (const vr of (vrRes.data ?? []) as VisitRecRow[]) {
+    if (!vr.consultation_id) continue;
+    const arr = visitRecsByCons.get(vr.consultation_id) ?? [];
+    arr.push(vr);
+    visitRecsByCons.set(vr.consultation_id, arr);
+  }
+  type DosageGuideRow = { id: string; consultation_id: string; created_at: string | null };
+  const dosageGuidesByCons = new Map<string, DosageGuideRow[]>();
+  for (const dg of (dgRes.data ?? []) as DosageGuideRow[]) {
+    if (!dg.consultation_id) continue;
+    const arr = dosageGuidesByCons.get(dg.consultation_id) ?? [];
+    arr.push(dg);
+    dosageGuidesByCons.set(dg.consultation_id, arr);
+  }
+
   return consultations.map((c) => {
     const prof = profileById.get(c.patient_id);
     const pProf = patientProfById.get(c.patient_id);
@@ -359,6 +416,35 @@ export async function fetchAllConsultations(
       .sort((a, b) => b.scheduled_date.localeCompare(a.scheduled_date));
     const isNoShow = noShowList.length > 0;
     const noShowDate = noShowList[0]?.scheduled_date;
+
+    // 방문 후 처리 끊김 — 구매 리스트 미작성 / 복용 가이드 미발송.
+    //   visit_records 행이 아예 없는 consultation(레거시 completed)은 두 boolean 다 false → 제외.
+    const vrList = visitRecsByCons.get(c.id) ?? [];
+    const emptyPurchaseRows = vrList.filter((vr) => {
+      const ps = vr.purchased_supplements;
+      if (ps == null) return true;
+      return Array.isArray(ps) && ps.length === 0;
+    });
+    const needsPurchaseList = emptyPurchaseRows.length > 0;
+    const filledPurchaseRows = vrList.filter((vr) => {
+      const ps = vr.purchased_supplements;
+      return Array.isArray(ps) && ps.length > 0;
+    });
+    let needsDosageGuide = false;
+    if (filledPurchaseRows.length > 0) {
+      const lastPurchaseVisitDate = filledPurchaseRows
+        .map((vr) => vr.visit_date)
+        .filter((d): d is string => !!d)
+        .sort((a, b) => b.localeCompare(a))[0];
+      if (lastPurchaseVisitDate) {
+        const dgList = dosageGuidesByCons.get(c.id) ?? [];
+        const sentAfter = dgList.filter(
+          (dg) => !!dg.created_at && dg.created_at.slice(0, 10) > lastPurchaseVisitDate,
+        );
+        needsDosageGuide = sentAfter.length === 0;
+      }
+    }
+
     const completedVisits = visits.filter((v) => v.status === "completed" || v.status === "visited");
     const lastCompletedDate = completedVisits
       .map((v) => v.visited_date ?? v.scheduled_date)
@@ -440,6 +526,7 @@ export async function fetchAllConsultations(
 
     return {
       id: c.id,
+      patientId: c.patient_id ?? null,
       patientName: prof?.name?.trim() || "환자",
       patientGender: mapGenderKo(pProf?.gender),
       birthYear: pProf?.birth_year ?? 0,
@@ -448,6 +535,7 @@ export async function fetchAllConsultations(
       symptoms,
       aiSummary: q?.ai_summary ?? "",
       freeText: q?.free_text ?? "",
+      memo: chartMemoByCons.get(c.id) ?? "",
       unreadCount: unread,
       lastMessageAt: relativeTimeLabel(lastMsgAtIso),
       lastMessageAtIso: lastMsgAtIso ?? undefined,
@@ -472,9 +560,36 @@ export async function fetchAllConsultations(
       minRemainingDays,
       isMedEndingSoon,
       hasVisitToday,
+      needsPurchaseList,
+      needsDosageGuide,
       // patient_profiles 에 birth_date 컬럼이 없어 현재 항상 null. 컬럼 추가 시 pProf?.birth_date 로 교체.
       birthDate: null,
       lastPurchaseAtIso,
     };
   });
+}
+
+/**
+ * 약사 메모 저장 — pharmacist_charts.pharmacist_memo 단일 소스. 대시보드·차트 공용.
+ * UNIQUE(pharmacist_id, consultation_id) 기준 upsert(없으면 INSERT, 있으면 UPDATE).
+ * 빈 메모는 호출부에서 trim 후 null 로 넘긴다(차트와 일관성).
+ */
+export async function upsertChartMemo(
+  supabase: SupabaseLike,
+  args: { pharmacistId: string; consultationId: string; patientId: string | null; patientName: string; memo: string | null },
+): Promise<{ error: PostgrestError | null }> {
+  const { error } = await supabase
+    .from("pharmacist_charts")
+    .upsert(
+      {
+        pharmacist_id: args.pharmacistId,
+        consultation_id: args.consultationId,
+        patient_id: args.patientId,
+        patient_name: args.patientName,
+        chart_type: "self",
+        pharmacist_memo: args.memo,
+      },
+      { onConflict: "pharmacist_id,consultation_id" },
+    );
+  return { error };
 }

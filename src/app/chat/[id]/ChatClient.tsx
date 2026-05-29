@@ -99,7 +99,20 @@ function formatSystemMessageContent(
   role: "patient" | "pharmacist",
   /** 환자 뷰에서 약사 실명 호칭("○○ 약사님")이 필요한 토큰용. 빈 값이면 "약사님" 무명 폴백. */
   counterpartPharmacistName?: string | null,
+  /** system 토큰 부가 데이터 — [FOLLOWUP_SET] 의 scheduled_at 표시 등 렌더 시점 포맷용. */
+  metadata?: Record<string, unknown> | null,
 ): string {
+  // 팔로업(약사 전용 — 환자 뷰는 렌더 .filter 에서 숨김). 설정은 metadata.scheduled_at 으로 날짜 표시.
+  if (content === "[FOLLOWUP_SET]") {
+    const sa = metadata && typeof metadata.scheduled_at === "string" ? metadata.scheduled_at : null;
+    const p = sa ? parseFollowUpScheduledAt(sa) : null;
+    return p
+      ? `팔로업이 설정되었습니다 (${formatFollowUpLabel(p.date)} ${p.time})`
+      : "팔로업이 설정되었습니다";
+  }
+  if (content === "[FOLLOWUP_CANCELLED]") {
+    return "팔로업이 취소되었습니다";
+  }
   if (content === "[CONSULT_REJECTED]") {
     return role === "patient" ? "상담이 진행되지 않았습니다" : "상담을 거절하였습니다";
   }
@@ -123,7 +136,7 @@ function formatSystemMessageContent(
         ? `${name} 약사님이 방문 완료로 기록하셨어요`
         : "약사님이 방문 완료로 기록하셨어요";
     }
-    return "방문을 완료로 기록했습니다";
+    return "방문이 기록되었어요";
   }
   if (content.startsWith("[시스템] ")) return content.replace("[시스템] ", "");
   return content;
@@ -329,6 +342,8 @@ export default function ChatClient() {
 }
 
 interface FollowUp {
+  /** follow_up_schedules.id — DB 영속화 시 채워짐(2단계 취소에서 사용). mock/로컬은 undefined. */
+  id?: string;
   date: string; // "2026.04.23" 형태
   time: string; // "오전 10시" 형태
   message: string;
@@ -426,6 +441,16 @@ function formatVisitDateShort(iso: string): string {
   return `${m}월 ${d}일`;
 }
 
+/** "YYYY-MM-DD" → "YYYY년 M월 D일 (요일)". 파싱 실패/빈값이면 "". toISOString 미사용(로컬 조합). */
+function formatVisitedDateFull(iso: string | null): string {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-").map(Number);
+  if (!y || !m || !d) return "";
+  const dt = new Date(y, m - 1, d);
+  if (Number.isNaN(dt.getTime())) return "";
+  return `${y}년 ${m}월 ${d}일 (${VISIT_WEEKDAY_KR[dt.getDay()]})`;
+}
+
 const FOLLOWUP_DEFAULT_MSG = "안녕하세요! 지난번 상담 이후 경과가 궁금해요. 혹시 수면이나 소화 쪽으로 변화가 있으셨나요? 편하게 말씀해 주세요.";
 
 const FU_TIME_OPTIONS = [
@@ -435,6 +460,45 @@ const FU_TIME_OPTIONS = [
 function formatFollowUpLabel(dateStr: string): string {
   const [, m, d] = dateStr.split(".");
   return `${Number(m)}월 ${Number(d)}일`;
+}
+
+/** "YYYY.MM.DD" + 시각("오전/오후 N시[ M분]" 또는 "HH:MM") → KST(+09:00) 절대시각 ISO. 형식 이상이면 null.
+ *  오후 12시=12:00(정오), 오전 12시=00:00(자정) 경계 처리. toISOString UTC 미사용 — 오프셋 명시. */
+function buildFollowUpScheduledAt(dateStr: string, timeStr: string): string | null {
+  const dm = dateStr.match(/^(\d{4})\.(\d{2})\.(\d{2})$/);
+  if (!dm) return null;
+  let hh: number; let mm = 0;
+  const kr = timeStr.match(/^(오전|오후)\s*(\d{1,2})시(?:\s*(\d{1,2})분)?$/);
+  const hm = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+  if (kr) {
+    const h = Number(kr[2]);
+    mm = kr[3] ? Number(kr[3]) : 0;
+    if (kr[1] === "오전") hh = h === 12 ? 0 : h;
+    else hh = h === 12 ? 12 : h + 12;
+  } else if (hm) {
+    hh = Number(hm[1]); mm = Number(hm[2]);
+  } else {
+    return null;
+  }
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return `${dm[1]}-${dm[2]}-${dm[3]}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+09:00`;
+}
+
+/** scheduled_at(timestamptz ISO) → KST 기준 { date:"YYYY.MM.DD", time:"오전 N시[ M분]" }. 파싱 실패 시 null.
+ *  KST 벽시계는 절대시각 + 9h 후 UTC 게터로 계산(서버 tz 무관). getEffectiveFuTime 출력 형식과 일치. */
+function parseFollowUpScheduledAt(iso: string): { date: string; time: string } | null {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  const kst = new Date(t.getTime() + 9 * 3600 * 1000);
+  const y = kst.getUTCFullYear();
+  const mo = String(kst.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(kst.getUTCDate()).padStart(2, "0");
+  const H = kst.getUTCHours();
+  const M = kst.getUTCMinutes();
+  const ampm = H < 12 ? "오전" : "오후";
+  const h12 = H === 0 ? 12 : H > 12 ? H - 12 : H;
+  const time = M === 0 ? `${ampm} ${h12}시` : `${ampm} ${h12}시 ${M}분`;
+  return { date: `${y}.${mo}.${d}`, time };
 }
 
 function calcDaysLeft(dateStr: string): string {
@@ -541,6 +605,8 @@ function ChatContent() {
   const [fuCustomTime, setFuCustomTime] = useState("10:00");
   const [fuMessage, setFuMessage] = useState(FOLLOWUP_DEFAULT_MSG);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  /** 팔로업 덮어쓰기 확인 모달 — 기존 pending 팔로업이 있을 때 [설정 완료] 시 먼저 노출. */
+  const [showFollowUpOverwrite, setShowFollowUpOverwrite] = useState(false);
 
   /* ── 방문 안내 (차수별) ── */
   const [visitGuideMap, setVisitGuideMap] = useState<Record<string, VisitGuide | null>>({
@@ -568,6 +634,9 @@ function ChatContent() {
   /** [VISIT_CONFIRMED] 시스템 메시지의 metadata.visit_schedule_id 집합.
    *  값이 들어있으면 그 visit 카드는 "방문 확인됨" 상태로 렌더 + [방문 확인] 버튼 비활성. */
   const [completedVisitIds, setCompletedVisitIds] = useState<Set<string>>(new Set());
+  /** 방금 [방문 완료] 처리한 visit_schedule_id — 그 카드 한 장에만 "영양제 구매하셨나요?" 인라인 안내 노출.
+   *  state 만(새로고침 시 사라짐). [예]/[나중에] 누르면 null 로 리셋되어 다시 안 뜸. */
+  const [lastCompletedVisitId, setLastCompletedVisitId] = useState<string | null>(null);
   /** [방문 완료] 클릭 시 카드 안에 펼쳐지는 인사 편집 textarea 의 임시 값 — visitId 별.
    *  키 없음 = 편집 영역 접힘(1단계, [방문 완료] 버튼만), 키 있음 = 펼쳐짐(textarea + 3 버튼). */
   const [thanksDraft, setThanksDraft] = useState<Record<string, string>>({});
@@ -588,6 +657,9 @@ function ChatContent() {
    *  message 기반 추적(cancelledVisitIds/completedVisitIds) 만으로는 재진입 시 과거 cancelled/completed 를
    *  놓치므로, DB 실 상태를 같이 본다. 카드 액션 분기의 최종 진실 소스. */
   const [visitStatusMap, setVisitStatusMap] = useState<Record<string, { status: string; visited_date: string | null }>>({});
+  /** 방문일 직접 수정 — 현재 편집 중인 visitId(없으면 null) + visitId별 input 임시값(YYYY-MM-DD). 약사 전용. */
+  const [editingVisitDate, setEditingVisitDate] = useState<string | null>(null);
+  const [visitDateDraft, setVisitDateDraft] = useState<Record<string, string>>({});
   const loadVisitStatuses = useCallback(async () => {
     if (!isDbConsultation) return;
     const { data, error } = await supabase
@@ -607,6 +679,35 @@ function ChatContent() {
   useEffect(() => {
     loadVisitStatuses();
   }, [loadVisitStatuses]);
+
+  /** follow_up_schedules 복원 — pending 1건(scheduled_at 최신)을 현재 차수(activeSession) followUp 으로.
+   *  ⚠️ 반드시 세션 확정 후(!authLoading && user) 실행 — 하드 새로고침 시 세션 붙기 전 SELECT 가 나가면
+   *     RLS 로 0건이 돌아와 배너 복원 실패함(팔로업은 visit 과 달리 DB 메시지 폴백이 없어 이 로더가 유일 소스).
+   *  배너는 followUpMap[activeSession] 을 읽으므로 동일 키(activeSession)에 기록. 0건이면 null. */
+  const loadFollowUp = useCallback(async () => {
+    if (!isDbConsultation || authLoading || !user) return;
+    const { data, error } = await supabase
+      .from("follow_up_schedules")
+      .select("id, scheduled_at, message_content")
+      .eq("consultation_id", chatId)
+      .eq("status", "pending")
+      .order("scheduled_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ id: string; scheduled_at: string; message_content: string | null }>();
+    if (error) {
+      console.error("[chat] follow_up_schedules load failed:", error);
+      return;
+    }
+    let restored: FollowUp | null = null;
+    if (data) {
+      const p = parseFollowUpScheduledAt(data.scheduled_at);
+      if (p) restored = { id: data.id, date: p.date, time: p.time, message: data.message_content ?? "" };
+    }
+    setFollowUpMap((prev) => ({ ...prev, [activeSession]: restored }));
+  }, [chatId, isDbConsultation, authLoading, user, activeSession]);
+  useEffect(() => {
+    loadFollowUp();
+  }, [loadFollowUp]);
   const [showReplacePrevVisit, setShowReplacePrevVisit] = useState(false);
 
   /* ── 환자 차트 사이드 패널 ── */
@@ -1017,6 +1118,10 @@ function ChatContent() {
     // 5) 인사 편집 펼침 영역 닫기 — 카드가 완료 표시로 전환되며 어차피 액션 영역 자체가 사라지지만, 명시 정리.
     closeThanksEditor(visitId);
 
+    // 5-1) "영양제 구매하셨나요?" 인라인 안내 카드 노출 트리거 — 이 visit_id 한정.
+    //   visit_records INSERT 성공/실패와 무관하게 인사/system 단계까지 끝났으면 띄움.
+    setLastCompletedVisitId(visitId);
+
     // 6) visit_records INSERT — 차트 "방문 기록" 카드용 row 자동 생성.
     //   purchased_supplements / complaint / improvement / guide / opinion / dosage_days / dosage_end_date /
     //   pharmacist_photos 등 나머지 컬럼은 차트에서 약사가 채우도록 null/기본값 유지.
@@ -1049,6 +1154,32 @@ function ChatContent() {
           }
         });
     }
+  };
+
+  /** 방문일 직접 수정 — completed 카드에서 약사가 visited_date 만 다시 UPDATE.
+   *  newDate 는 <input type="date"> 가 주는 로컬 YYYY-MM-DD 문자열 그대로(toISOString 미사용). status 는 안 건드림. */
+  const handleUpdateVisitDate = async (visitId: string, newDate: string) => {
+    if (!isDbConsultation) return;
+    if (!newDate) return; // 빈값 저장 방지
+    const upResp = await (supabase
+      .from("visit_schedules") as unknown as {
+        update: (p: { visited_date: string }) => {
+          eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+        };
+      })
+      .update({ visited_date: newDate })
+      .eq("id", visitId);
+    if (upResp.error) {
+      console.error("[chat] visit date UPDATE failed:", upResp.error);
+      alert("날짜 저장에 실패했습니다. 다시 시도해주세요.");
+      return;
+    }
+    setVisitStatusMap((prev) => ({
+      ...prev,
+      [visitId]: { ...prev[visitId], visited_date: newDate },
+    }));
+    void loadVisitStatuses();
+    setEditingVisitDate(null);
   };
 
   const handleReschedule = async () => {
@@ -1261,44 +1392,200 @@ function ChatContent() {
     return fuTime;
   };
 
-  const confirmFollowUp = () => {
+  const confirmFollowUp = async () => {
     const date = fuInterval === "custom" ? fuCustomDate.replace(/-/g, ".") : calcFollowUpDate(fuInterval);
     if (!date) return;
     const effectiveTime = getEffectiveFuTime();
-    setFollowUp({ date, time: effectiveTime, message: fuMessage });
     setShowFollowUpPanel(false);
-    // 시스템 메시지 추가
-    const now = new Date();
-    const hours = now.getHours();
-    const minutes = now.getMinutes();
-    const ampm = hours < 12 ? "오전" : "오후";
-    const h = hours > 12 ? hours - 12 : hours === 0 ? 12 : hours;
-    const timeStr = `${ampm} ${h}:${String(minutes).padStart(2, "0")}`;
-    const sysMsg: Message = {
-      id: `fu-${Date.now()}`,
-      sender: "pharmacist",
-      content: `[시스템] 팔로업이 설정되었습니다 (${formatFollowUpLabel(date)} ${effectiveTime})`,
-      time: timeStr,
-      isRead: true,
-      sessionId: activeSession,
-      pharmacistOnly: true,
-    };
-    setMessages((prev) => [...prev, sysMsg]);
+
+    // 팔로업 예정 시각 합성(KST ISO) — INSERT scheduled_at + 설정 시스템 메시지 metadata 공용.
+    const scheduledAt = buildFollowUpScheduledAt(date, effectiveTime);
+
+    // DB 모드(UUID 상담) — follow_up_schedules 영속화. mock 모드는 아래 로컬 흐름만(visit 패턴 동일).
+    let newId: string | undefined;
+    if (isDbConsultation && user && dbConsultation && scheduledAt) {
+      const nowIso = new Date().toISOString();
+      // 1) 기존 활성(pending) 팔로업 자동 취소 — "새 팔로업 = 이전 pending 취소"(visit status UPDATE 패턴).
+      const cancelResp = await (supabase
+        .from("follow_up_schedules") as unknown as {
+          update: (p: { status: "cancelled"; cancelled_at: string }) => {
+            eq: (col: string, val: string) => {
+              eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+            };
+          };
+        })
+        .update({ status: "cancelled", cancelled_at: nowIso })
+        .eq("consultation_id", chatId)
+        .eq("status", "pending");
+      if (cancelResp.error) {
+        console.error("[chat] follow_up_schedules cancel-previous failed:", cancelResp.error);
+      }
+      // 2) 새 follow_up_schedules row INSERT.
+      type FollowUpInsertPayload = {
+        consultation_id: string;
+        round_id: string | null;
+        pharmacist_id: string;
+        patient_id: string;
+        scheduled_at: string;
+        message_content: string | null;
+        status: "pending";
+      };
+      const fuPayload: FollowUpInsertPayload = {
+        consultation_id: chatId,
+        round_id: activeRoundId,
+        pharmacist_id: user.id,
+        patient_id: dbConsultation.patient_id,
+        scheduled_at: scheduledAt,
+        message_content: fuMessage.trim() || null,
+        status: "pending",
+      };
+      const fuResp = await (supabase
+        .from("follow_up_schedules") as unknown as {
+          insert: (p: FollowUpInsertPayload) => {
+            select: () => {
+              single: () => Promise<{ data: { id: string } | null; error: { message: string } | null }>;
+            };
+          };
+        })
+        .insert(fuPayload)
+        .select()
+        .single();
+      if (fuResp.error || !fuResp.data) {
+        console.error("[chat] follow_up_schedules insert failed:", fuResp.error);
+        // 낙관적 유지 — 로컬 state 롤백 안 함(visit 에러 톤).
+      } else {
+        newId = fuResp.data.id;
+      }
+    }
+
+    // 옵티미스틱 로컬 state(mock·DB 공통) — newId 있으면 보관(취소에서 사용).
+    setFollowUp({ id: newId, date, time: effectiveTime, message: fuMessage });
+
+    // 설정 시스템 메시지 — DB 모드는 messages INSERT([FOLLOWUP_SET], realtime echo로 표시), mock 은 로컬 push.
+    //   [VISIT_CONFIRMED] 패턴: message_type='system', round_id=activeRoundId, 환자 뷰는 렌더 .filter 에서 숨김.
+    if (isDbConsultation && user) {
+      type SystemMsgPayload = {
+        consultation_id: string;
+        sender_id: string;
+        content: string;
+        message_type: "system";
+        round_id: string | null;
+        is_read: boolean;
+        metadata: { follow_up_schedule_id: string | null; scheduled_at: string | null };
+      };
+      const msgPayload: SystemMsgPayload = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content: "[FOLLOWUP_SET]",
+        message_type: "system",
+        round_id: activeRoundId,
+        is_read: true,
+        metadata: { follow_up_schedule_id: newId ?? null, scheduled_at: scheduledAt },
+      };
+      void (supabase
+        .from("messages") as unknown as {
+          insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(msgPayload)
+        .then(({ error }) => {
+          if (error) console.error("[chat] follow-up set system message insert failed (non-fatal):", error);
+        });
+    } else {
+      const timeStr = getNowTimeStr();
+      const sysMsg: Message = {
+        id: `fu-${Date.now()}`,
+        sender: "pharmacist",
+        content: `[시스템] 팔로업이 설정되었습니다 (${formatFollowUpLabel(date)} ${effectiveTime})`,
+        time: timeStr,
+        isRead: true,
+        sessionId: activeSession,
+        pharmacistOnly: true,
+      };
+      setMessages((prev) => [...prev, sysMsg]);
+    }
   };
 
-  const cancelFollowUp = () => {
+  /** [설정 완료] 클릭 — 기존 pending 팔로업이 있으면 덮어쓰기 확인 모달 먼저, 없으면 바로 확정.
+   *  confirmFollowUp 내부(이전 자동 취소·INSERT·시스템 메시지)는 불변 — 앞단 게이트만. */
+  const handleFollowUpSubmitClick = () => {
+    if (followUp) {
+      setShowFollowUpOverwrite(true);
+    } else {
+      void confirmFollowUp();
+    }
+  };
+
+  const cancelFollowUp = async () => {
+    const fuId = followUp?.id;
+    // 옵티미스틱 — 배너 즉시 사라짐.
     setFollowUp(null);
     setShowCancelConfirm(false);
-    const timeStr = getNowTimeStr();
-    setMessages((prev) => [...prev, {
-      id: `fu-cancel-${Date.now()}`,
-      sender: "pharmacist",
-      content: "[시스템] 팔로업이 취소되었습니다",
-      time: timeStr,
-      isRead: true,
-      sessionId: activeSession,
-      pharmacistOnly: true,
-    }]);
+
+    // DB 모드 — follow_up_schedules status UPDATE + [FOLLOWUP_CANCELLED] system 메시지. mock 은 로컬 push.
+    if (isDbConsultation && user) {
+      const nowIso = new Date().toISOString();
+      // 1) 취소 UPDATE — 보관한 row id 우선, 없으면 consultation+pending 폴백.
+      if (fuId) {
+        const upResp = await (supabase
+          .from("follow_up_schedules") as unknown as {
+            update: (p: { status: "cancelled"; cancelled_at: string }) => {
+              eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+            };
+          })
+          .update({ status: "cancelled", cancelled_at: nowIso })
+          .eq("id", fuId);
+        if (upResp.error) console.error("[chat] follow_up_schedules cancel (by id) failed:", upResp.error);
+      } else {
+        const upResp = await (supabase
+          .from("follow_up_schedules") as unknown as {
+            update: (p: { status: "cancelled"; cancelled_at: string }) => {
+              eq: (col: string, val: string) => {
+                eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+              };
+            };
+          })
+          .update({ status: "cancelled", cancelled_at: nowIso })
+          .eq("consultation_id", chatId)
+          .eq("status", "pending");
+        if (upResp.error) console.error("[chat] follow_up_schedules cancel (fallback) failed:", upResp.error);
+      }
+      // 2) 취소 시스템 메시지 INSERT(realtime echo로 표시). metadata 불필요.
+      type SystemMsgPayload = {
+        consultation_id: string;
+        sender_id: string;
+        content: string;
+        message_type: "system";
+        round_id: string | null;
+        is_read: boolean;
+      };
+      const msgPayload: SystemMsgPayload = {
+        consultation_id: chatId,
+        sender_id: user.id,
+        content: "[FOLLOWUP_CANCELLED]",
+        message_type: "system",
+        round_id: activeRoundId,
+        is_read: true,
+      };
+      void (supabase
+        .from("messages") as unknown as {
+          insert: (p: SystemMsgPayload) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(msgPayload)
+        .then(({ error }) => {
+          if (error) console.error("[chat] follow-up cancel system message insert failed (non-fatal):", error);
+        });
+    } else {
+      const timeStr = getNowTimeStr();
+      setMessages((prev) => [...prev, {
+        id: `fu-cancel-${Date.now()}`,
+        sender: "pharmacist",
+        content: "[시스템] 팔로업이 취소되었습니다",
+        time: timeStr,
+        isRead: true,
+        sessionId: activeSession,
+        pharmacistOnly: true,
+      }]);
+    }
   };
 
   // Scroll to bottom on messages change
@@ -2247,6 +2534,7 @@ function ChatContent() {
   const visibleMessages = messages.filter((m) =>
     !(m.pharmacistOnly && role !== "pharmacist") &&
     !(m.content === "[VISIT_CONFIRMED]" && role !== "pharmacist") &&
+    !((m.content === "[FOLLOWUP_SET]" || m.content === "[FOLLOWUP_CANCELLED]") && role !== "pharmacist") &&
     (isDbConsultation || m.sessionId === activeSession),
   );
   const searchResults = debouncedQuery
@@ -2575,33 +2863,32 @@ function ChatContent() {
           className="chat-status-banner waiting"
           style={{ padding: "12px 16px" }}
         >
-          <div style={{ fontSize: 15, fontWeight: 700, lineHeight: 1.4 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, lineHeight: 1.4, color: "#2C3630" }}>
             약사님이 확인 중입니다
           </div>
           <div
             style={{
               fontSize: 14,
-              fontWeight: 400,
+              fontWeight: 500,
               marginTop: 4,
               lineHeight: 1.5,
-              color: "var(--color-text-mid)",
+              color: "#3D4A42",
             }}
           >
             약사님은 약국 근무중이라 답변에 시간이 걸릴 수 있어요.
           </div>
         </div>
       )}
-      {/* 차수별 AI 문답 요약 카드 (활성 차수)
-       *  DB 모드: rounds + ai_questionnaires 콘텐츠 기반
-       *  mock 모드: CONSULT_SESSIONS 기존 그대로
+      {/* AI 문답 요약 카드 — 약사 전용(환자 화면 숨김). 차수 배지는 2026.05.08 차수 미노출 정책으로 제거.
+       *  DB 모드: rounds + ai_questionnaires 콘텐츠 / mock 모드: CONSULT_SESSIONS
        */}
-      {(() => {
-        // ── DB 모드 분기 — 박스 자체는 항상 노출, 내부 콘텐츠만 데이터 유무에 따라 분기 ──
+      {role === "pharmacist" && (() => {
+        // ── DB 모드 분기 — 약사 화면에서만 노출, 내부 콘텐츠는 데이터 유무에 따라 분기 ──
         if (isDbConsultation) {
           const activeRound = activeRoundId
             ? rounds.find((r) => r.id === activeRoundId)
             : null;
-          // rounds 가 없거나 활성 차수 없으면 "현재 차수" 라벨만 표시 (레거시 consultation 안전 처리)
+          // 최신 round 여부 — 카드 배경/테두리 톤(sage/gray)에만 사용. 차수 배지는 미노출.
           const isLatestRound = activeRound
             ? rounds[rounds.length - 1]?.id === activeRoundId
             : true;
@@ -2628,7 +2915,7 @@ function ChatContent() {
           })();
           return (
             <div style={{
-              margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
+              margin: "0 16px", marginTop: 8,
               padding: "12px 14px",
               background: isLatestRound ? "#EDF4F0" : "#F4F5F3",
               border: `1px solid ${isLatestRound ? "#B3CCBE" : "rgba(94,125,108,0.18)"}`,
@@ -2636,9 +2923,6 @@ function ChatContent() {
               flexShrink: 0,
             }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 100, background: isLatestRound ? "#4A6355" : "#D1D5D3", color: "#fff" }}>
-                  {isLatestRound ? "현재 차수" : "지난 차수"}
-                </span>
                 {startLabel && (
                   <span style={{ fontSize: 13, fontWeight: 600, color: "#4A6355" }}>
                     {startLabel}~ 상담
@@ -2660,11 +2944,6 @@ function ChatContent() {
                   📋 {summary}
                 </div>
               )}
-              {!isLatestRound && (
-                <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 6, fontWeight: 600 }}>
-                  지난 상담 기록입니다. 메시지 전송은 현재 차수에서만 가능합니다.
-                </div>
-              )}
             </div>
           );
         }
@@ -2672,7 +2951,7 @@ function ChatContent() {
         if (!activeSessionData) return null;
         return (
           <div style={{
-            margin: "0 16px", marginTop: role === "patient" ? 0 : 8,
+            margin: "0 16px", marginTop: 8,
             padding: "12px 14px",
             background: isLatestSession ? "#EDF4F0" : "#F4F5F3",
             border: `1px solid ${isLatestSession ? "#B3CCBE" : "rgba(94,125,108,0.18)"}`,
@@ -2680,9 +2959,6 @@ function ChatContent() {
             flexShrink: 0,
           }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
-              <span style={{ fontSize: 12, fontWeight: 700, padding: "2px 8px", borderRadius: 100, background: isLatestSession ? "#4A6355" : "#D1D5D3", color: "#fff" }}>
-                {isLatestSession ? "현재 차수" : "지난 차수"}
-              </span>
               <span style={{ fontSize: 13, fontWeight: 600, color: "#4A6355" }}>
                 {activeSessionData.startDate}~ 상담
               </span>
@@ -2700,11 +2976,6 @@ function ChatContent() {
             <div style={{ fontSize: 14, color: "#2C3630", lineHeight: 1.55, fontWeight: 500 }}>
               📋 {activeSessionData.aiSummary}
             </div>
-            {!isLatestSession && (
-              <div style={{ fontSize: 12, color: "#5E7D6C", marginTop: 6, fontWeight: 600 }}>
-                지난 상담 기록입니다. 메시지 전송은 현재 차수에서만 가능합니다.
-              </div>
-            )}
           </div>
         );
       })()}
@@ -2789,7 +3060,8 @@ function ChatContent() {
             (1) dbLoading: 빈 영역 (메시지/카드 둘 다 안 보임 → rejected 깜빡임 방지)
             (2) !dbLoading + rejected + patient: 거절 안내 카드 (정중앙)
             (3) 그 외: 기존 메시지 리스트 */}
-      <div className="chat-messages" style={{ borderTop: "none" }}>
+      {/* 환자: AI 요약 카드가 약사 전용이라 안내 박스 바로 아래 메시지가 옴 — 상단 여백 축소(약사는 글로벌 16 유지). */}
+      <div className="chat-messages" style={{ borderTop: "none", paddingTop: role === "patient" ? 8 : undefined }}>
         {dbLoading ? null : !dbLoading && consultationRejected && role === "patient" ? (
           /* 거절 안내 카드 — 채팅 영역 정중앙. 메시지 리스트는 숨김.
              거절 사유는 환자에게 노출 X. */
@@ -2863,6 +3135,8 @@ function ChatContent() {
           // [VISIT_CONFIRMED] 시스템 메시지는 환자 뷰에서 숨김 — 카드의 "방문 완료" 표시와 중복.
           //   약사 뷰는 처리 확인용으로 유지. (pharmacistOnly 패턴 재사용)
           if (m.content === "[VISIT_CONFIRMED]" && role !== "pharmacist") return false;
+          // 팔로업 설정/취소 — 약사 전용. 환자 뷰 숨김([VISIT_CONFIRMED] 동일 규칙).
+          if ((m.content === "[FOLLOWUP_SET]" || m.content === "[FOLLOWUP_CANCELLED]") && role !== "pharmacist") return false;
           // mock 모드: 기존 sessionId 필터 보존
           if (!isDbConsultation) return m.sessionId === activeSession;
           // DB 모드: 회차 무관 통합 뷰 — 모든 메시지 시간순 노출
@@ -3119,7 +3393,7 @@ function ChatContent() {
                       <path d="M7 11V7a5 5 0 0110 0v4" />
                     </svg>
                   )}
-                  {formatSystemMessageContent(msg.content, role, dbCounterpartLicenseName || dbCounterpartName)}
+                  {formatSystemMessageContent(msg.content, role, dbCounterpartLicenseName || dbCounterpartName, msg.metadata)}
                 </div>
                 {role === "pharmacist" && msg.pharmacistOnly && (
                   <span style={{ fontSize: 11, color: "#9AA8A0" }}>내부 메모 (환자에게 안 보임)</span>
@@ -3210,16 +3484,129 @@ function ChatContent() {
                       ))}
                     </div>
                   </div>
-                  {/* 완료된 방문 — 양쪽 다 액션 자리에 "방문 확인됨" (체크 아이콘 + 세이지, 비활성 텍스트). */}
-                  {!isCancelled && isCompleted && (
+                  {/* 완료된 방문 — "✓ 방문 완료됨 · 방문일"(양쪽 노출) + 약사 전용 [날짜 수정] 토글/입력. */}
+                  {!isCancelled && isCompleted && (() => {
+                    const visitedDate = visitId ? (visitStatusMap[visitId]?.visited_date ?? null) : null;
+                    const isEditingDate = !!visitId && editingVisitDate === visitId;
+                    return (
+                      <div style={{
+                        padding: "10px 14px", borderTop: "1px solid #B3CCBE",
+                        display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
+                      }}>
+                        <div style={{
+                          fontSize: 13, fontWeight: 600, color: "#7FA48E",
+                          display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                          textAlign: "center",
+                        }}>
+                          <span aria-hidden>✓</span>
+                          <span>방문 완료됨{visitedDate ? ` · ${formatVisitedDateFull(visitedDate)}` : ""}</span>
+                        </div>
+                        {role === "pharmacist" && visitId && !isEditingDate && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setVisitDateDraft((prev) => ({ ...prev, [visitId]: visitedDate ?? "" }));
+                              setEditingVisitDate(visitId);
+                            }}
+                            style={{
+                              background: "none", border: "none", padding: 0, cursor: "pointer",
+                              fontSize: 13, color: "#5E7D6C", textDecoration: "underline",
+                              fontFamily: "'Noto Sans KR', sans-serif",
+                            }}
+                          >날짜 수정</button>
+                        )}
+                        {role === "pharmacist" && visitId && isEditingDate && (
+                          <div style={{
+                            display: "flex", flexWrap: "wrap", alignItems: "center",
+                            justifyContent: "center", gap: 8,
+                          }}>
+                            <input
+                              type="date"
+                              value={visitDateDraft[visitId] ?? ""}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setVisitDateDraft((prev) => ({ ...prev, [visitId]: v }));
+                              }}
+                              style={{
+                                fontSize: 14, padding: "8px 10px", borderRadius: 8,
+                                border: "1px solid #B3CCBE", color: "#2C3630",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateVisitDate(visitId, visitDateDraft[visitId] ?? "")}
+                              style={{
+                                padding: "8px 16px", borderRadius: 100, fontSize: 13, fontWeight: 700,
+                                color: "#fff", background: "#4A6355", border: "none", cursor: "pointer",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}
+                            >저장</button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingVisitDate(null)}
+                              style={{
+                                padding: "8px 16px", borderRadius: 100, fontSize: 13, fontWeight: 600,
+                                color: "#C06B45", background: "#fff", border: "1px solid #B3CCBE", cursor: "pointer",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}
+                            >취소</button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  {/* ⭐1 3단계 — 방금 완료 처리한 방문 카드에만 노출되는 후속 안내. 약사만, lastCompletedVisitId === visitId 일 때.
+                       [예] → 차트 패널 열고 자체 닫음 / [나중에] → 자체만 닫음. 새로고침하면 자연 소실(state 만 사용). */}
+                  {!isCancelled && isCompleted && role === "pharmacist"
+                    && visitId && lastCompletedVisitId === visitId && (
                     <div style={{
-                      padding: "10px", fontSize: 13, fontWeight: 600,
-                      color: "#7FA48E", textAlign: "center",
-                      borderTop: "1px solid #B3CCBE",
-                      display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                      padding: "14px 16px", borderTop: "1px solid #B3CCBE",
+                      background: "#F8F9F7",
+                      display: "flex", flexDirection: "column", gap: 10,
                     }}>
-                      <span aria-hidden>✓</span>
-                      <span>방문 완료됨</span>
+                      <div style={{
+                        fontSize: 14, fontWeight: 700, color: "#2C3630",
+                        textAlign: "center", lineHeight: 1.5,
+                      }}>
+                        영양제 구매하셨나요?
+                      </div>
+                      <div style={{
+                        fontSize: 13, color: "#3D4A42",
+                        textAlign: "center", lineHeight: 1.5,
+                      }}>
+                        차트를 열어 구매내역을 작성해주세요
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            // 본격 작업 동선 — 사이드 패널이 아닌 차트 페이지로 전체 이동.
+                            //   채팅 헤더 [차트 보기]는 패널(빠른 확인) 그대로, 안내 카드 [차트 열기]는 페이지 이동(본격 작업).
+                            setLastCompletedVisitId(null);
+                            router.push(`/chart/${chatId}?role=pharmacist`);
+                          }}
+                          style={{
+                            flex: 1, minHeight: 44, padding: "10px 12px",
+                            borderRadius: 10, fontSize: 14, fontWeight: 700,
+                            background: "#4A6355", color: "#fff", border: "none",
+                            cursor: "pointer",
+                            fontFamily: "'Noto Sans KR', sans-serif",
+                          }}
+                        >차트 열기</button>
+                        <button
+                          type="button"
+                          onClick={() => setLastCompletedVisitId(null)}
+                          style={{
+                            flex: 1, minHeight: 44, padding: "10px 12px",
+                            borderRadius: 10, fontSize: 14, fontWeight: 600,
+                            background: "#fff", color: "#3D4A42",
+                            border: "1px solid rgba(94, 125, 108, 0.3)",
+                            cursor: "pointer",
+                            fontFamily: "'Noto Sans KR', sans-serif",
+                          }}
+                        >나중에</button>
+                      </div>
                     </div>
                   )}
                   {/* 환자 액션 — DB 모드면 actualStatus==='scheduled' 일 때만 (cancelled/completed 는 위 가드로 차단).
@@ -3279,30 +3666,59 @@ function ChatContent() {
                               }}
                             />
                           </div>
-                          <div style={{ display: "flex", borderTop: "1px solid #B3CCBE" }}>
+                          <div style={{
+                            display: "flex", flexDirection: "column", gap: 8,
+                            padding: "12px 16px", borderTop: "1px solid #B3CCBE",
+                          }}>
                             <button type="button" onClick={() => handleConfirmVisit(visitId, thanksDraft[visitId] ?? "")} style={{
-                              flex: 1, padding: "10px", fontSize: 13, fontWeight: 700,
-                              color: "#4A6355", background: "transparent", border: "none",
-                              borderRight: "1px solid #B3CCBE", cursor: "pointer",
-                            }}>보내고 완료</button>
-                            <button type="button" onClick={() => handleConfirmVisit(visitId, null)} style={{
-                              flex: 1, padding: "10px", fontSize: 13, fontWeight: 600,
-                              color: "#4A6355", background: "transparent", border: "none",
-                              borderRight: "1px solid #B3CCBE", cursor: "pointer",
-                            }}>인사 없이 완료</button>
-                            <button type="button" onClick={() => closeThanksEditor(visitId)} style={{
-                              flex: 1, padding: "10px", fontSize: 13, fontWeight: 600,
-                              color: "#C06B45", background: "transparent", border: "none",
+                              width: "100%",
+                              padding: "10px 18px", borderRadius: 100,
+                              fontSize: 13, fontWeight: 700, minHeight: 40,
+                              color: "#fff", background: "#4A6355", border: "none",
                               cursor: "pointer",
-                            }}>취소</button>
+                              fontFamily: "'Noto Sans KR', sans-serif",
+                            }}>보내고 완료</button>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button type="button" onClick={() => handleConfirmVisit(visitId, null)} style={{
+                                flex: 1,
+                                padding: "10px 18px", borderRadius: 100,
+                                fontSize: 13, fontWeight: 600, minHeight: 40,
+                                color: "#4A6355", background: "#fff",
+                                border: "1px solid #B3CCBE", cursor: "pointer",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}>인사 없이 완료</button>
+                              <button type="button" onClick={() => closeThanksEditor(visitId)} style={{
+                                flex: 1,
+                                padding: "10px 18px", borderRadius: 100,
+                                fontSize: 13, fontWeight: 600, minHeight: 40,
+                                color: "#C06B45", background: "#fff",
+                                border: "1px solid #B3CCBE", cursor: "pointer",
+                                fontFamily: "'Noto Sans KR', sans-serif",
+                              }}>취소</button>
+                            </div>
                           </div>
                         </>
                       ) : (
-                        <button type="button" onClick={() => openThanksEditor(visitId)} style={{
-                          width: "100%", padding: "10px", fontSize: 13, fontWeight: 600,
-                          color: "#4A6355", background: "transparent", border: "none",
-                          cursor: "pointer",
-                        }}>방문 완료</button>
+                        <div style={{
+                          borderTop: "1px solid #B3CCBE",
+                          padding: "12px 16px",
+                          display: "flex", flexDirection: "column", alignItems: "stretch", gap: 6,
+                        }}>
+                          <button type="button" onClick={() => openThanksEditor(visitId)} style={{
+                            width: "100%",
+                            padding: "12px 16px", borderRadius: 100,
+                            fontSize: 13, fontWeight: 600, minHeight: 40,
+                            color: "#fff", background: "#4A6355", border: "none",
+                            cursor: "pointer",
+                            fontFamily: "'Noto Sans KR', sans-serif",
+                          }}>방문 완료</button>
+                          <div style={{
+                            fontSize: 13, color: "#3D4A42",
+                            textAlign: "center", lineHeight: 1.4,
+                          }}>
+                            누르면 방문이 기록됩니다
+                          </div>
+                        </div>
                       )}
                     </div>
                   )}
@@ -4021,10 +4437,10 @@ function ChatContent() {
               }}
             />
 
-            {/* 설정 완료 버튼 */}
+            {/* 설정 완료 버튼 — 기존 팔로업 있으면 덮어쓰기 확인 모달 경유. */}
             <button
               type="button"
-              onClick={confirmFollowUp}
+              onClick={handleFollowUpSubmitClick}
               disabled={fuInterval === "custom" && !fuCustomDate}
               style={{
                 width: "100%", padding: "14px 0", borderRadius: 12,
@@ -4088,6 +4504,62 @@ function ChatContent() {
                 }}
               >
                 취소하기
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 팔로업 덮어쓰기 확인 — 기존 pending 팔로업이 있을 때 [설정 완료] 경유. 취소 확인 모달과 동일 톤. */}
+      {showFollowUpOverwrite && followUp && (
+        <div
+          style={{
+            position: "fixed", inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 200,
+          }}
+          onClick={() => setShowFollowUpOverwrite(false)}
+        >
+          <div
+            style={{
+              background: "#fff", borderRadius: 16, padding: 24,
+              maxWidth: 340, width: "90%", textAlign: "center",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.18)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontSize: 17, fontWeight: 700, color: "#2C3630", marginBottom: 10 }}>
+              이미 설정된 팔로업이 있어요
+            </div>
+            <div style={{ fontSize: 15, color: "#3D4A42", marginBottom: 22, lineHeight: 1.6 }}>
+              기존 팔로업(<b style={{ color: "#2C3630" }}>{formatFollowUpLabel(followUp.date)} {followUp.time}</b>)이 취소되고,
+              새 팔로업(<b style={{ color: "#4A6355" }}>{formatFollowUpLabel(fuInterval === "custom" ? fuCustomDate.replace(/-/g, ".") : calcFollowUpDate(fuInterval))} {getEffectiveFuTime()}</b>)으로 변경됩니다. 진행하시겠어요?
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                type="button"
+                onClick={() => setShowFollowUpOverwrite(false)}
+                style={{
+                  flex: 1, padding: "14px", borderRadius: 10,
+                  fontSize: 15, fontWeight: 600,
+                  background: "#F8F9F7", color: "#3D4A42",
+                  border: "1px solid rgba(94,125,108,0.14)", cursor: "pointer",
+                }}
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={() => { setShowFollowUpOverwrite(false); void confirmFollowUp(); }}
+                style={{
+                  flex: 1, padding: "14px", borderRadius: 10,
+                  fontSize: 15, fontWeight: 700,
+                  background: "#4A6355", color: "#fff",
+                  border: "none", cursor: "pointer",
+                }}
+              >
+                변경하기
               </button>
             </div>
           </div>

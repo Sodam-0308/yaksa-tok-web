@@ -71,6 +71,9 @@ function formatPreview(content: string, myRole: "patient" | "pharmacist"): strin
     return myRole === "patient" ? "복용 가이드가 도착했어요" : "복용 가이드 전송 완료";
   }
   if (content === "[VISIT_CONFIRMED]") return "방문 완료";
+  // 팔로업 — 약사 전용. 환자 미리보기엔 노출 금지(빈 문자열, raw 토큰도 숨김).
+  if (content === "[FOLLOWUP_SET]") return myRole === "pharmacist" ? "팔로업 설정" : "";
+  if (content === "[FOLLOWUP_CANCELLED]") return myRole === "pharmacist" ? "팔로업 취소" : "";
   // 접두 토큰 — [추가질문답변] 이 [추가질문] 접두를 포함하므로 답변 먼저 분기
   if (content.startsWith("[추가질문답변]")) return "환자가 답변했어요";
   if (content.startsWith("[추가질문]")) return "추가 질문을 보냈어요";
