@@ -54,7 +54,13 @@ const INITIAL_TEMPLATES: Template[] = [
   { id: 2, title: "방문 안내", content: "약국 방문하시면 더 정확한 상담이 가능해요. 영업시간은 평일 10시~7시입니다." },
 ];
 
-const STATS = { total: 28, completed: 23, avgTime: "2시간 30분", improved: 12, badge: "개선 확인", nextBadge: "종합 건강관리까지 개선 확인 3개 분야 필요" };
+/* avg_response_minutes → 사람이 읽는 형식 (60→"약 1시간", 90→"약 1시간 30분") */
+function formatAvgResponse(min: number): string {
+  if (min < 60) return `약 ${min}분`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m === 0 ? `약 ${h}시간` : `약 ${h}시간 ${m}분`;
+}
 
 /* ── 개별 문답 세트 ── */
 interface QuestionSetSummary {
@@ -114,7 +120,10 @@ function Content() {
   /** 상세주소 — 도로명(pAddress) 뒤에 합쳐 저장. DB 컬럼은 1개라 화면에서만 분리.
    *  로드 시점에는 빈 칸으로 두고, 사용자가 주소 검색을 새로 누르면 도로명만 새로 채워짐. */
   const [pAddressDetail, setPAddressDetail] = useState("");
-  const [saved, setSaved] = useState({ name: "", pharmacy: "", address: "" });
+  // 약사 경력 신고 — input 은 문자열로 보관(빈칸 = 미입력 = NULL)
+  const [pCareerYears, setPCareerYears] = useState("");
+  const [pOfflineCount, setPOfflineCount] = useState("");
+  const [saved, setSaved] = useState({ name: "", pharmacy: "", address: "", careerYears: "", offlineCount: "" });
 
   /* ── DB 상태 ──
    * profileLoaded 를 boolean state 로 두면, useAuth.user 가 null→object 로 바뀌는
@@ -125,6 +134,9 @@ function Content() {
   const [hasPharmacistProfile, setHasPharmacistProfile] = useState(false);
   // 개선 확인 카운트 (improvement_confirmations 행 개수, pharmacist_id=본인)
   const [improvementCount, setImprovementCount] = useState<number | null>(null);
+  // 내 실적 — pharmacist_profiles 실컬럼
+  const [totalConsultations, setTotalConsultations] = useState<number | null>(null);
+  const [avgResponseMinutes, setAvgResponseMinutes] = useState<number | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
   // license_name 이 DB 에 존재하면 "이름" 인풋을 잠금 (면허 인증 무결성 보호)
   const [licenseNameLocked, setLicenseNameLocked] = useState(false);
@@ -142,6 +154,8 @@ function Content() {
     expert_specialties: string[];
     available_specialties: string[];
     pharmacy_photos: string[];
+    career_years: number | null;
+    offline_consult_count: number | null;
   }>) => {
     if (!user) return;
     type PpUpsert = {
@@ -153,6 +167,8 @@ function Content() {
       expert_specialties?: string[];
       available_specialties?: string[];
       pharmacy_photos?: string[];
+      career_years?: number | null;
+      offline_consult_count?: number | null;
       // license_name 은 의도적으로 제외 — 면허 인증 무결성 보호
     };
     const payload: PpUpsert = { id: user.id, ...fields };
@@ -191,7 +207,20 @@ function Content() {
     if (error) console.error("[ph-mypage] profiles.name update failed:", error);
   };
 
-  const cancelEdit = () => { setPName(saved.name); setPPharmacy(saved.pharmacy); setPAddress(saved.address); setPAddressDetail(""); setEditMode(false); };
+  // 숫자 입력 파싱: 빈칸 → null, 정수 아니거나 음수/NaN → null
+  const parseNonNegInt = (v: string): number | null => {
+    const t = v.trim();
+    if (t === "") return null;
+    const n = parseInt(t, 10);
+    if (isNaN(n) || n < 0) return null;
+    return n;
+  };
+
+  const cancelEdit = () => {
+    setPName(saved.name); setPPharmacy(saved.pharmacy); setPAddress(saved.address); setPAddressDetail("");
+    setPCareerYears(saved.careerYears); setPOfflineCount(saved.offlineCount);
+    setEditMode(false);
+  };
   const saveEdit = async () => {
     if (savingProfile) return;
     setSavingProfile(true);
@@ -200,18 +229,30 @@ function Content() {
     const road = pAddress.trim();
     const detail = pAddressDetail.trim();
     const combinedAddress = [road, detail].filter(Boolean).join(" ");
+    const careerYearsVal = parseNonNegInt(pCareerYears);
+    const offlineCountVal = parseNonNegInt(pOfflineCount);
     // license_name 이 잠겨 있으면 profiles.name 도 건드리지 않음 (이름 변경 시도 차단)
     const tasks: Promise<void>[] = [
-      persistPharmacistFields({ pharmacy_name: pPharmacy, address: combinedAddress }),
+      persistPharmacistFields({
+        pharmacy_name: pPharmacy,
+        address: combinedAddress,
+        career_years: careerYearsVal,
+        offline_consult_count: offlineCountVal,
+      }),
     ];
     if (!licenseNameLocked) {
       tasks.push(persistProfileName(pName));
     }
     await Promise.all(tasks);
-    setSaved({ name: pName, pharmacy: pPharmacy, address: combinedAddress });
+    // 정규화된 값(null→"" / 정수→문자열)으로 입력란·스냅샷 동기화
+    const careerStr = careerYearsVal != null ? String(careerYearsVal) : "";
+    const offlineStr = offlineCountVal != null ? String(offlineCountVal) : "";
+    setSaved({ name: pName, pharmacy: pPharmacy, address: combinedAddress, careerYears: careerStr, offlineCount: offlineStr });
     // 저장 후 도로명 칸을 합쳐진 전체 주소로 갱신, 상세 칸은 비움 (다음 편집 시 깨끗한 상태).
     setPAddress(combinedAddress);
     setPAddressDetail("");
+    setPCareerYears(careerStr);
+    setPOfflineCount(offlineStr);
     setEditMode(false);
     setSavingProfile(false);
   };
@@ -381,7 +422,7 @@ function Content() {
           .maybeSingle<{ name: string }>(),
         supabase
           .from("pharmacist_profiles")
-          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name, pharmacy_photos")
+          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name, pharmacy_photos, career_years, offline_consult_count, total_consultations, avg_response_minutes")
           .eq("id", user.id)
           .maybeSingle<{
             pharmacy_name: string | null;
@@ -390,6 +431,10 @@ function Content() {
             available_specialties: string[] | null;
             license_name: string | null;
             pharmacy_photos: string[] | null;
+            career_years: number | null;
+            offline_consult_count: number | null;
+            total_consultations: number | null;
+            avg_response_minutes: number | null;
           }>(),
       ]);
 
@@ -410,16 +455,28 @@ function Content() {
         if (Array.isArray(pp.pharmacy_photos)) {
           setPharmacyPhotos(pp.pharmacy_photos.filter((u) => typeof u === "string" && u).map((url) => ({ url })));
         }
+        // 경력 신고 — NULL 이면 빈칸
+        const careerStr = pp.career_years != null ? String(pp.career_years) : "";
+        const offlineStr = pp.offline_consult_count != null ? String(pp.offline_consult_count) : "";
+        setPCareerYears(careerStr);
+        setPOfflineCount(offlineStr);
+        // 내 실적 통계
+        setTotalConsultations(pp.total_consultations ?? 0);
+        setAvgResponseMinutes(pp.avg_response_minutes ?? null);
         setSaved({
           name: displayName,
           pharmacy: pp.pharmacy_name ?? "",
           address: pp.address ?? "",
+          careerYears: careerStr,
+          offlineCount: offlineStr,
         });
       } else {
         setSaved({
           name: displayName,
           pharmacy: "",
           address: "",
+          careerYears: "",
+          offlineCount: "",
         });
       }
       setLoadedForUid(user.id);
@@ -613,6 +670,40 @@ function Content() {
                     onChange={(e) => setPAddressDetail(e.target.value)}
                   />
                 </div>
+
+                {/* ── 약사 경력 ── */}
+                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, marginBottom: 12, fontFamily: "'Gothic A1', sans-serif" }}>약사 경력</div>
+                  <div>
+                    <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 4 }}>상담 경력 (년)</label>
+                    <input
+                      style={inp}
+                      type="number"
+                      min={0}
+                      placeholder="예: 15"
+                      value={pCareerYears}
+                      onChange={(e) => setPCareerYears(e.target.value)}
+                    />
+                    <div style={{ fontSize: 13, color: C.sageMid, marginTop: 6, lineHeight: 1.5 }}>
+                      약국에서 상담해 온 햇수예요. 비워두면 표시되지 않아요.
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 12 }}>
+                    <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid, display: "block", marginBottom: 4 }}>오프라인 상담 건수</label>
+                    <input
+                      style={inp}
+                      type="number"
+                      min={0}
+                      placeholder="예: 1200"
+                      value={pOfflineCount}
+                      onChange={(e) => setPOfflineCount(e.target.value)}
+                    />
+                    <div style={{ fontSize: 13, color: C.sageMid, marginTop: 6, lineHeight: 1.5 }}>
+                      약국에서 직접 상담한 누적 건수예요. 대략적인 수로 적어도 괜찮아요. 비워두면 표시되지 않아요.
+                    </div>
+                  </div>
+                </div>
+
                 <div style={{ fontSize: 14, color: C.textMid, padding: "10px 14px", background: C.sagePale, borderRadius: 8 }}>면허번호: {PROFILE.license}</div>
                 <div style={{ display: "flex", gap: 10 }}>
                   <button type="button" style={btnS} onClick={cancelEdit}>취소</button>
@@ -757,21 +848,16 @@ function Content() {
           <div style={card}>
             <div style={secTitle}>내 실적</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
-              <StatBox label="총 상담" value={`${STATS.total}건`} />
-              <StatBox label="완료" value={`${STATS.completed}건`} />
-              <StatBox label="평균 답변 시간" value={STATS.avgTime} />
+              <StatBox label="총 상담" value={`${totalConsultations ?? 0}건`} />
+              <StatBox
+                label="평균 답변 시간"
+                value={avgResponseMinutes != null ? formatAvgResponse(avgResponseMinutes) : "—"}
+              />
               <StatBox
                 label="개선 확인"
                 value={improvementCount !== null ? `${improvementCount}건` : "—"}
                 accent
               />
-            </div>
-            <div style={{ padding: "14px 16px", borderRadius: 12, background: `linear-gradient(135deg, ${C.terraPale} 0%, ${C.white} 100%)`, border: `1px solid ${C.terraLight}`, marginBottom: 10 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <span style={{ fontSize: 20 }}>&#11088;</span>
-                <span style={{ fontSize: 15, fontWeight: 700, color: C.terraDark }}>현재 뱃지: {STATS.badge}</span>
-              </div>
-              <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.5 }}>다음 목표: {STATS.nextBadge}</div>
             </div>
             <div style={{ textAlign: "right" }}>
               <button

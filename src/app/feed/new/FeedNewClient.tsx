@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, Suspense } from "react";
+import { useState, useEffect, useRef, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -9,36 +9,23 @@ import { useAuth } from "@/contexts/AuthContext";
    타입 & 상수
    ══════════════════════════════════════════ */
 
-type TagVariant = "sage" | "terra" | "lavender" | "rose" | "blue" | "muted";
-
-interface SymptomOption {
-  label: string;
-  variant: TagVariant;
-}
-
-const PHARMACIST = { name: "김서연 약사", pharmacy: "그린약국" };
-
 const GENDERS = ["남성", "여성", "기타"] as const;
 const AGE_GROUPS = ["영유아 (0~6세)", "어린이 (7~12세)", "10대", "20대", "30대", "40대", "50대", "60대", "70대 이상"] as const;
 
-const SYMPTOM_OPTIONS: SymptomOption[] = [
-  { label: "만성피로", variant: "terra" },
-  { label: "소화장애", variant: "sage" },
-  { label: "불면", variant: "lavender" },
-  { label: "비염", variant: "blue" },
-  { label: "두통", variant: "terra" },
-  { label: "생리통", variant: "rose" },
-  { label: "여드름", variant: "rose" },
-  { label: "아토피", variant: "rose" },
-  { label: "우울·불안", variant: "lavender" },
-  { label: "안구건조", variant: "blue" },
-  { label: "수족냉증", variant: "blue" },
-  { label: "붓기", variant: "sage" },
-  { label: "기타", variant: "muted" },
-];
+const CATEGORY_OPTIONS = [
+  { key: "digestion",   label: "소화·장" },
+  { key: "sleep",       label: "수면·마음" },
+  { key: "fatigue",     label: "피로·기력" },
+  { key: "skin",        label: "피부" },
+  { key: "pain",        label: "통증·염증" },
+  { key: "women",       label: "여성건강" },
+  { key: "circulation", label: "체중관리·순환" },
+  { key: "growth",      label: "소아·성장" },
+  { key: "etc",         label: "기타" },
+] as const;
 
 const DURATION_OPTIONS = ["1개월 미만", "1~3개월", "3~6개월", "6개월~1년", "1년 이상"] as const;
-const IMPROVE_DURATION = ["2주 이내", "2~4주", "1~2개월", "2~3개월", "3개월 이상"] as const;
+const IMPROVE_DURATION = ["1주 이내", "2주 이내", "1개월 이내", "3개월 이내", "6개월 이내", "6개월 이상"] as const;
 
 const SCORE_LABELS = ["에너지/활력", "수면의 질", "소화 상태", "기분/정서", "증상 불편도"];
 
@@ -48,8 +35,10 @@ const SCORE_LABELS = ["에너지/활력", "수면의 질", "소화 상태", "기
 function FeedNewContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user } = useAuth();
-  const isPharmacist = searchParams.get("role") === "pharmacist";
+  const editId = searchParams.get("edit"); // 편집 모드 — 기존 글 id
+  const { user, profile } = useAuth();
+  // 미리보기 표시용 약사 이름 — 실제 로그인 약사(profile.name). 비동기로 늦게 오면 빈값, mock 이름은 절대 표시 안 함.
+  const previewName = profile?.name?.trim() || "";
 
   // 업로드/등록 진행 상태 + 에러 토스트
   const [submitting, setSubmitting] = useState(false);
@@ -63,8 +52,16 @@ function FeedNewContent() {
   const [ageGroup, setAgeGroup] = useState<string>("");
 
   /* 증상 */
-  const [symptoms, setSymptoms] = useState<Set<string>>(new Set());
-  const [etcText, setEtcText] = useState("");
+  const [categories, setCategories] = useState<string[]>([]);
+  const toggleCategory = (key: string) => {
+    setCategories((prev) =>
+      prev.includes(key)
+        ? prev.filter((k) => k !== key)
+        : prev.length < 3
+        ? [...prev, key]
+        : prev
+    );
+  };
 
   /* 기간 */
   const [duration, setDuration] = useState("");
@@ -89,8 +86,7 @@ function FeedNewContent() {
   const [title, setTitle] = useState("");
 
   /* 사진 */
-  const [photos, setPhotos] = useState<{ file: File; url: string }[]>([]);
-  const [uploaderType, setUploaderType] = useState<"pharmacist" | "patient">(isPharmacist ? "pharmacist" : "patient");
+  const [photos, setPhotos] = useState<{ file?: File; url: string }[]>([]);
   const [consent, setConsent] = useState(false);
   const galleryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
@@ -128,20 +124,9 @@ function FeedNewContent() {
   const [showPreview, setShowPreview] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [showToast, setShowToast] = useState(false);
+  const [loadingEdit, setLoadingEdit] = useState(false);
 
   /* 증상 토글 */
-  const toggleSymptom = (label: string) => {
-    setSymptoms((prev) => {
-      const next = new Set(prev);
-      if (next.has(label)) {
-        next.delete(label);
-      } else if (next.size < 3) {
-        next.add(label);
-      }
-      return next;
-    });
-  };
-
   /* 슬라이더 변경 */
   const updateScore = (
     setter: React.Dispatch<React.SetStateAction<number[]>>,
@@ -151,7 +136,35 @@ function FeedNewContent() {
     setter((prev) => prev.map((v, i) => (i === idx ? val : v)));
   };
 
-  /* 등록 — Supabase Storage 업로드 + case_studies INSERT */
+  /* 편집 모드 — editId 있으면 기존 글 1회 로드해 폼 초기값 채움. (점수/증상 기간은 DB 미저장이라 복원 안 함) */
+  useEffect(() => {
+    if (!editId) return;
+    let cancelled = false;
+    setLoadingEdit(true);
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("case_studies").select("*").eq("id", editId).maybeSingle();
+        if (cancelled || error || !data) return;
+        const row = data as Record<string, unknown>;
+        setTitle((row.title as string) ?? "");
+        setCategories(Array.isArray(row.categories) ? (row.categories as string[]) : []);
+        setAgeGroup((row.patient_age_group as string) ?? "");
+        setGender((row.patient_gender as string) ?? "");
+        setBeforeDesc((row.description as string) ?? "");
+        setAfterDesc((row.outcome as string) ?? "");
+        setImproveDuration((row.duration_text as string) ?? "");
+        setConsent(!!row.patient_consent_checked);
+        const existing = Array.isArray(row.photos) ? (row.photos as string[]) : [];
+        setPhotos(existing.map((u) => ({ url: u })));
+      } finally {
+        if (!cancelled) setLoadingEdit(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [editId]);
+
+  /* 등록/수정 — Supabase Storage 업로드 + case_studies INSERT/UPDATE */
   const handleSubmit = async () => {
     if (submitting) return;
     setShowConfirm(false);
@@ -164,10 +177,14 @@ function FeedNewContent() {
 
     setSubmitting(true);
 
-    // 1) photos 업로드
+    // 1) photos 업로드 — 새 파일(p.file)만 Storage 업로드, 기존 사진(p.url만)은 그대로 유지.
     const photoUrls: string[] = [];
     for (let i = 0; i < photos.length; i++) {
       const p = photos[i];
+      if (!p.file) {
+        photoUrls.push(p.url); // 편집 시 기존 사진 URL 유지
+        continue;
+      }
       const ext = (p.file.name.split(".").pop() || "jpg").toLowerCase();
       const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
       const path = `${user.id}/${Date.now()}-${i}.${safeExt}`;
@@ -190,12 +207,13 @@ function FeedNewContent() {
       author_type: "pharmacist" | "patient";
       pharmacist_id: string | null;
       title: string;
-      symptoms: string[];
+      categories: string[];
       patient_age_group: string | null;
       patient_gender: string | null;
       description: string;
       outcome: string | null;
       duration_weeks: number | null;
+      duration_text: string | null;
       photos: string[];
       patient_consent_checked: boolean;
       is_published: boolean;
@@ -203,45 +221,76 @@ function FeedNewContent() {
     // duration "2~4주" → 3 (대략 중앙값) 등 단순 매핑은 생략 — null 로 둠
     const payload: CsInsert = {
       author_id: user.id,
-      author_type: uploaderType,
-      pharmacist_id: uploaderType === "pharmacist" ? user.id : null,
+      // 이 화면은 약사 전용(약사가 환자 사례를 익명으로 작성·게시) → author_type 항상 pharmacist 확정.
+      author_type: "pharmacist",
+      pharmacist_id: user.id,
       title: title.trim() || "(제목 없음)",
-      symptoms: Array.from(symptoms),
+      categories: categories,
       patient_age_group: ageGroup || null,
       patient_gender: gender || null,
       description: (beforeDesc || "").trim() || "(내용 없음)",
       outcome: (afterDesc || "").trim() || null,
       duration_weeks: null,
+      duration_text: improveDuration || null,
       photos: photoUrls,
-      patient_consent_checked: uploaderType === "pharmacist" ? consent : true,
+      patient_consent_checked: consent,
       is_published: true,
     };
-    const { error: insErr } = await (supabase
-      .from("case_studies") as unknown as {
-        insert: (p: CsInsert) => Promise<{ error: { message: string } | null }>;
-      })
-      .insert(payload);
-    if (insErr) {
-      console.error("[feed-new] case_studies insert failed:", insErr);
-      setSubmitError(`등록 실패: ${insErr.message}`);
+    let opErr: { message: string } | null = null;
+    if (editId) {
+      // 편집 — 불변 필드(author_id/author_type/pharmacist_id/is_published) 제외하고 UPDATE.
+      type CsUpdate = Omit<CsInsert, "author_id" | "author_type" | "pharmacist_id" | "is_published">;
+      const updatePayload: CsUpdate = {
+        title: payload.title,
+        categories: payload.categories,
+        patient_age_group: payload.patient_age_group,
+        patient_gender: payload.patient_gender,
+        description: payload.description,
+        outcome: payload.outcome,
+        duration_weeks: payload.duration_weeks,
+        duration_text: payload.duration_text,
+        photos: payload.photos,
+        patient_consent_checked: payload.patient_consent_checked,
+      };
+      const { error } = await (supabase
+        .from("case_studies") as unknown as {
+          update: (p: CsUpdate) => { eq: (c: string, v: string) => Promise<{ error: { message: string } | null }> };
+        })
+        .update(updatePayload)
+        .eq("id", editId);
+      opErr = error;
+    } else {
+      const { error } = await (supabase
+        .from("case_studies") as unknown as {
+          insert: (p: CsInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(payload);
+      opErr = error;
+    }
+    if (opErr) {
+      console.error("[feed-new] case_studies save failed:", opErr);
+      setSubmitError(`${editId ? "수정" : "등록"} 실패: ${opErr.message}`);
       setSubmitting(false);
       return;
     }
 
+    // 성공 — 토스트를 띄운 채로 즉시 이동(인위적 지연 없음). /feed 로 화면이 바뀌며 토스트는 자연 소멸.
     setSubmitting(false);
     setShowToast(true);
-    setTimeout(() => {
-      setShowToast(false);
-      router.push("/feed");
-    }, 1500);
+    router.push("/feed");
   };
 
-  /* 선택된 증상 variant 목록 */
-  const selectedSymptomData = SYMPTOM_OPTIONS.filter((s) => symptoms.has(s.label));
+  /* 선택된 분류 라벨 목록 (미리보기용) */
+  const selectedCategoryLabels = CATEGORY_OPTIONS.filter((c) => categories.includes(c.key)).map((c) => c.label);
 
   return (
     <div className="fn-page">
       <style>{`
+        /* 데스크톱 폭 통일 — /feed/recommend 와 동일(960px). */
+        @media (min-width: 1200px) {
+          .fn-container { max-width: 960px !important; }
+          .fn-bottom-inner { max-width: 960px !important; }
+        }
         .fn-preview-card,
         .fn-preview-card:hover {
           transform: none !important;
@@ -250,6 +299,9 @@ function FeedNewContent() {
           transition: none !important;
           cursor: default !important;
         }
+        /* 토스트 등장 — transform 비충돌(opacity만). globals .fn-toast 의 slideUp(translateY)이
+           중앙정렬 translateX(-50%) 를 덮어써 오른쪽→가운데로 미끄러지는 문제를 인라인 animation 으로 차단. */
+        @keyframes fnConfirmFadeIn { from { opacity: 0; } to { opacity: 1; } }
       `}</style>
       {/* 네비게이션 */}
       <nav>
@@ -262,7 +314,7 @@ function FeedNewContent() {
       <div className="fn-container">
         {/* ── 안내 카드 ── */}
         <div className="fn-guide-card">
-          <div className="fn-guide-title">이런 사례를 올려주세요</div>
+          <div className="fn-guide-title">{editId ? "사례 수정하기" : "이런 사례를 올려주세요"}</div>
           <p className="fn-guide-desc">
             실제 상담 환자의 증상 개선 과정을 공유해주세요.
             환자 개인정보는 자동으로 익명 처리됩니다.
@@ -305,33 +357,23 @@ function FeedNewContent() {
           </div>
         </section>
 
-        {/* ── 증상 태그 ── */}
+        {/* ── 분류 ── */}
         <section className="fn-section">
-          <h2 className="fn-section-title">주요 증상 <span className="fn-required">*</span></h2>
-          <p className="fn-field-hint">최대 3개까지 선택할 수 있어요</p>
+          <h2 className="fn-section-title">분류 <span className="fn-required">*</span></h2>
+          <p className="fn-field-hint">해당하는 분류를 선택해주세요. (최대 3개까지 가능)</p>
 
           <div className="fn-chip-row wrap">
-            {SYMPTOM_OPTIONS.map((s) => (
+            {CATEGORY_OPTIONS.map((c) => (
               <button
-                key={s.label}
-                className={`fn-symptom-chip${symptoms.has(s.label) ? ` active-${s.variant}` : ""}`}
-                onClick={() => toggleSymptom(s.label)}
+                key={c.key}
+                className={`fn-symptom-chip${categories.includes(c.key) ? " active-sage" : ""}`}
+                onClick={() => toggleCategory(c.key)}
                 type="button"
               >
-                {s.label}
+                {c.label}
               </button>
             ))}
           </div>
-
-          {symptoms.has("기타") && (
-            <input
-              type="text"
-              className="fn-input"
-              placeholder="증상을 입력해주세요"
-              value={etcText}
-              onChange={(e) => setEtcText(e.target.value)}
-            />
-          )}
         </section>
 
         {/* ── 증상 기간 ── */}
@@ -548,32 +590,8 @@ function FeedNewContent() {
           )}
           <p className="fn-field-hint">최대 {MAX_PHOTOS}장까지 첨부할 수 있어요 (선택)</p>
 
-          {/* 업로더 유형 (약사만 선택 가능) */}
-          {isPharmacist && (
-            <div style={{ marginBottom: 14 }}>
-              <div className="fn-field-label">사진 올리는 사람</div>
-              <div className="fn-chip-row">
-                <button
-                  type="button"
-                  className={`fn-chip${uploaderType === "pharmacist" ? " selected" : ""}`}
-                  onClick={() => { setUploaderType("pharmacist"); setConsent(false); }}
-                >
-                  약사가 올리는 사례
-                </button>
-                <button
-                  type="button"
-                  className={`fn-chip${uploaderType === "patient" ? " selected" : ""}`}
-                  onClick={() => { setUploaderType("patient"); setConsent(false); }}
-                >
-                  환자 본인이 올리는 사례
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* 동의 체크 (약사 업로드 시) */}
-          {uploaderType === "pharmacist" && (
-            <label style={{
+          {/* 동의 체크 (약사가 환자 사례 업로드 시) */}
+          <label style={{
               display: "flex",
               alignItems: "flex-start",
               gap: 8,
@@ -594,7 +612,6 @@ function FeedNewContent() {
               />
               <span>환자 본인의 동의를 받았으며, 개인 식별이 불가능한 사진만 업로드합니다.</span>
             </label>
-          )}
 
           {/* 버튼 */}
           <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
@@ -699,7 +716,7 @@ function FeedNewContent() {
           </div>
         </section>
 
-        {/* ── 하단 버튼 ── */}
+        {/* ── 하단 버튼 (폼 흐름 맨 끝 — 다 작성한 뒤 보이게) ── */}
         <div style={{
           background: "rgba(248,249,247,0.95)",
           borderTop: "1px solid rgba(94,125,108,0.14)",
@@ -716,15 +733,17 @@ function FeedNewContent() {
               type="button"
               disabled={
                 submitting ||
-                (uploaderType === "pharmacist" && photos.length > 0 && !consent)
+                loadingEdit ||
+                categories.length === 0 ||
+                (photos.length > 0 && !consent)
               }
               style={
-                submitting || (uploaderType === "pharmacist" && photos.length > 0 && !consent)
+                submitting || loadingEdit || categories.length === 0 || (photos.length > 0 && !consent)
                   ? { opacity: 0.5, cursor: "not-allowed" }
                   : {}
               }
             >
-              {submitting ? "등록 중..." : "등록하기"}
+              {loadingEdit ? "불러오는 중..." : submitting ? (editId ? "수정 중..." : "등록 중...") : (editId ? "수정하기" : "등록하기")}
             </button>
           </div>
         </div>
@@ -743,23 +762,23 @@ function FeedNewContent() {
                 {/* 약사 정보 */}
                 <div className="feed-card-header">
                   <div className="feed-card-avatar" style={{ background: "var(--color-sage-pale)", color: "var(--color-sage-deep)", fontSize: 18, display: "flex", alignItems: "center", justifyContent: "center", width: 44, height: 44, borderRadius: "50%", fontWeight: 700, flexShrink: 0 }}>
-                    {PHARMACIST.name.charAt(0)}
+                    {(previewName || "약").charAt(0)}
                   </div>
                   <div className="feed-card-pharmacist">
-                    <div className="feed-card-name">{PHARMACIST.name}</div>
-                    <div className="feed-card-pharmacy">{PHARMACIST.pharmacy}</div>
+                    <div className="feed-card-name">{previewName ? `${previewName} 약사` : "약사"}</div>
+                    <div className="feed-card-pharmacy">{""}</div>
                   </div>
                 </div>
 
                 <div className="feed-card-body">
-                  {/* 증상 태그 */}
-                  <div className="feed-card-tags">
-                    {selectedSymptomData.map((s) => (
-                      <span key={s.label} className={`feed-tag feed-tag-${s.variant}`}>
-                        {s.label}
-                      </span>
-                    ))}
-                  </div>
+                  {/* 분류 태그 */}
+                  {selectedCategoryLabels.length > 0 && (
+                    <div className="feed-card-tags">
+                      {selectedCategoryLabels.map((label) => (
+                        <span key={label} className="feed-tag feed-tag-sage">{label}</span>
+                      ))}
+                    </div>
+                  )}
 
                   {/* 환자 정보 (익명) */}
                   <div className="feed-card-patient">
@@ -858,7 +877,7 @@ function FeedNewContent() {
                 textAlign: "center",
               }}
             >
-              개선 사례를 등록하시겠습니까?
+              {editId ? "이대로 수정할까요?" : "개선 사례를 등록하시겠습니까?"}
             </h3>
             <p
               style={{
@@ -871,6 +890,12 @@ function FeedNewContent() {
             >
               등록 후 개선 사례 피드에 공개됩니다.
             </p>
+            <div style={{
+              margin: "14px 0 4px", padding: "12px 14px", borderRadius: 10,
+              background: "#F4F6F4", fontSize: 14, color: "#3D4A42", lineHeight: 1.5, textAlign: "center",
+            }}>
+              이 증상으로 올라가요: <b style={{ color: "#2C3630" }}>{selectedCategoryLabels.join(", ")}</b>
+            </div>
             <div style={{ display: "flex", gap: 10 }}>
               <button
                 onClick={() => setShowConfirm(false)}
@@ -904,7 +929,7 @@ function FeedNewContent() {
                   cursor: "pointer",
                 }}
               >
-                등록하기
+                {editId ? "수정 완료" : "등록하기"}
               </button>
             </div>
           </div>
@@ -913,7 +938,7 @@ function FeedNewContent() {
 
       {/* ── 토스트 ── */}
       {showToast && (
-        <div className="fn-toast">등록 완료!</div>
+        <div className="fn-toast" style={{ position: "fixed", top: "50%", left: "50%", bottom: "auto", transform: "translate(-50%, -50%)", zIndex: 300, animation: "fnConfirmFadeIn 0.2s ease" }}>등록 완료 (피드 목록으로 돌아갑니다)</div>
       )}
     </div>
   );

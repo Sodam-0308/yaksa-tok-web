@@ -1,7 +1,10 @@
 "use client";
 
-import { useState, Suspense } from "react";
+import { useState, useEffect, Suspense } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import type { PharmacistQuestion } from "@/types/database";
 
 /* ══════════════════════════════════════════
    타입 & Mock
@@ -21,121 +24,6 @@ interface QuestionSet {
   name: string;
   isDefault: boolean;
   questions: Question[];
-}
-
-const MOCK_SETS: Record<string, QuestionSet> = {
-  "set-1": {
-    id: "set-1",
-    name: "소화 문제용",
-    isDefault: true,
-    questions: [
-      {
-        id: "q1",
-        text: "식후 더부룩함이 얼마나 자주 있나요?",
-        type: "객관식",
-        choices: ["거의 없음", "가끔", "자주", "매일"],
-      },
-      {
-        id: "q2",
-        text: "배변 주기는 어떻게 되나요?",
-        type: "객관식",
-        choices: ["매일", "2~3일에 한 번", "일주일에 2~3회", "일주일에 한 번 이하"],
-      },
-      {
-        id: "q3",
-        text: "소화에 도움이 되는 음식이 있다면 자유롭게 적어주세요.",
-        type: "주관식",
-        choices: [],
-      },
-      {
-        id: "q4",
-        text: "평소 불편한 증상을 모두 선택해주세요.",
-        type: "다중 선택",
-        choices: ["속쓰림", "더부룩함", "가스 참", "메스꺼움", "복통"],
-      },
-      {
-        id: "q5",
-        text: "하루 수분 섭취량은 어느 정도인가요?",
-        type: "객관식",
-        choices: ["500mL 이하", "500mL~1L", "1L~2L", "2L 이상"],
-      },
-    ],
-  },
-  "set-2": {
-    id: "set-2",
-    name: "수면 문제용",
-    isDefault: false,
-    questions: [
-      {
-        id: "q1",
-        text: "잠드는 데까지 걸리는 시간은?",
-        type: "객관식",
-        choices: ["10분 이내", "10~30분", "30분~1시간", "1시간 이상"],
-      },
-      {
-        id: "q2",
-        text: "자다가 깨는 횟수는?",
-        type: "객관식",
-        choices: ["없음", "1회", "2~3회", "4회 이상"],
-      },
-      {
-        id: "q3",
-        text: "수면 관련 더 말씀하고 싶은 내용이 있다면 적어주세요.",
-        type: "주관식",
-        choices: [],
-      },
-    ],
-  },
-  "set-3": {
-    id: "set-3",
-    name: "피로·무기력용",
-    isDefault: false,
-    questions: [
-      {
-        id: "q1",
-        text: "오전과 오후 중 언제 더 피곤함을 느끼나요?",
-        type: "객관식",
-        choices: ["오전", "오후", "온종일", "저녁 이후"],
-      },
-      {
-        id: "q2",
-        text: "피로와 함께 오는 증상을 모두 선택해주세요.",
-        type: "다중 선택",
-        choices: ["두통", "어지러움", "집중력 저하", "근육통", "식욕 저하"],
-      },
-      {
-        id: "q3",
-        text: "최근 운동 빈도는?",
-        type: "객관식",
-        choices: ["안 함", "주 1~2회", "주 3~4회", "거의 매일"],
-      },
-      {
-        id: "q4",
-        text: "평소 스트레스 요인이 있다면 적어주세요.",
-        type: "주관식",
-        choices: [],
-      },
-    ],
-  },
-};
-
-function loadSet(setId: string): QuestionSet {
-  if (setId === "new") {
-    return {
-      id: `set-${Date.now()}`,
-      name: "",
-      isDefault: false,
-      questions: [],
-    };
-  }
-  return (
-    MOCK_SETS[setId] ?? {
-      id: setId,
-      name: "새 세트",
-      isDefault: false,
-      questions: [],
-    }
-  );
 }
 
 /* ══════════════════════════════════════════
@@ -173,10 +61,56 @@ function Content() {
   const setId = (params?.setId as string) ?? "new";
   const isNew = setId === "new";
 
-  const [initial] = useState<QuestionSet>(() => loadSet(setId));
-  const [name, setName] = useState(initial.name);
-  const [isDefault, setIsDefault] = useState(initial.isDefault);
-  const [questions, setQuestions] = useState<Question[]>(initial.questions);
+  const { user } = useAuth();
+  const [loading, setLoading] = useState(!isNew);
+  const [notFound, setNotFound] = useState(false);
+  const [name, setName] = useState("");
+  const [isDefault, setIsDefault] = useState(false);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [original, setOriginal] = useState<{ name: string; isDefault: boolean; questions: Question[] } | null>(null);
+  const [savingSet, setSavingSet] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [showLeaveModal, setShowLeaveModal] = useState(false);
+
+  /* ── 로드 ── */
+  useEffect(() => {
+    if (isNew) {
+      setOriginal({ name: "", isDefault: false, questions: [] });
+      setLoading(false);
+      return;
+    }
+    if (!user) return;
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("pharmacist_question_sets")
+          .select("title, is_default, questions, pharmacist_id")
+          .eq("id", setId)
+          .maybeSingle<{ title: string | null; is_default: boolean | null; questions: PharmacistQuestion[] | null; pharmacist_id: string }>();
+        if (cancelled) return;
+        if (error || !data || data.pharmacist_id !== user.id) { setNotFound(true); return; }
+        const loadedName = data.title ?? "";
+        const loadedDefault = !!data.is_default;
+        const rawQs = Array.isArray(data.questions) ? data.questions : [];
+        // DB엔 질문 id 없음 → 화면용 보조 id를 인덱스로 부여
+        const loadedQs: Question[] = rawQs.map((q, i) => ({
+          id: `q-${i}`,
+          text: String(q?.text ?? ""),
+          type: (["객관식", "주관식", "다중 선택"].includes(q?.type as string) ? q.type : "객관식") as QuestionType,
+          choices: Array.isArray(q?.choices) ? q.choices.map(String) : [],
+        }));
+        setName(loadedName);
+        setIsDefault(loadedDefault);
+        setQuestions(loadedQs);
+        setOriginal({ name: loadedName, isDefault: loadedDefault, questions: loadedQs });
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isNew, setId, user]);
 
   // 드래그 상태
   const [dragIdx, setDragIdx] = useState<number | null>(null);
@@ -272,16 +206,70 @@ function Content() {
     setDragOverIdx(null);
   };
 
-  const saveSet = () => {
-    // 실제 저장은 백엔드 연결 후 구현
-    setSavedToast(true);
-    setTimeout(() => {
-      setSavedToast(false);
-      router.push("/pharmacist/mypage");
-    }, 1200);
+  const canSaveSet = name.trim().length > 0 && questions.length > 0;
+
+  /* dirty 판정 — 로드 원본 대비 변경 여부 */
+  const isDirty = original !== null &&
+    JSON.stringify({ name, isDefault, questions }) !== JSON.stringify(original);
+
+  const saveSet = async () => {
+    if (savingSet || !canSaveSet || !user) return;
+    setSavingSet(true);
+    setSaveError(null);
+    // DB 구조: { text, type, choices? } — 화면 보조 id 제거, 주관식은 choices 생략
+    const dbQuestions = questions.map((q) =>
+      q.type === "주관식"
+        ? { text: q.text, type: q.type }
+        : { text: q.text, type: q.type, choices: q.choices }
+    );
+    // 새 컬럼(updated_at 등) 유연 처리 위해 write 빌더 캐스팅
+    type Writer = {
+      update: (p: Record<string, unknown>) => { eq: (c: string, v: string) => Promise<{ error: Error | null }> };
+      insert: (p: Record<string, unknown>) => { select: (c: string) => { single: () => Promise<{ data: { id: string } | null; error: Error | null }> } };
+    };
+    const pqs = () => supabase.from("pharmacist_question_sets") as unknown as Writer;
+    try {
+      // 기본 세트는 1개만 — 켤 때 본인 다른 세트를 모두 내림
+      if (isDefault) {
+        const { error: rErr } = await pqs().update({ is_default: false }).eq("pharmacist_id", user.id);
+        if (rErr) throw rErr;
+      }
+      if (isNew) {
+        const { data, error } = await pqs()
+          .insert({ pharmacist_id: user.id, title: name.trim(), is_default: isDefault, questions: dbQuestions })
+          .select("id").single();
+        if (error || !data) throw error ?? new Error("insert failed");
+      } else {
+        const { error } = await pqs()
+          .update({ title: name.trim(), is_default: isDefault, questions: dbQuestions, updated_at: new Date().toISOString() })
+          .eq("id", setId);
+        if (error) throw error;
+      }
+      // dirty 리셋 기준 갱신
+      setOriginal({ name, isDefault, questions });
+      setSavedToast(true);
+      setTimeout(() => { setSavedToast(false); router.push("/pharmacist/mypage"); }, 1200);
+    } catch (e) {
+      console.error("[question-set] save failed:", e);
+      setSaveError("저장에 실패했어요. 잠시 후 다시 시도해주세요.");
+    } finally {
+      setSavingSet(false);
+    }
   };
 
-  const canSaveSet = name.trim().length > 0 && questions.length > 0;
+  /* 이탈 경고 — 브라우저 새로고침·창닫기 (isDirty일 때만) */
+  useEffect(() => {
+    if (!isDirty) return;
+    const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [isDirty]);
+
+  /* 앱 내 이탈(뒤로가기/취소) — dirty면 커스텀 모달 */
+  const requestLeave = () => {
+    if (isDirty) { setShowLeaveModal(true); return; }
+    router.push("/pharmacist/mypage");
+  };
 
   return (
     <>
@@ -312,7 +300,7 @@ function Content() {
         <nav>
           <button
             type="button"
-            onClick={() => router.push("/pharmacist/mypage")}
+            onClick={requestLeave}
             aria-label="뒤로가기"
             style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textDark, padding: 6, lineHeight: 1 }}
           >←</button>
@@ -321,6 +309,18 @@ function Content() {
           </div>
         </nav>
 
+        {loading ? (
+          <div className="qs-c" style={{ minHeight: "50vh", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, color: C.textMid }}>
+            불러오는 중이에요…
+          </div>
+        ) : notFound ? (
+          <div className="qs-c" style={{ minHeight: "50vh", display: "flex", flexDirection: "column", gap: 8, alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+            <div style={{ fontSize: 40 }}>🔍</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark }}>세트를 찾을 수 없어요</div>
+            <button type="button" onClick={() => router.push("/pharmacist/mypage")} style={{ marginTop: 8, padding: "10px 20px", border: `1px solid ${C.sageLight}`, borderRadius: 10, background: C.white, color: C.sageDeep, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>목록으로</button>
+          </div>
+        ) : (
+          <>
         <div className="qs-c">
           {/* ── 세트 이름 + 기본 세트 토글 ── */}
           <div style={{ background: C.white, borderRadius: 16, padding: 20, marginBottom: 16, boxShadow: "0 2px 12px rgba(74,99,85,0.07)" }}>
@@ -529,10 +529,15 @@ function Content() {
 
         {/* 하단 저장 바 */}
         <div className="qs-bottom">
+          {saveError && (
+            <div className="qs-bottom-inner" style={{ marginBottom: 8, fontSize: 13, color: C.error, fontWeight: 600 }}>
+              {saveError}
+            </div>
+          )}
           <div className="qs-bottom-inner" style={{ display: "flex", gap: 10 }}>
             <button
               type="button"
-              onClick={() => router.push("/pharmacist/mypage")}
+              onClick={requestLeave}
               style={{
                 padding: "14px 0", borderRadius: 12,
                 fontSize: 15, fontWeight: 700,
@@ -544,20 +549,25 @@ function Content() {
             <button
               type="button"
               onClick={saveSet}
-              disabled={!canSaveSet}
+              disabled={!canSaveSet || savingSet}
               style={{
                 padding: "14px 0", borderRadius: 12,
                 fontSize: 15, fontWeight: 700,
-                background: canSaveSet ? C.sageDeep : C.sageLight,
+                background: !canSaveSet ? C.sageLight : (isDirty ? C.terra : C.sageLight),
                 color: C.white, border: "none",
-                cursor: canSaveSet ? "pointer" : "default",
+                cursor: (!canSaveSet || savingSet) ? "default" : "pointer",
+                opacity: savingSet ? 0.7 : 1,
+                boxShadow: (canSaveSet && isDirty) ? "0 4px 14px rgba(192,107,69,0.35)" : "none",
+                transition: "background 0.15s, box-shadow 0.15s",
                 flex: 2,
               }}
             >
-              세트 저장
+              {savingSet ? "저장 중..." : isDirty ? "• 변경사항 저장" : "저장됨"}
             </button>
           </div>
         </div>
+        </>
+        )}
       </div>
 
       {/* 질문 삭제 확인 */}
@@ -613,18 +623,70 @@ function Content() {
         </div>
       )}
 
-      {/* 저장 완료 토스트 */}
+      {/* 저장 완료 토스트 — 화면 정중앙 */}
       {savedToast && (
-        <div style={{
-          position: "fixed", bottom: 88, left: "50%",
-          transform: "translateX(-50%)",
-          padding: "12px 22px", borderRadius: 24,
-          background: "rgba(50,55,52,0.95)", color: C.white,
-          fontSize: 14, fontWeight: 600,
-          boxShadow: "0 6px 24px rgba(0,0,0,0.18)",
-          zIndex: 500, whiteSpace: "nowrap",
+        <div role="status" style={{
+          position: "fixed", top: "50%", left: "50%",
+          transform: "translate(-50%, -50%)",
+          padding: "14px 24px", borderRadius: 12,
+          background: C.sageDeep, color: C.white,
+          fontSize: 15, fontWeight: 700,
+          boxShadow: "0 8px 28px rgba(0,0,0,0.28)",
+          zIndex: 1000, whiteSpace: "nowrap",
+          fontFamily: "'Noto Sans KR', sans-serif",
         }}>
-          ✓ 세트가 저장되었습니다
+          문답 세트가 저장됐어요 ✓
+        </div>
+      )}
+
+      {/* 이탈 확인 모달 (저장 안 한 변경사항 있을 때) */}
+      {showLeaveModal && (
+        <div
+          onClick={() => setShowLeaveModal(false)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 400,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 16,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: C.white, borderRadius: 16,
+              padding: "24px 22px", maxWidth: 320, width: "100%",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.15)", textAlign: "center",
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>
+              저장하지 않은 변경사항이 있어요
+            </div>
+            <div style={{ fontSize: 13, color: C.textMid, lineHeight: 1.6, marginBottom: 16 }}>
+              지금 나가면 변경한 내용이 사라져요.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => setShowLeaveModal(false)}
+                style={{
+                  flex: 1, padding: "11px 0", borderRadius: 10,
+                  fontSize: 14, fontWeight: 600,
+                  background: C.sageBg, color: C.textMid,
+                  border: `1px solid ${C.border}`, cursor: "pointer",
+                }}
+              >취소</button>
+              <button
+                type="button"
+                onClick={() => { setShowLeaveModal(false); router.push("/pharmacist/mypage"); }}
+                style={{
+                  flex: 1, padding: "11px 0", borderRadius: 10,
+                  fontSize: 14, fontWeight: 700,
+                  background: C.error, color: C.white,
+                  border: "none", cursor: "pointer",
+                }}
+              >나가기</button>
+            </div>
+          </div>
         </div>
       )}
     </>

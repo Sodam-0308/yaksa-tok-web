@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import HealthIndicatorComparison from "@/components/HealthIndicatorComparison";
 import { useAuth } from "@/contexts/AuthContext";
@@ -409,6 +409,7 @@ const emptyBtnOutline: React.CSSProperties = {
 
 function MypageContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { user, signOut } = useAuth();
   const showEmptyState = false;
 
@@ -1195,6 +1196,29 @@ function MypageContent() {
       return next;
     });
   };
+
+  /* ── ?guide= 딥링크 — 채팅 "복용 가이드 보기" 버튼에서 진입 시 해당 카드 자동 펼침·스크롤.
+   *  로드 완료(dosageGuidesLoaded) 후 1회만(didDeepLinkRef). activeGuides 는 렌더 파생값이라
+   *  여기선 동일 active 조건으로 재계산해 인덱스(펼침 키)를 구한다. 매칭 실패 시 조용히 통과. */
+  const didDeepLinkRef = useRef(false);
+  useEffect(() => {
+    if (didDeepLinkRef.current) return;
+    if (!dosageGuidesLoaded) return;
+    const guideId = searchParams.get("guide");
+    if (!guideId) return;
+    didDeepLinkRef.current = true;
+    const activeGuides = dosageGuides.filter((g) => g.dosage_status === "active");
+    const idx = activeGuides.findIndex((g) => g.id === guideId);
+    if (idx >= 0) {
+      // 딥링크 도착 시 그 카드 하나만 펼침 — 기본 0번 펼침과 겹쳐 두 개 열리는 혼란 방지.
+      setExpandedGuides(new Set([idx]));
+      requestAnimationFrame(() => {
+        document.getElementById(`guide-${guideId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    }
+    // ?guide= 제거 — 새로고침 시 재스크롤 방지 + 주소창 정리. scroll:false 로 현재 스크롤 위치 보존.
+    router.replace("/mypage", { scroll: false });
+  }, [dosageGuidesLoaded, dosageGuides]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── 설정 (알림 세분화) ── */
   const [notiChat, setNotiChat] = useState(true);
@@ -2537,6 +2561,7 @@ function MypageContent() {
               return (
                 <div
                   key={guide.id}
+                  id={`guide-${guide.id}`}
                   style={{
                     borderRadius: 14,
                     border: gi === 0 ? "1.5px solid #F0D9CC" : "1px solid rgba(94,125,108,0.14)",

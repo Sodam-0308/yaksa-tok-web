@@ -80,11 +80,9 @@ export function applyFilters(
     filterSource, filterVisit, filterSupplement, filterRelation,
   } = opts;
 
-  // 새 상담 요청(requested)은 기본 제외(dbPendingList 위쪽 영역과 중복 방지).
-  //   단 "🔔 새 상담 요청" 탭 활성 시 통과시킴.
-  let result = consults.filter(
-    (c) => filter === "requested" || !(c.patientStatus === "requested" && !c.isRejected),
-  );
+  // 통합 목록은 모든 상태를 포함(pending 포함). 옛 dbPending 박스 제거(2단계)로 pending 별도 제외 불필요.
+  //   각 탭은 아래 if-체인에서 자기 술어로 좁힘. "전체"는 원본 패스스루.
+  let result = consults;
 
   if (filter === "managing") {
     result = result.filter((c) => c.patientStatus === "managing");

@@ -1,7 +1,9 @@
 "use client";
 
-import { useState, useRef, Suspense } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useEffect, useRef, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
 
 /* ════════════��═════════════════════════════
    상수 & 더미
@@ -9,32 +11,21 @@ import { useRouter } from "next/navigation";
 
 const PHARMACIST = { name: "김서연", pharmacy: "그린약국", career: "15년차" };
 
-type TagVariant = "sage" | "terra" | "lavender" | "rose" | "blue" | "muted";
-
-interface SymptomOption { label: string; variant: TagVariant }
-
-const SYMPTOM_OPTIONS: SymptomOption[] = [
-  { label: "만성피로", variant: "terra" },
-  { label: "소화장애", variant: "sage" },
-  { label: "불면", variant: "lavender" },
-  { label: "비염", variant: "blue" },
-  { label: "두통", variant: "terra" },
-  { label: "생리통", variant: "rose" },
-  { label: "여드름", variant: "rose" },
-  { label: "아토피", variant: "rose" },
-  { label: "우울·불안", variant: "lavender" },
-  { label: "안구건조", variant: "blue" },
-  { label: "수족냉증", variant: "blue" },
-  { label: "붓기", variant: "sage" },
-  { label: "관절통", variant: "blue" },
-  { label: "난임", variant: "rose" },
-  { label: "집중력 저하", variant: "terra" },
-  { label: "기타", variant: "muted" },
-];
+const CATEGORY_OPTIONS = [
+  { key: "digestion",   label: "소화·장" },
+  { key: "sleep",       label: "수면·마음" },
+  { key: "fatigue",     label: "피로·기력" },
+  { key: "skin",        label: "피부" },
+  { key: "pain",        label: "통증·염증" },
+  { key: "women",       label: "여성건강" },
+  { key: "circulation", label: "체중관리·순환" },
+  { key: "growth",      label: "소아·성장" },
+  { key: "etc",         label: "기타" },
+] as const;
 
 const GENDERS = ["남성", "여성", "기타"] as const;
 const AGE_GROUPS = ["영유아 (0~6세)", "어린이 (7~12세)", "10대", "20대", "30대", "40대", "50대", "60대", "70대 이상"] as const;
-const DURATION_OPTIONS = ["2주 이내", "2~4주", "1~2개월", "2~3개월", "3~6개월", "6개월 이상"] as const;
+const DURATION_OPTIONS = ["1주 이내", "2주 이내", "1개월 이내", "3개월 이내", "6개월 이내", "6개월 이상"] as const;
 
 const MAX_TITLE = 50;
 const MIN_BODY = 100;
@@ -57,6 +48,13 @@ const C = {
 
 function RecommendContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const editId = searchParams.get("edit"); // 편집 모드 — 기존 글 id
+  const { user, profile } = useAuth();
+  // 미리보기 표시용 약사 이름 — 실제 로그인 약사(profile.name). 비동기로 늦게 오면 빈값, mock 이름은 절대 표시 안 함.
+  const previewName = profile?.name?.trim() || "";
+  // 전용 story 버킷이 없어 case-photos 재사용 — 동일 약사 업로더 + `${uid}/` 경로 prefix 라 동일 Storage RLS 통과.
+  const STORY_PHOTO_BUCKET = "case-photos";
 
   /* 대상 */
   const [targetType, setTargetType] = useState<"self" | "family" | "">("");
@@ -64,13 +62,15 @@ function RecommendContent() {
   const [familyGender, setFamilyGender] = useState("");
 
   /* 증상 */
-  const [symptoms, setSymptoms] = useState<Set<string>>(new Set());
-  const toggleSymptom = (label: string) => {
-    setSymptoms((prev) => {
-      const next = new Set(prev);
-      next.has(label) ? next.delete(label) : (next.size < 3 && next.add(label));
-      return next;
-    });
+  const [categories, setCategories] = useState<string[]>([]);
+  const toggleCategory = (key: string) => {
+    setCategories((prev) =>
+      prev.includes(key)
+        ? prev.filter((k) => k !== key)
+        : prev.length < 3
+        ? [...prev, key]
+        : prev
+    );
   };
 
   /* 제목 & ���문 */
@@ -96,7 +96,7 @@ function RecommendContent() {
   const [career, setCareer] = useState(PHARMACIST.career + " 약사");
 
   /* 사진 */
-  const [photos, setPhotos] = useState<{ file: File; url: string }[]>([]);
+  const [photos, setPhotos] = useState<{ file?: File; url: string }[]>([]);
   const galleryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
 
@@ -120,14 +120,159 @@ function RecommendContent() {
   const [showPreview, setShowPreview] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [showToast, setShowToast] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [loadingEdit, setLoadingEdit] = useState(false);
 
-  const handleSubmit = () => {
+  /* 편집 모드 — editId 있으면 기존 글 1회 로드해 폼 초기값 채움. */
+  useEffect(() => {
+    if (!editId) return;
+    let cancelled = false;
+    setLoadingEdit(true);
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("pharmacist_stories").select("*").eq("id", editId).maybeSingle();
+        if (cancelled || error || !data) return;
+        const row = data as Record<string, unknown>;
+        setTitle((row.title as string) ?? "");
+        setCategories(Array.isArray(row.categories) ? (row.categories as string[]) : []);
+        setBody((row.story as string) ?? "");
+        setDuration((row.duration_text as string) ?? "");
+        const existing = Array.isArray(row.photos) ? (row.photos as string[]) : [];
+        setPhotos(existing.map((u) => ({ url: u })));
+        // 본인/가족 추론: 나이/성별이 있으면 가족, 없으면 본인.
+        if (row.subject_age_group || row.subject_gender) {
+          setTargetType("family");
+          setFamilyAge((row.subject_age_group as string) ?? "");
+          setFamilyGender((row.subject_gender as string) ?? "");
+        } else {
+          setTargetType("self");
+        }
+        // changes 복원: before/after_description 을 \n 으로 쪼개 인덱스로 짝짓기.
+        const befores = ((row.before_description as string) ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+        const afters = ((row.after_description as string) ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+        const n = Math.max(befores.length, afters.length);
+        const restored: Change[] = [];
+        for (let i = 0; i < n; i++) restored.push({ before: befores[i] ?? "", after: afters[i] ?? "" });
+        setChanges(restored.length ? restored : [{ before: "", after: "" }]);
+      } finally {
+        if (!cancelled) setLoadingEdit(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [editId]);
+
+  /* 등록/수정 — Supabase Storage 업로드 + pharmacist_stories INSERT/UPDATE */
+  const handleSubmit = async () => {
+    if (submitting) return;
     setShowConfirm(false);
+    setSubmitError(null);
+
+    if (!user) {
+      setSubmitError("약사 로그인이 필요해요");
+      return;
+    }
+    setSubmitting(true);
+
+    // 1) 사진 Storage 업로드
+    const photoUrls: string[] = [];
+    for (let i = 0; i < photos.length; i++) {
+      const p = photos[i];
+      if (!p.file) {
+        photoUrls.push(p.url); // 편집 시 기존 사진 URL 유지
+        continue;
+      }
+      const ext = (p.file.name.split(".").pop() || "jpg").toLowerCase();
+      const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+      const path = `${user.id}/${Date.now()}-${i}.${safeExt}`;
+      const { error: upErr } = await supabase.storage
+        .from(STORY_PHOTO_BUCKET)
+        .upload(path, p.file, { upsert: false, cacheControl: "3600", contentType: p.file.type });
+      if (upErr) {
+        console.error("[recommend] story photo upload failed:", upErr);
+        setSubmitError("사진 업로드에 실패했어요. 잠시 후 다시 시도해 주세요.");
+        setSubmitting(false);
+        return;
+      }
+      const { data: pub } = supabase.storage.from(STORY_PHOTO_BUCKET).getPublicUrl(path);
+      if (pub?.publicUrl) photoUrls.push(pub.publicUrl);
+    }
+
+    // 2) pharmacist_stories INSERT
+    //   changes(전/후 변화 배열)는 DB의 단일 before_description/after_description 으로 합쳐 저장(줄바꿈 join).
+    const beforeDesc = changes.map((c) => c.before.trim()).filter(Boolean).join("\n");
+    const afterDesc = changes.map((c) => c.after.trim()).filter(Boolean).join("\n");
+    type PsInsert = {
+      pharmacist_id: string;
+      title: string;
+      categories: string[];
+      subject_age_group: string | null;
+      subject_gender: string | null;
+      subject_relation: string | null;
+      before_description: string;
+      after_description: string;
+      story: string | null;
+      duration_text: string | null;
+      photos: string[];
+      is_published: boolean;
+    };
+    const payload: PsInsert = {
+      pharmacist_id: user.id,
+      title: title.trim() || "(제목 없음)",
+      categories: categories,
+      subject_age_group: targetType === "family" ? (familyAge || null) : null,
+      subject_gender: targetType === "family" ? (familyGender || null) : null,
+      subject_relation: targetText.trim() || null,
+      before_description: beforeDesc,
+      after_description: afterDesc,
+      story: body.trim() || null,
+      duration_text: duration || null,
+      photos: photoUrls,
+      is_published: true,
+    };
+    let opErr: { message: string } | null = null;
+    if (editId) {
+      // 편집 — 불변 필드(pharmacist_id/is_published) 제외하고 UPDATE.
+      type PsUpdate = Omit<PsInsert, "pharmacist_id" | "is_published">;
+      const updatePayload: PsUpdate = {
+        title: payload.title,
+        categories: payload.categories,
+        subject_age_group: payload.subject_age_group,
+        subject_gender: payload.subject_gender,
+        subject_relation: payload.subject_relation,
+        before_description: payload.before_description,
+        after_description: payload.after_description,
+        story: payload.story,
+        duration_text: payload.duration_text,
+        photos: payload.photos,
+      };
+      const { error } = await (supabase
+        .from("pharmacist_stories") as unknown as {
+          update: (p: PsUpdate) => { eq: (c: string, v: string) => Promise<{ error: { message: string } | null }> };
+        })
+        .update(updatePayload)
+        .eq("id", editId);
+      opErr = error;
+    } else {
+      const { error } = await (supabase
+        .from("pharmacist_stories") as unknown as {
+          insert: (p: PsInsert) => Promise<{ error: { message: string } | null }>;
+        })
+        .insert(payload);
+      opErr = error;
+    }
+    if (opErr) {
+      console.error("[recommend] pharmacist_stories save failed:", opErr);
+      setSubmitError(`${editId ? "수정" : "등록"}에 실패했어요. 잠시 후 다시 시도해 주세요.`);
+      setSubmitting(false);
+      return;
+    }
+
+    // 성공 — 토스트를 띄운 채로 즉시 이동(인위적 지연 없음). /feed 로 화면이 바뀌며 토스트는 자연 소멸.
+    setSubmitting(false);
     setShowToast(true);
-    setTimeout(() => {
-      setShowToast(false);
-      router.push("/feed");
-    }, 2000);
+    router.push("/feed");
   };
 
   /* 대상 텍스트 */
@@ -138,7 +283,7 @@ function RecommendContent() {
       : "";
 
   /* 선택된 증상 데이터 */
-  const selectedSymptomData = SYMPTOM_OPTIONS.filter((s) => symptoms.has(s.label));
+  const selectedCategoryLabels = CATEGORY_OPTIONS.filter((c) => categories.includes(c.key)).map((c) => c.label);
 
   return (
     <>
@@ -151,6 +296,9 @@ function RecommendContent() {
             grid-template-columns: repeat(3, 1fr) !important;
           }
         }
+        /* 확인 팝업 등장 — transform 비충돌(opacity만). globals .fn-confirm 의 fadeUp(translateY)이
+           중앙정렬 translate(-50%,-50%) 를 덮어써 우하단→가운데로 미끄러지는 문제를 인라인 animation 으로 차단. */
+        @keyframes fnConfirmFadeIn { from { opacity: 0; } to { opacity: 1; } }
       `}</style>
 
       <div className="fn-page">
@@ -159,7 +307,7 @@ function RecommendContent() {
           <button className="nav-back" onClick={() => router.back()} aria-label="뒤로가기">
             ←
           </button>
-          <div className="nav-title">약사의 이야기 작성</div>
+          <div className="nav-title">{editId ? "이야기 수정하기" : "약사의 이야기 작성"}</div>
         </nav>
 
         <div className="fn-container">
@@ -235,21 +383,21 @@ function RecommendContent() {
             )}
           </section>
 
-          {/* ── 4. 증상 태그 ── */}
+          {/* ── 4. 분류 ── */}
           <section className="fn-section">
             <h2 className="fn-section-title">
-              주요 증상 <span className="fn-required">*</span>
+              분류 <span className="fn-required">*</span>
             </h2>
-            <p className="fn-field-hint">최대 3개까지 선택할 수 있어요</p>
+            <p className="fn-field-hint">해당하는 분류를 선택해주세요. (최대 3개까지 가능)</p>
             <div className="fn-chip-row wrap">
-              {SYMPTOM_OPTIONS.map((s) => (
+              {CATEGORY_OPTIONS.map((c) => (
                 <button
-                  key={s.label}
+                  key={c.key}
                   type="button"
-                  className={`fn-symptom-chip${symptoms.has(s.label) ? ` active-${s.variant}` : ""}`}
-                  onClick={() => toggleSymptom(s.label)}
+                  className={`fn-symptom-chip${categories.includes(c.key) ? " active-sage" : ""}`}
+                  onClick={() => toggleCategory(c.key)}
                 >
-                  {s.label}
+                  {c.label}
                 </button>
               ))}
             </div>
@@ -479,7 +627,7 @@ function RecommendContent() {
             등록 시 자동 포함: &quot;개인의 경험이며, 같은 증상이라도 사람마다 원인이 다릅니다. 정확한 분석은 전문 약사와 상담하세요.&quot;
           </div>
 
-          {/* ── 하단 버튼 ── */}
+          {/* ── 하단 버튼 (폼 흐름 맨 끝 — 다 작성한 뒤 보이게) ── */}
           <div style={{
             background: "rgba(248,249,247,0.95)",
             borderTop: "1px solid rgba(94,125,108,0.14)",
@@ -490,8 +638,14 @@ function RecommendContent() {
               <button className="fn-btn secondary" onClick={() => setShowPreview(true)} type="button">
                 미리보기
               </button>
-              <button className="fn-btn primary" onClick={() => setShowConfirm(true)} type="button">
-                등록하기
+              <button
+                className="fn-btn primary"
+                onClick={() => setShowConfirm(true)}
+                type="button"
+                disabled={submitting || loadingEdit || categories.length === 0}
+                style={(submitting || loadingEdit || categories.length === 0) ? { opacity: 0.5, cursor: "not-allowed" } : {}}
+              >
+                {loadingEdit ? "불러오는 중..." : submitting ? (editId ? "수정 중..." : "등록 중...") : (editId ? "수정하기" : "등록하기")}
               </button>
             </div>
           </div>
@@ -514,12 +668,12 @@ function RecommendContent() {
                       alignItems: "center", justifyContent: "center",
                       fontSize: 18, fontWeight: 700, color: C.sageDeep, flexShrink: 0,
                     }}>
-                      {PHARMACIST.name.charAt(0)}
+                      {(previewName || "약").charAt(0)}
                     </div>
                     <div className="feed-card-pharmacist">
-                      <div className="feed-card-name">{PHARMACIST.name} 약사</div>
+                      <div className="feed-card-name">{previewName ? `${previewName} 약사` : "약사"}</div>
                       <div className="feed-card-pharmacy">
-                        {PHARMACIST.pharmacy} · {career || PHARMACIST.career}
+                        {career || ""}
                       </div>
                     </div>
                   </div>
@@ -532,11 +686,11 @@ function RecommendContent() {
                       </div>
                     )}
 
-                    {/* 증상 태그 */}
-                    {selectedSymptomData.length > 0 && (
+                    {/* 분류 태그 */}
+                    {selectedCategoryLabels.length > 0 && (
                       <div className="feed-card-tags">
-                        {selectedSymptomData.map((s) => (
-                          <span key={s.label} className={`feed-tag feed-tag-${s.variant}`}>{s.label}</span>
+                        {selectedCategoryLabels.map((label) => (
+                          <span key={label} className="feed-tag feed-tag-sage">{label}</span>
                         ))}
                       </div>
                     )}
@@ -636,15 +790,21 @@ function RecommendContent() {
         {/* ── 등록 확인 팝업 ── */}
         {showConfirm && (
           <div className="fn-modal-overlay" onClick={() => setShowConfirm(false)}>
-            <div className="fn-confirm" onClick={(e) => e.stopPropagation()}>
-              <h3 className="fn-confirm-title">이야기를 등록하시겠습니까?</h3>
+            <div className="fn-confirm" onClick={(e) => e.stopPropagation()} style={{ animation: "fnConfirmFadeIn 0.2s ease" }}>
+              <h3 className="fn-confirm-title">{editId ? "이대로 수정할까요?" : "이야기를 등록하시겠습니까?"}</h3>
               <p className="fn-confirm-desc">등록 후 약사의 이야기 피드에 공개됩니다.</p>
+              <div style={{
+                margin: "14px 0 4px", padding: "12px 14px", borderRadius: 10,
+                background: "#F4F6F4", fontSize: 14, color: "#3D4A42", lineHeight: 1.5, textAlign: "center",
+              }}>
+                선택한 분류: <b style={{ color: "#2C3630" }}>{selectedCategoryLabels.join(", ")}</b>
+              </div>
               <div className="fn-confirm-actions">
                 <button className="fn-btn secondary" onClick={() => setShowConfirm(false)} type="button">
                   취소
                 </button>
-                <button className="fn-btn primary" onClick={handleSubmit} type="button">
-                  등록하기
+                <button className="fn-btn primary" onClick={handleSubmit} type="button" disabled={submitting}>
+                  {submitting ? (editId ? "수정 중..." : "등록 중...") : (editId ? "수정 완료" : "등록하기")}
                 </button>
               </div>
             </div>
@@ -653,7 +813,10 @@ function RecommendContent() {
 
         {/* ── 토스트 ── */}
         {showToast && (
-          <div className="fn-toast">등록 완료!</div>
+          <div className="fn-toast" style={{ position: "fixed", top: "50%", left: "50%", bottom: "auto", transform: "translate(-50%, -50%)", zIndex: 300, animation: "fnConfirmFadeIn 0.2s ease" }}>등록 완료 (피드 목록으로 돌아갑니다)</div>
+        )}
+        {submitError && (
+          <div className="fn-toast" style={{ position: "fixed", top: "50%", left: "50%", bottom: "auto", transform: "translate(-50%, -50%)", zIndex: 300, background: "#C0392B", animation: "fnConfirmFadeIn 0.2s ease" }} role="alert">{submitError}</div>
         )}
       </div>
     </>

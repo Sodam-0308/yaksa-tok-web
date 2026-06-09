@@ -20,8 +20,8 @@ import { supabase } from "@/lib/supabase";
  *  - profile 있고 role !== 'pharmacist'(환자 확정) → / 로 replace
  *  - 약사 → pharmacist_profiles.license_name 조회
  *      · 에러 → 800ms 간격 최대 2회 재시도 → 끝내 실패면 failed(=replace 안 함, 약사일 수 있음)
- *      · row 없음 → /signup/pharmacist?step=license (가입 직후 row 미생성 유도)
- *      · license 빈값 → /signup/pharmacist?step=license
+ *      · row 없음(가입 미완주) → /signup/pharmacist (처음 step1부터 — 약국·주소 등도 없어 면허만 넣으면 못 빠져나옴)
+ *      · row 있고 license 빈값(레거시) → /signup/pharmacist?step=license (면허만 보완)
  *      · license 정상 → 통과(checking=false)
  *  - 어떤 경로로도 영구 멈춤 안 되게 8s 전체 타임아웃 안전장치.
  *  - replace 사용 — 뒤로가기 시 약사 페이지로 안 돌아오게.
@@ -109,12 +109,13 @@ export function usePharmacistGuard(): { checking: boolean; failed: boolean } {
       }
 
       if (!data) {
-        // 약사인데 pharmacist_profiles row 미생성(가입 직후 등) — 멈추지 말고 면허 입력으로 유도.
+        // 약사인데 pharmacist_profiles row 미생성(가입 미완주) — 약국명·주소(NOT NULL)·전문분야도 없는
+        // 상태라 면허 단계(step3)로 보내면 끝까지 못 가고 튕김. 가입 처음(step1)부터 완주시켜야 프로필이 온전히 생성됨.
         console.error("[dashboard guard] no pharmacist_profiles row found");
         retryCountRef.current = 0;
         clearTimeout(overall);
         setChecking(true);
-        router.replace("/signup/pharmacist?step=license");
+        router.replace("/signup/pharmacist");
         return;
       }
 

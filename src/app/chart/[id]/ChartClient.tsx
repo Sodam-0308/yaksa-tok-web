@@ -1004,6 +1004,8 @@ function ChartContent() {
   const [editingPharmacistMemo, setEditingPharmacistMemo] = useState(false);
   const [pharmacistMemoDraft, setPharmacistMemoDraft] = useState(patient.pharmacistMemo);
   const [isSavingMemo, setIsSavingMemo] = useState(false);
+  // 검사기록(민감정보) 동의 상태. null = 조회 전/확인 중, true = 동의 유효(열림), false = 미동의/철회(잠김)
+  const [consentActive, setConsentActive] = useState<boolean | null>(null);
   const savePharmacistMemo = async () => {
     if (isSavingMemo) return; // 더블클릭 방지
     const trimmed = pharmacistMemoDraft.trim();
@@ -1426,6 +1428,35 @@ function ChartContent() {
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consultationId, authUser]);
+
+  /* ── 검사기록 동의 조회 (sensitive_consents) ──
+   *  유효 동의 = granted_at != null AND withdrawn_at == null 인 행이 1개 이상.
+   *  mock·워크인(비UUID patient.id)·비로그인은 잠김(false) 고정. RLS상 본인 담당 환자만 읽힘. */
+  useEffect(() => {
+    if (!isUuid(patient.id) || !authUser?.id) {
+      setConsentActive(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("sensitive_consents")
+        .select("id, granted_at, withdrawn_at")
+        .eq("patient_id", patient.id)
+        .not("granted_at", "is", null)
+        .is("withdrawn_at", null)
+        .limit(1);
+      if (cancelled) return;
+      if (error) {
+        console.error("[chart] sensitive_consents load failed:", error);
+        setConsentActive(false);
+        return;
+      }
+      setConsentActive((data ?? []).length > 0);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [patient.id, authUser?.id]);
 
   /* ── 차트 사진 업로드 (chart-photos 버킷) ── */
   const CHART_BUCKET = "chart-photos";
@@ -2005,18 +2036,20 @@ function ChartContent() {
             display: grid;
             grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
             grid-template-areas:
-              "basic    basic"
-              "memo     memo"
-              "problems visits"
+              "basic     basic"
+              "memo      memo"
+              "sensitive sensitive"
+              "problems  visits"
               "qanswers consults"
               "health   health";
             gap: 20px;
             align-items: start;
           }
           .chart-container > * { margin-bottom: 0 !important; min-width: 0; }
-          .cs-basic    { grid-area: basic; }
-          .cs-memo     { grid-area: memo; }
-          .cs-problems { grid-area: problems; }
+          .cs-basic     { grid-area: basic; }
+          .cs-memo      { grid-area: memo; }
+          .cs-sensitive { grid-area: sensitive; }
+          .cs-problems  { grid-area: problems; }
           .cs-qanswers { grid-area: qanswers; }
           .cs-visits   { grid-area: visits; }
           .cs-consults { grid-area: consults; }
@@ -2320,6 +2353,22 @@ function ChartContent() {
             ) : (
               <div style={{ fontSize: 14, lineHeight: 1.65, color: patient.pharmacistMemo ? COLOR.textDark : COLOR.textMid, whiteSpace: "pre-wrap" }}>
                 {patient.pharmacistMemo || "메모를 추가하세요"}
+              </div>
+            )}
+          </div>
+
+          {/* 검사기록(민감정보) 단계3에서 sensitive_consents 동의 조회로 잠금/열림 분기 예정 */}
+          <div className="cs-sensitive" style={{ background: "#FBF5F1", border: "1px solid #E8C9B8", borderRadius: 16, padding: 20, marginBottom: 16 }}>
+            <div style={sectionTitle}>{consentActive ? "📋 검사기록 (민감정보)" : "🔒 검사기록 (민감정보)"}</div>
+            {consentActive ? (
+              <div style={{ background: "#fff", border: "1px solid #E8C9B8", borderRadius: 12, padding: "14px 16px", color: "#3D4A42", fontSize: 15, lineHeight: 1.6 }}>
+                <div style={{ fontWeight: 700 }}>이 환자가 검사기록 저장에 동의했어요.</div>
+                <div style={{ marginTop: 6 }}>검사기록 입력 기능은 개인정보 전문가 검토 후 다음 단계에서 열립니다.</div>
+              </div>
+            ) : (
+              <div style={{ background: "#fff", border: "1px dashed #E8C9B8", borderRadius: 12, padding: "14px 16px", color: "#3D4A42", fontSize: 15, lineHeight: 1.6 }}>
+                <div style={{ fontWeight: 700 }}>이 환자는 아직 검사기록 저장에 동의하지 않았어요.</div>
+                <div style={{ marginTop: 6 }}>검사지나 유전 결과 같은 민감정보는 환자 본인이 저장에 동의한 경우에만 이 칸에 기록할 수 있어요. 일반 상담 내용은 위 약사 메모에 적어주세요.</div>
               </div>
             )}
           </div>
@@ -3588,6 +3637,9 @@ function VisitPhotoBlock({
     <div>
       <div style={{ fontSize: 13, fontWeight: 600, color: "#5E7D6C", marginBottom: 8 }}>
         방문 사진 (방문당 최대 {maxCount}장 · jpg/png/webp · 5MB 이하)
+      </div>
+      <div style={{ fontSize: 14, color: "#C06B45", lineHeight: 1.5, marginBottom: 10 }}>
+        ⚠️ 검사지·유전 결과 등 민감정보 사진은 올리지 마세요. 환자 동의가 필요한 검사기록입니다.
       </div>
       <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
         <button

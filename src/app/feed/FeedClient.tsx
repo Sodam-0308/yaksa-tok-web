@@ -2,14 +2,18 @@
 
 import { useState, useEffect, useRef, useMemo, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/contexts/AuthContext";
+import type { CaseStudyRow, ScoreSnapshot, PharmacistStoryRow } from "@/types/database";
 import Footer from "@/components/ui/Footer";
 import PhotoLightbox from "@/components/PhotoLightbox";
-import {
-  SymptomIcon,
-  SYMPTOM_META,
-  TAG_LABEL_TO_KEY,
-  type SymptomKey,
-} from "@/components/SymptomIcon";
+
+// 카테고리 key → 한글 라벨 (작성 폼 CATEGORY_OPTIONS 와 동일 9개)
+const CATEGORY_LABELS: Record<string, string> = {
+  digestion: "소화·장", sleep: "수면·마음", fatigue: "피로·기력",
+  skin: "피부", pain: "통증·염증", women: "여성건강",
+  circulation: "체중관리·순환", growth: "소아·성장", etc: "기타",
+};
 
 /* ══════════════════════════════════════════
    타입 & 상수 — 개선 사례
@@ -25,6 +29,8 @@ interface ScoreChange {
 
 interface CaseStudy {
   id: string;
+  authorId?: string;
+  title?: string;
   authorType: "pharmacist" | "patient";
   showHealthScore: boolean;
   authorLabel?: string;
@@ -38,7 +44,8 @@ interface CaseStudy {
     location: string;
     distance: string | null;
   };
-  tags: { label: string; variant: TagVariant }[];
+  tags: { label: string; variant: TagVariant; key?: string }[];
+  categories?: string[];
   patientInfo: string;
   summary: string;
   scores: ScoreChange[];
@@ -46,66 +53,52 @@ interface CaseStudy {
   likesCount: number;
 }
 
-const FILTER_TABS_DEFAULT = [
-  { key: "all", label: "전체" },
-  { key: "fatigue", label: "만성피로" },
-  { key: "digestion", label: "소화장애" },
-  { key: "sleep", label: "불면/수면" },
-  { key: "women", label: "여성건강/생리통" },
-  { key: "skin", label: "피부" },
-  { key: "rhinitis", label: "비염/알레르기" },
-  { key: "gut", label: "변비/장건강" },
-  { key: "mood", label: "우울/불안/스트레스" },
-  { key: "hair", label: "탈모" },
-  { key: "weight", label: "체중 관리/붓기" },
-  { key: "antiaging", label: "항노화/항산화" },
-  { key: "immune", label: "면역력저하" },
-] as const;
+/* ── case_studies Row → 화면 표시용 CaseStudy 매핑 ── */
+type CaseRow = CaseStudyRow & { created_at?: string; categories?: string[]; author_id?: string };
 
-const FILTER_TABS_MORE = [
-  { key: "headache", label: "두통/목어깨결림" },
-  { key: "coldlimbs", label: "수족냉증" },
-  { key: "dryeye", label: "안구건조" },
-  { key: "joint", label: "관절/뼈" },
-  { key: "liver", label: "간 건강" },
-  { key: "menopause", label: "갱년기" },
-  { key: "men", label: "남성건강" },
-] as const;
-
-type FilterKey =
-  | (typeof FILTER_TABS_DEFAULT)[number]["key"]
-  | (typeof FILTER_TABS_MORE)[number]["key"];
-
-/* 필터 칩 전용 컬러 (카드 헤더 아이콘 컬러와 일치. 확장 7개는 중립 그레이) */
-const CHIP_COLORS: Record<string, { bg: string; fg: string }> = {
-  // 초록
-  fatigue:   { bg: "#EAF3DE", fg: "#3B6D11" },
-  weight:    { bg: "#EAF3DE", fg: "#3B6D11" },
-  // 앰버
-  digestion: { bg: "#FAEEDA", fg: "#854F0B" },
-  gut:       { bg: "#FAEEDA", fg: "#854F0B" },
-  // 파랑
-  sleep:     { bg: "#E6F1FB", fg: "#185FA5" },
-  // 코랄
-  women:     { bg: "#FAECE7", fg: "#993C1D" },
-  skin:      { bg: "#FAECE7", fg: "#993C1D" },
-  hair:      { bg: "#FAECE7", fg: "#993C1D" },
-  antiaging: { bg: "#FAECE7", fg: "#993C1D" },
-  // 틸
-  rhinitis:  { bg: "#E1F5EE", fg: "#0F6E56" },
-  immune:    { bg: "#E1F5EE", fg: "#0F6E56" },
-  // 퍼플
-  mood:      { bg: "#EEEDFE", fg: "#534AB7" },
-  // 중립 (확장)
-  headache:  { bg: "#F0F0F0", fg: "#555555" },
-  coldlimbs: { bg: "#F0F0F0", fg: "#555555" },
-  dryeye:    { bg: "#F0F0F0", fg: "#555555" },
-  joint:     { bg: "#F0F0F0", fg: "#555555" },
-  liver:     { bg: "#F0F0F0", fg: "#555555" },
-  menopause: { bg: "#F0F0F0", fg: "#555555" },
-  men:       { bg: "#F0F0F0", fg: "#555555" },
+const SCORE_LABEL: Record<string, string> = {
+  energy: "에너지", sleep: "수면", digestion: "소화", mood: "기분", discomfort: "불편도",
 };
 
+// before/after 점수 스냅샷(jsonb) → ScoreChange[]. show_health_score 꺼졌거나 한쪽 없으면 빈 배열.
+function buildScores(show: boolean, before: ScoreSnapshot | null, after: ScoreSnapshot | null): ScoreChange[] {
+  if (!show || !before || !after) return [];
+  const out: ScoreChange[] = [];
+  for (const key of Object.keys(after)) {
+    const b = before[key];
+    const a = after[key];
+    if (typeof b === "number" && typeof a === "number") {
+      out.push({ label: SCORE_LABEL[key] ?? key, before: b, after: a });
+    }
+  }
+  return out;
+}
+
+function mapCaseRow(row: CaseRow): CaseStudy {
+  const categories: string[] = Array.isArray(row.categories) ? row.categories : [];
+  const photos = Array.isArray(row.photos) ? row.photos : [];
+  return {
+    id: row.id,
+    authorId: row.author_id ?? row.pharmacist_id ?? "",
+    title: row.title ?? "",
+    authorType: row.author_type,
+    showHealthScore: !!row.show_health_score,
+    createdAt: row.created_at ?? "",
+    images: photos,
+    // 약사 이름·약국명·위치·거리·아바타는 case_studies 에 컬럼 없음 → pharmacist_profiles JOIN 필요(다음 단계). 기본값 처리.
+    pharmacist: { id: row.pharmacist_id ?? "", name: "", avatar: "👩‍⚕️", pharmacyName: "", location: "", distance: null },
+    tags: categories.map((key) => ({ label: CATEGORY_LABELS[key] ?? key, variant: "sage" as const, key })),
+    categories,
+    patientInfo: [row.patient_age_group, row.patient_gender].filter(Boolean).join(" "),
+    summary: row.description ?? "",
+    scores: buildScores(!!row.show_health_score, row.before_scores, row.after_scores),
+    durationWeeks: row.duration_weeks ?? 0,
+    likesCount: row.likes_count ?? 0,
+  };
+}
+
+// 디자인 참조용 mock — case_studies 실데이터 전환 후 렌더 미사용(보존). 약사의 이야기 연동 단계에서 함께 정리 예정.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const MOCK_CASES: CaseStudy[] = [
   {
     id: "case-1",
@@ -310,24 +303,6 @@ function ExpandableText({
   );
 }
 
-/* 작성일 포맷 */
-function formatRelativeDate(iso: string): string {
-  const now = new Date();
-  const then = new Date(iso);
-  const diffMs = now.getTime() - then.getTime();
-  if (diffMs < 0) return "방금 전";
-  const diffMin = diffMs / (1000 * 60);
-  const diffHour = diffMin / 60;
-  const diffDay = diffHour / 24;
-  if (diffHour < 1) return "방금 전";
-  if (diffHour < 24) return `${Math.floor(diffHour)}시간 전`;
-  if (diffDay < 7) return `${Math.floor(diffDay)}일 전`;
-  const y = then.getFullYear();
-  const m = String(then.getMonth() + 1).padStart(2, "0");
-  const d = String(then.getDate()).padStart(2, "0");
-  return `${y}.${m}.${d}`;
-}
-
 /* ══════════════════════════════════════════
    약사의 이야기 더미 데이터
    ══════════════════════════════════════════ */
@@ -336,28 +311,64 @@ interface StoryChange { before: string; after: string }
 
 interface StoryPost {
   id: string;
+  authorId?: string;
+  createdAt?: string;
   pharmacist: { name: string; pharmacy: string; career: string; avatar: string; id: string };
   target: string;
-  tags: { label: string; variant: TagVariant }[];
+  tags: { label: string; variant: TagVariant; key?: string }[];
+  categories?: string[];
   title: string;
   description?: string;
   changes: StoryChange[];
   duration: string;
   likes: number;
-  filterKey: string;
+  filterKey?: string;
+}
+
+/* ── pharmacist_stories Row → 화면 표시용 StoryPost 매핑 ── */
+type StoryRow = PharmacistStoryRow & { created_at?: string; categories?: string[] };
+
+function mapStoryRow(row: StoryRow): StoryPost {
+  const categories: string[] = Array.isArray(row.categories) ? row.categories : [];
+  // 저장 시 줄바꿈 join 했던 before/after_description 을 다시 전·후 변화 쌍으로 복원.
+  const befores = (row.before_description ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const afters = (row.after_description ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const pairCount = Math.max(befores.length, afters.length);
+  const changes: StoryChange[] = [];
+  for (let i = 0; i < pairCount; i++) {
+    changes.push({ before: befores[i] ?? "", after: afters[i] ?? "" });
+  }
+  return {
+    id: row.id,
+    authorId: row.pharmacist_id ?? "",
+    createdAt: row.created_at ?? "",
+    // 약사 이름·약국명·경력·아바타는 pharmacist_stories 에 컬럼 없음 → pharmacist_profiles JOIN 필요(다음 단계). 기본값 처리.
+    pharmacist: { name: "", pharmacy: "", career: "", avatar: "약", id: row.pharmacist_id ?? "" },
+    target: row.subject_relation ?? "",
+    tags: categories.map((key) => ({ label: CATEGORY_LABELS[key] ?? key, variant: "sage" as const, key })),
+    categories,
+    title: row.title ?? "",
+    description: row.story ?? undefined,
+    changes,
+    duration: row.duration_text ?? "",
+    likes: row.likes_count ?? 0,
+  };
 }
 
 const STORY_FILTERS = [
   { key: "all", label: "전체" },
-  { key: "skin", label: "피부·아토피" },
-  { key: "fatigue", label: "피로·에너지" },
-  { key: "sleep", label: "수면·스트레스" },
   { key: "digestion", label: "소화·장" },
-  { key: "immune", label: "면역" },
+  { key: "sleep", label: "수면·마음" },
+  { key: "fatigue", label: "피로·기력" },
+  { key: "skin", label: "피부" },
+  { key: "pain", label: "통증" },
   { key: "women", label: "여성건강" },
-  { key: "growth", label: "성장·발달" },
+  { key: "circulation", label: "체중관리·순환" },
+  { key: "etc", label: "기타" },
 ] as const;
 
+// 디자인 참조용 mock — pharmacist_stories 실데이터 전환 후 렌더 미사용(보존).
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const MOCK_STORIES: StoryPost[] = [
   {
     id: "story-1",
@@ -423,30 +434,422 @@ const C = {
 };
 
 /* ══════════════════════════════════════════
+   통합 피드 카드 (개선 사례 + 약사의 이야기 공통 — 약사의 이야기 레이아웃 기준)
+   ══════════════════════════════════════════ */
+
+interface FeedExperience {
+  kind: "case" | "story";
+  id: string;
+  authorId: string;   // 글 작성자 profile id (본인 판별용). case=author_id 우선, 없으면 pharmacist_id. story=pharmacist_id.
+  createdAt: string;
+  title: string;
+  // 약사 프로필(이름·약국명) — pharmacist_profiles 에서 주입. 약사 없는 사례(환자 작성/미상)는 null.
+  pharmacist: { name: string; pharmacy: string; id: string } | null;
+  relationLabel: string;
+  categories: string[]; // 카테고리 칩 키 목록(STORY_FILTERS). 빈 배열이면 전체에서만.
+  tags: { label: string; variant: TagVariant; key?: string }[];
+  body: string;
+  changes?: StoryChange[];
+  scores?: ScoreChange[];
+  showHealthScore?: boolean;
+  durationText: string;
+  images?: string[];
+  likes: number;
+}
+
+type PharmacistInfo = Record<string, { name: string; pharmacy: string }>;
+
+/* CaseStudy → 통합 카드 모델 (pmap: pharmacist_id → 이름/약국명) */
+function normalizeCase(c: CaseStudy, pmap: PharmacistInfo): FeedExperience {
+  const primaryLabel = c.tags[0]?.label ?? "건강 관리";
+  const pid = c.pharmacist.id;
+  const prof = pid ? pmap[pid] : undefined;
+  return {
+    kind: "case",
+    id: c.id,
+    authorId: c.authorId ?? "",
+    createdAt: c.createdAt,
+    title: c.title?.trim() ? c.title : primaryLabel,
+    pharmacist: pid ? { name: prof?.name ?? "", pharmacy: prof?.pharmacy ?? "", id: pid } : null,
+    relationLabel: c.authorType === "pharmacist" ? "약사의 상담사례" : "직접 남긴 경험",
+    categories: c.categories ?? [],
+    tags: c.tags,
+    body: c.summary,
+    scores: c.scores,
+    showHealthScore: c.showHealthScore,
+    durationText: c.durationWeeks > 0 ? `${c.durationWeeks}주 관리` : "",
+    images: c.images,
+    likes: c.likesCount,
+  };
+}
+
+/* StoryPost → 통합 카드 모델 (pmap: pharmacist_id → 이름/약국명) */
+function normalizeStory(s: StoryPost, pmap: PharmacistInfo): FeedExperience {
+  const pid = s.pharmacist.id;
+  const prof = pid ? pmap[pid] : undefined;
+  return {
+    kind: "story",
+    id: s.id,
+    authorId: s.authorId ?? "",
+    createdAt: s.createdAt ?? "",
+    title: s.title,
+    pharmacist: pid ? { name: prof?.name ?? "", pharmacy: prof?.pharmacy ?? "", id: pid } : null,
+    relationLabel: s.target,
+    categories: s.categories ?? [],
+    tags: s.tags,
+    body: s.description ?? "",
+    changes: s.changes,
+    durationText: s.duration,
+    likes: s.likes,
+  };
+}
+
+/* 작성일 yy.mm.dd (예: 26.06.04). 빈/잘못된 값은 "". */
+function formatYmd(iso: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const yy = String(d.getFullYear()).slice(2);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yy}.${mm}.${dd}`;
+}
+
+function FeedExperienceCard({
+  item, index, onRef, liked, onToggleLike, onConsult, onOpenLightbox, isOwner, onDelete, onEdit,
+}: {
+  item: FeedExperience;
+  index: number;
+  onRef: (el: HTMLElement | null) => void;
+  liked: boolean;
+  onToggleLike: () => void;
+  onConsult: () => void;
+  onOpenLightbox: (images: string[], start: number) => void;
+  isOwner?: boolean;
+  onDelete?: () => void;
+  onEdit?: () => void;
+}) {
+  const images = item.images ?? [];
+  const ph = item.pharmacist;
+  // 이니셜 원형 아바타 — 약사 이름 첫 글자, 약사 미상이면 중립 사람 아이콘(깨진 이미지 금지).
+  const avatarText = ph?.name?.trim() ? ph.name.trim().charAt(0) : "👤";
+  const likeCount = liked ? item.likes + 1 : item.likes;
+  const dateStr = formatYmd(item.createdAt);
+  // 관계 라벨 분리: 유형 키워드(헤더 오른쪽) + 괄호 상세(본문 위). 예 "약사 가족 (10대 딸)" → "약사 가족" / "(10대 딸)".
+  const relMatch = item.relationLabel.match(/^(.*?)\s*(\(.*\))\s*$/);
+  const typeLabel = relMatch ? relMatch[1].trim() : item.relationLabel;
+  const detailLabel = relMatch ? relMatch[2].trim() : "";
+  return (
+    <article
+      className="reveal"
+      ref={onRef}
+      style={{
+        animationDelay: `${0.1 * index}s`,
+        background: "#fff",
+        borderRadius: 16,
+        border: "1px solid rgba(94,125,108,0.1)",
+        boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+        padding: 20,
+        marginBottom: 16,
+      }}
+    >
+      {/* 약사 프로필 — 왼쪽 [아바타+이름+약국명] / 오른쪽 끝 [유형 라벨 + 대상 상세] */}
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 14 }}>
+        <div style={{
+          width: 44, height: 44, borderRadius: "50%",
+          background: C.sagePale, display: "flex",
+          alignItems: "center", justifyContent: "center",
+          fontSize: 18, fontWeight: 700, color: C.sageDeep, flexShrink: 0,
+        }}>
+          {avatarText}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {ph?.name?.trim() && (
+            <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, fontFamily: "'Gothic A1', sans-serif" }}>
+              {ph.name}
+            </div>
+          )}
+          {ph?.pharmacy?.trim() && (
+            <div style={{ fontSize: 14, color: "#3D4A42", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {ph.pharmacy}
+            </div>
+          )}
+        </div>
+        {(typeLabel || detailLabel) && (
+          <div style={{ flexShrink: 0, marginLeft: 8, textAlign: "right" }}>
+            {typeLabel && (
+              <div style={{ fontSize: 13, color: C.sageMid, fontWeight: 500, whiteSpace: "nowrap" }}>
+                {typeLabel}
+              </div>
+            )}
+            {detailLabel && (
+              <div style={{ fontSize: 12, color: C.sageMid, fontWeight: 500, whiteSpace: "nowrap", marginTop: 2 }}>
+                {detailLabel}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 본인 글 수정·삭제 (작성자에게만, 수정은 개선 사례만) */}
+      {isOwner && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onEdit?.(); }}
+            style={{ background: "none", border: "none", color: "#9CA3A8", fontSize: 13, cursor: "pointer", padding: "2px 4px", marginRight: 4 }}
+          >
+            수정
+          </button>
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onDelete?.(); }}
+            style={{ background: "none", border: "none", color: "#9CA3A8", fontSize: 13, cursor: "pointer", padding: "2px 4px" }}
+          >
+            삭제
+          </button>
+        </div>
+      )}
+
+      {/* 증상 태그 */}
+      {item.tags.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+          {item.tags.map((t) => (
+            <span key={t.label} className={`feed-tag feed-tag-${t.variant}`} style={{ fontSize: 13, padding: "5px 11px" }}>{t.label}</span>
+          ))}
+        </div>
+      )}
+
+      {/* 제목 */}
+      {item.title && (
+        <div style={{
+          fontSize: 17, fontWeight: 700, color: C.textDark,
+          lineHeight: 1.5, marginBottom: 12,
+          fontFamily: "'Gothic A1', sans-serif",
+        }}>
+          {item.title}
+        </div>
+      )}
+
+      {/* 본문 */}
+      {item.body && <ExpandableText text={item.body} />}
+
+      {/* 사진 (case 에만) — 썸네일 직접 노출 금지, 라이트박스 */}
+      {images.length > 0 && (
+        <button
+          type="button"
+          onClick={() => onOpenLightbox(images, 0)}
+          style={{
+            background: "none", border: "none", padding: 0,
+            margin: "8px 0 0", fontSize: 14, color: C.sageMid,
+            cursor: "pointer", display: "inline-block",
+          }}
+        >
+          📷 사진 {images.length}장 보기
+        </button>
+      )}
+
+      {/* 전/후 변화 (story changes) */}
+      {item.changes && item.changes.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12, marginBottom: 12 }}>
+          {item.changes.map((ch, ci) => (
+            <div key={ci} style={{ padding: "10px 14px", borderRadius: 10, background: C.sagePale, fontSize: 14, lineHeight: 1.6 }}>
+              <div style={{ color: C.textMid }}>
+                <span style={{ marginRight: 6 }}>😫</span>
+                <span style={{ fontWeight: 500 }}>{ch.before}</span>
+              </div>
+              <div style={{ color: C.sageDeep, marginTop: 4 }}>
+                <span style={{ marginRight: 6 }}>😊</span>
+                <span style={{ fontWeight: 600 }}>{ch.after}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 개선 결과 (case 의 건강점수) — 데이터 있을 때만 */}
+      {item.showHealthScore && item.scores && item.scores.length > 0 && (
+        <div style={{ background: C.sagePale, borderRadius: 12, padding: 16, margin: "12px 0", display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.sageDeep, letterSpacing: "0.02em" }}>개선 결과</div>
+          {item.scores.map((s) => {
+            const improved = s.after > s.before;
+            const diff = Math.abs(s.after - s.before);
+            return (
+              <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ minWidth: 52, fontSize: 14, color: C.textMid, fontWeight: 500 }}>{s.label}</span>
+                <span style={{ fontSize: 13, color: "#3D4A42", minWidth: 16, textAlign: "right" }}>{s.before}</span>
+                <div style={{ flex: 1, height: 8, background: "#E0E0E0", borderRadius: 4, position: "relative", overflow: "hidden" }}>
+                  <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${s.after * 10}%`, background: C.sageDeep, borderRadius: 4 }} />
+                </div>
+                <span style={{ fontSize: 14, color: C.sageDeep, fontWeight: 700, minWidth: 16, textAlign: "right" }}>{s.after}</span>
+                <span style={{ fontSize: 13, color: C.sageDeep, fontWeight: 700, minWidth: 40, textAlign: "right" }}>{improved ? `+${diff}↑` : `-${diff}↓`}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 기간 */}
+      {item.durationText && (
+        <div style={{ fontSize: 14, color: "#3D4A42", marginTop: 12, marginBottom: 14 }}>
+          🗓 <span style={{ fontWeight: 500 }}>{item.durationText}</span>
+        </div>
+      )}
+
+      {/* 하단: 좋아요 + 작성일 / 상담 */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+          <button
+            type="button"
+            onClick={onToggleLike}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: 14, fontWeight: 600,
+              color: liked ? "#E0574F" : C.textMid,
+              display: "flex", alignItems: "center", gap: 5, padding: "4px 0",
+            }}
+          >
+            {liked ? "❤️" : "🤍"} {likeCount}
+          </button>
+          {dateStr && (
+            <span style={{ fontSize: 12, color: C.sageMid, flexShrink: 0 }}>{dateStr}</span>
+          )}
+        </div>
+        {ph && (
+          <button
+            type="button"
+            onClick={onConsult}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: 14, fontWeight: 700, color: C.terra, padding: "4px 0",
+            }}
+          >
+            이 약사에게 상담받기 →
+          </button>
+        )}
+      </div>
+
+      {/* 면책 문구 */}
+      <div style={{
+        fontSize: 12, color: C.sageMid, marginTop: 12,
+        padding: "8px 12px", background: C.sageBg,
+        borderRadius: 8, lineHeight: 1.5, textAlign: "center",
+      }}>
+        개인의 경험이며, 같은 증상이라도 사람마다 원인이 다릅니다.
+      </div>
+    </article>
+  );
+}
+
+/* ══════════════════════════════════════════
    메인 피드
    ══════════════════════════════════════════ */
 
 function FeedContent() {
   const router = useRouter();
-  const showEmptyState = false;
-  const [mainTab, setMainTab] = useState<"cases" | "recs">("cases");
+  const { user, profile, loading: authLoading } = useAuth();
+  // 약사 판별 — 기존 프로젝트 패턴(usePharmacistGuard/FeedNewClient 동일) 재사용. 글쓰기 진입은 약사만.
+  const isPharmacist = profile?.role === "pharmacist";
 
-  /* ── 개선 사례 상태 ── */
-  const [activeFilter, setActiveFilter] = useState<FilterKey>("all");
-  const [showMoreFilters, setShowMoreFilters] = useState(false);
+  /* ── 통합 목록 필터/검색 상태 ── */
+  const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [showModal, setShowModal] = useState(false);
-  const [selectedCase, setSelectedCase] = useState<CaseStudy | null>(null);
+  const [showWriteSheet, setShowWriteSheet] = useState(false); // 글쓰기 종류 선택 시트
+  const [deleteTarget, setDeleteTarget] = useState<FeedExperience | null>(null); // 삭제 확인 대상
+  const [deleting, setDeleting] = useState(false);
   const [likedSet, setLikedSet] = useState<Set<string>>(new Set());
   const [lightboxImages, setLightboxImages] = useState<string[] | null>(null);
   const [lightboxStart, setLightboxStart] = useState(0);
   const revealRefs = useRef<(HTMLElement | null)[]>([]);
 
-  /* ── 약사의 이야기 상태 ── */
-  const [storyFilter, setStoryFilter] = useState("all");
-  const [storyLiked, setStoryLiked] = useState<Set<string>>(new Set());
+  /* ── 개선 사례 실데이터 (case_studies) ── */
+  const [cases, setCases] = useState<CaseStudy[]>([]);
+  const [casesLoading, setCasesLoading] = useState(true);
+  // 게시본 공개 조회 — RLS: is_published = true 는 환자 포함 누구나 SELECT 가능.
+  //   단 세션 복원이 끝난 뒤(authLoading=false) 실행 — 익명 컨텍스트로 미리 나가 빈 결과를 받는 race 방지.
+  //   비로그인도 봐야 하므로 user 유무로 막지 않고, "세션 확정 여부"만 기다린다.
+  //   user 가 null→실값으로 바뀌면(onAuthStateChange) 의존성에 의해 재실행 → JWT 실린 재쿼리.
+  useEffect(() => {
+    if (authLoading) return; // 세션 복원 미완료 — casesLoading=true 유지하며 대기
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("case_studies")
+        .select("*")
+        .eq("is_published", true)
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (error) {
+        console.error("[feed] case_studies load failed:", error);
+        setCasesLoading(false);
+        return;
+      }
+      const rows = (data ?? []) as unknown as CaseRow[];
+      setCases(rows.map(mapCaseRow));
+      setCasesLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [authLoading, user]);
+
+  /* ── 약사의 이야기 실데이터 (pharmacist_stories) ── 개선 사례와 동일 패턴(세션 확정 후 SELECT). */
+  const [stories, setStories] = useState<StoryPost[]>([]);
+  const [storiesLoading, setStoriesLoading] = useState(true);
+  useEffect(() => {
+    if (authLoading) return; // 세션 복원 미완료 — storiesLoading=true 유지하며 대기
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("pharmacist_stories")
+        .select("*")
+        .eq("is_published", true)
+        .order("created_at", { ascending: false });
+      if (cancelled) return;
+      if (error) {
+        console.error("[feed] pharmacist_stories load failed:", error);
+        setStoriesLoading(false);
+        return;
+      }
+      const rows = (data ?? []) as unknown as StoryRow[];
+      setStories(rows.map(mapStoryRow));
+      setStoriesLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [authLoading, user]);
+
+  /* ── 약사 프로필(이름·약국명) — case_studies/pharmacist_stories 엔 컬럼 없어 pharmacist_profiles 에서 주입 ── */
+  const [pharmacistMap, setPharmacistMap] = useState<PharmacistInfo>({});
+  useEffect(() => {
+    const ids = Array.from(new Set([
+      ...cases.map((c) => c.pharmacist.id),
+      ...stories.map((s) => s.pharmacist.id),
+    ].filter(Boolean)));
+    if (ids.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("pharmacist_profiles")
+        .select("id, license_name, pharmacy_name")
+        .in("id", ids);
+      if (cancelled) return;
+      if (error) {
+        console.error("[feed] pharmacist_profiles load failed:", error);
+        return;
+      }
+      const rows = (data ?? []) as unknown as { id: string; license_name: string | null; pharmacy_name: string | null }[];
+      const map: PharmacistInfo = {};
+      for (const r of rows) {
+        map[r.id] = { name: (r.license_name ?? "").trim(), pharmacy: (r.pharmacy_name ?? "").trim() };
+      }
+      setPharmacistMap(map);
+    })();
+    return () => { cancelled = true; };
+  }, [cases, stories]);
 
   // Scroll reveal
+  //   의존성에 casesLoading·cases.length 포함 — case_studies 가 비동기로 늦게 채워져 카드가
+  //   옵저버 마지막 실행 이후 마운트돼도, 로드 완료(casesLoading false)·카드 수 변화(0→N) 시
+  //   옵저버가 재실행되어 새 카드를 관찰 → .visible 부여(투명하게 남는 문제 방지).
+  //   (filtered 는 이 effect 아래에서 useMemo 로 선언돼 여기선 참조 불가 → cases.length 로 대체.)
   useEffect(() => {
     const observer = new IntersectionObserver(
       (entries) => {
@@ -456,46 +859,56 @@ function FeedContent() {
       },
       { threshold: 0.15 },
     );
-    revealRefs.current.forEach((el) => el && observer.observe(el));
+    // null 걸러서 현재 DOM 요소만 관찰 (배열은 비우지 않음 — 카드 재push 보장 없음).
+    revealRefs.current.filter(Boolean).forEach((el) => observer.observe(el!));
     return () => observer.disconnect();
-  }, [activeFilter, mainTab, searchQuery]);
+  }, [activeCategory, searchQuery, casesLoading, storiesLoading, cases.length, stories.length]);
 
   const addRevealRef = (el: HTMLElement | null) => {
     if (el && !revealRefs.current.includes(el)) revealRefs.current.push(el);
   };
 
-  const filtered = useMemo(() => {
-    const byFilter = activeFilter === "all"
-      ? MOCK_CASES
-      : MOCK_CASES.filter((c) => c.tags.some((t) => TAG_LABEL_TO_KEY[t.label] === activeFilter));
+  // 통합 목록 — 개선 사례 + 약사 이야기를 한 배열로 정규화 → 카테고리·검색 필터 → createdAt 최신순.
+  const items = useMemo<FeedExperience[]>(() => {
+    const all = [
+      ...cases.map((c) => normalizeCase(c, pharmacistMap)),
+      ...stories.map((s) => normalizeStory(s, pharmacistMap)),
+    ];
+    const byCat = activeCategory === "all" ? all : all.filter((x) => x.categories.includes(activeCategory));
     const q = searchQuery.trim().toLowerCase();
-    const bySearch = q === "" ? byFilter : byFilter.filter((c) => {
-      const fields = [
-        c.summary,
-        c.pharmacist.name,
-        c.pharmacist.pharmacyName,
-        c.pharmacist.location,
-        c.patientInfo,
-        c.authorLabel ?? "",
-        ...c.tags.map((t) => t.label),
-      ];
+    const bySearch = q === "" ? byCat : byCat.filter((x) => {
+      const fields = [x.title, x.body, x.pharmacist?.pharmacy ?? "", ...x.tags.map((t) => t.label)];
       return fields.some((f) => f.toLowerCase().includes(q));
     });
     return [...bySearch].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  }, [activeFilter, searchQuery]);
+  }, [cases, stories, pharmacistMap, activeCategory, searchQuery]);
 
   function openLightbox(images: string[], start: number) {
     setLightboxImages(images);
     setLightboxStart(start);
   }
 
-  function handleConsult(c: CaseStudy) { setSelectedCase(c); setShowModal(true); }
-  function handleConfirm() { if (!selectedCase) return; router.push(`/pharmacist/${selectedCase.pharmacist.id}`); }
   function toggleLike(id: string) { setLikedSet((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; }); }
 
-  const isNearby = selectedCase?.pharmacist.distance !== null;
-
-  const filteredStories = storyFilter === "all" ? MOCK_STORIES : MOCK_STORIES.filter((s) => s.filterKey === storyFilter);
+  const handleDelete = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    const table = deleteTarget.kind === "case" ? "case_studies" : "pharmacist_stories";
+    const { error } = await supabase.from(table).delete().eq("id", deleteTarget.id);
+    setDeleting(false);
+    if (error) {
+      console.error("[feed] delete failed:", error);
+      alert("삭제에 실패했어요. 잠시 후 다시 시도해 주세요.");
+      return;
+    }
+    // 화면에서 제거 — kind 에 따라 cases/stories state 에서 해당 id 제거.
+    if (deleteTarget.kind === "case") {
+      setCases((prev) => prev.filter((c) => c.id !== deleteTarget.id));
+    } else {
+      setStories((prev) => prev.filter((s) => s.id !== deleteTarget.id));
+    }
+    setDeleteTarget(null);
+  };
 
   return (
     <div className="feed-page" style={{ paddingBottom: 80 }}>
@@ -505,672 +918,98 @@ function FeedContent() {
         <div className="nav-title">피드</div>
       </nav>
 
-      {/* ── 메인 탭 ── */}
-      <div style={{ position: "sticky", top: 56, zIndex: 40, background: C.sageBg, borderBottom: `1px solid ${C.border}` }}>
-        <div style={{ display: "flex", maxWidth: 560, margin: "0 auto", padding: "0 24px" }}>
-          {([["cases", "개선 사례"], ["recs", "약사의 이야기"]] as const).map(([key, label]) => (
+      {(casesLoading || storiesLoading) ? (
+        <div style={{
+          minHeight: "calc(100vh - 200px)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          padding: "40px 24px", textAlign: "center", fontSize: 15, color: C.textMid,
+        }}>
+          불러오는 중이에요…
+        </div>
+      ) : (
+      <>
+      {/* ── 검색창 ── */}
+      <div style={{ maxWidth: 560, margin: "0 auto", padding: "12px 20px 0" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, height: 44, padding: "0 14px", background: "#F8F9F7", border: `1px solid ${C.border}`, borderRadius: 22 }}>
+          <span aria-hidden="true" style={{ fontSize: 16, color: C.sageMid, lineHeight: 1 }}>🔍</span>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="증상, 약국, 키워드 검색"
+            aria-label="피드 검색"
+            style={{ flex: 1, height: "100%", border: "none", background: "transparent", outline: "none", fontSize: 14, color: C.textDark }}
+          />
+          {searchQuery && (
             <button
-              key={key}
               type="button"
-              onClick={() => setMainTab(key)}
-              style={{
-                flex: 1,
-                padding: "14px 0",
-                background: "none",
-                border: "none",
-                borderBottom: mainTab === key ? `2.5px solid ${C.sageDeep}` : "2.5px solid transparent",
-                cursor: "pointer",
-                fontSize: 15,
-                fontWeight: mainTab === key ? 700 : 500,
-                color: mainTab === key ? C.sageDeep : C.sageMid,
-                fontFamily: "'Gothic A1', sans-serif",
-                transition: "all 0.15s",
-              }}
+              onClick={() => setSearchQuery("")}
+              aria-label="검색어 지우기"
+              style={{ width: 28, height: 28, borderRadius: "50%", background: "rgba(94,125,108,0.12)", color: C.textMid, border: "none", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 1 }}
             >
-              {label}
+              ✕
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── 카테고리 필터 (단색 8개) ── */}
+      <div className="feed-filter-bar">
+        <div className="feed-filter-scroll">
+          {STORY_FILTERS.map((f) => (
+            <button
+              key={f.key}
+              onClick={() => setActiveCategory(f.key)}
+              className={`feed-filter-tab${activeCategory === f.key ? " active" : ""}`}
+            >
+              {f.label}
             </button>
           ))}
         </div>
       </div>
 
-      {/* ══════════════ 탭 1: 개선 사례 ══════════════ */}
-      {mainTab === "cases" && (
-        <>
-          {/* 검색창 */}
-          <div style={{ maxWidth: 560, margin: "0 auto", padding: "12px 20px 0" }}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                height: 44,
-                padding: "0 14px",
-                background: "#F8F9F7",
-                border: `1px solid ${C.border}`,
-                borderRadius: 22,
-              }}
-            >
-              <span aria-hidden="true" style={{ fontSize: 16, color: C.sageMid, lineHeight: 1 }}>🔍</span>
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="증상, 약국, 키워드 검색"
-                aria-label="피드 검색"
-                style={{
-                  flex: 1,
-                  height: "100%",
-                  border: "none",
-                  background: "transparent",
-                  outline: "none",
-                  fontSize: 14,
-                  color: C.textDark,
-                }}
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery("")}
-                  aria-label="검색어 지우기"
-                  style={{
-                    width: 28, height: 28, borderRadius: "50%",
-                    background: "rgba(94,125,108,0.12)", color: C.textMid,
-                    border: "none", fontSize: 13, cursor: "pointer",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    padding: 0, lineHeight: 1,
-                  }}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* 필터 칩 */}
-          <div
-            style={{
-              maxWidth: 560,
-              margin: "0 auto",
-              padding: "10px 20px",
-            }}
-          >
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-              {[...FILTER_TABS_DEFAULT, ...(showMoreFilters ? FILTER_TABS_MORE : [])].map((tab) => {
-                const isActive = activeFilter === tab.key;
-                const isAll = tab.key === "all";
-                const chip = CHIP_COLORS[tab.key];
-                let bg: string;
-                let fg: string;
-                if (isAll) {
-                  bg = isActive ? C.sageDeep : "#F8F9F7";
-                  fg = isActive ? "#fff" : "#3D4A42";
-                } else if (chip) {
-                  bg = isActive ? chip.fg : chip.bg;
-                  fg = isActive ? "#fff" : chip.fg;
-                } else {
-                  bg = isActive ? C.sageDeep : "#F0F0F0";
-                  fg = isActive ? "#fff" : "#555";
-                }
-                const border = isAll && !isActive ? "1px solid rgba(94,125,108,0.2)" : "none";
-                return (
-                  <button
-                    key={tab.key}
-                    type="button"
-                    onClick={() => setActiveFilter(tab.key)}
-                    style={{
-                      height: 40,
-                      padding: "0 16px",
-                      border,
-                      borderRadius: 20,
-                      background: bg,
-                      color: fg,
-                      fontSize: 14,
-                      fontWeight: 500,
-                      cursor: "pointer",
-                      whiteSpace: "nowrap",
-                      flexShrink: 0,
-                      fontFamily: "'Gothic A1', sans-serif",
-                      lineHeight: 1,
-                      transition: "background 0.15s, color 0.15s",
-                    }}
-                  >
-                    {tab.label}
-                  </button>
-                );
-              })}
-              <button
-                type="button"
-                onClick={() => setShowMoreFilters((v) => !v)}
-                style={{
-                  height: 40,
-                  padding: "0 16px",
-                  border: "1px dashed rgba(94,125,108,0.3)",
-                  borderRadius: 20,
-                  background: "transparent",
-                  color: "#5E7D6C",
-                  fontSize: 14,
-                  fontWeight: 500,
-                  cursor: "pointer",
-                  whiteSpace: "nowrap",
-                  flexShrink: 0,
-                  fontFamily: "'Gothic A1', sans-serif",
-                  lineHeight: 1,
-                }}
-              >
-                더보기 {showMoreFilters ? "↑" : "↓"}
-              </button>
-            </div>
-          </div>
-
-          {/* 피드 컨테이너 */}
-          <div className="feed-container">
-            {showEmptyState ? (
-              <div style={{
-                display: "flex", flexDirection: "column", alignItems: "center",
-                justifyContent: "center", padding: "48px 20px", textAlign: "center",
-              }}>
-                <div style={{ fontSize: 48, marginBottom: 12, lineHeight: 1 }}>📝</div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>아직 개선 사례가 없어요</div>
-                <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 16 }}>첫 번째 사례를 올려보세요!</div>
-                <button type="button" onClick={() => router.push("/feed/new")} style={{
+      {/* ── 통합 피드 목록 (개선 사례 + 약사 이야기, 최신순) ── */}
+      <div className="feed-container" style={{ minHeight: "calc(100vh - 240px)" }}>
+        {items.length === 0 ? (
+          (cases.length === 0 && stories.length === 0) ? (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "48px 20px", textAlign: "center" }}>
+              <div style={{ fontSize: 48, marginBottom: 12, lineHeight: 1 }}>📝</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>아직 등록된 글이 없어요</div>
+              <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: isPharmacist ? 16 : 0 }}>첫 경험을 올려보세요!</div>
+              {isPharmacist && (
+                <button type="button" onClick={() => setShowWriteSheet(true)} style={{
                   padding: "11px 24px", borderRadius: 12, fontSize: 14, fontWeight: 700,
                   background: C.sageDeep, color: "#fff", border: "none", cursor: "pointer",
-                }}>개선 사례 올리기</button>
-              </div>
-            ) : filtered.length === 0 ? (
-              <div className="feed-empty">해당 증상의 개선 사례가 아직 없습니다.</div>
-            ) : (
-              <div className="feed-list">
-                {filtered.map((c, i) => {
-                  const liked = likedSet.has(c.id);
-                  const isPatient = c.authorType === "patient";
-                  const dateStr = formatRelativeDate(c.createdAt);
-                  const images = c.images ?? [];
-
-                  const primaryTag = c.tags[0];
-                  const restTags = c.tags.slice(1);
-                  const symKey = primaryTag ? TAG_LABEL_TO_KEY[primaryTag.label] : undefined;
-                  const meta = symKey ? SYMPTOM_META[symKey] : undefined;
-                  const accent = meta?.accent ?? C.sageDeep;
-                  const lightBg = meta?.bg ?? C.sagePale;
-                  const primaryLabel = primaryTag?.label ?? "건강 관리";
-
-                  const authorBadgeStyle: React.CSSProperties = {
-                    display: "inline-block",
-                    fontSize: 12,
-                    fontWeight: 500,
-                    padding: "3px 8px",
-                    borderRadius: 4,
-                    background: isPatient ? "#F5E6DC" : "#EDF4F0",
-                    color: isPatient ? "#C06B45" : "#4A6355",
-                    letterSpacing: "0.01em",
-                    flexShrink: 0,
-                  };
-
-                  return (
-                    <article
-                      key={c.id}
-                      className="reveal"
-                      ref={addRevealRef}
-                      style={{
-                        animationDelay: `${0.1 * i}s`,
-                        background: "#fff",
-                        borderRadius: 16,
-                        border: "1px solid rgba(94,125,108,0.1)",
-                        boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
-                        overflow: "hidden",
-                        marginBottom: 16,
-                      }}
-                    >
-                      {/* 상단 액센트 라인 */}
-                      <div style={{ height: 3, background: accent }} />
-
-                      {/* 증상 헤더: 아이콘 + 증상명 + 작성자 뱃지 */}
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 12,
-                          padding: "16px 20px 10px",
-                        }}
-                      >
-                        {symKey ? (
-                          <SymptomIcon keyId={symKey} size={40} />
-                        ) : (
-                          <div
-                            style={{
-                              width: 40,
-                              height: 40,
-                              borderRadius: "50%",
-                              background: lightBg,
-                              flexShrink: 0,
-                            }}
-                          />
-                        )}
-                        <div
-                          style={{
-                            flex: 1,
-                            fontSize: 17,
-                            fontWeight: 700,
-                            color: C.textDark,
-                            fontFamily: "'Gothic A1', sans-serif",
-                            minWidth: 0,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {primaryLabel}
-                        </div>
-                        <span style={authorBadgeStyle}>
-                          {isPatient ? "환자 작성" : "약사 작성"}
-                        </span>
-                      </div>
-
-                      {/* 추가 증상 태그 */}
-                      {restTags.length > 0 && (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 20px 12px" }}>
-                          {restTags.map((t) => (
-                            <span key={t.label} className={`feed-tag feed-tag-${t.variant}`}>
-                              {t.label}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* 작성자 정보 */}
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
-                          padding: "0 20px 14px",
-                          borderBottom: `1px solid ${C.border}`,
-                          marginBottom: 14,
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: 32,
-                            height: 32,
-                            borderRadius: "50%",
-                            background: isPatient ? C.terraLight : C.sagePale,
-                            color: isPatient ? C.terra : C.sageDeep,
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            fontSize: 16,
-                            fontWeight: 700,
-                            flexShrink: 0,
-                          }}
-                          aria-hidden="true"
-                        >
-                          {isPatient ? "👤" : c.pharmacist.avatar}
-                        </div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          {isPatient ? (
-                            <>
-                              <div style={{ fontSize: 14, fontWeight: 600, color: C.textDark, lineHeight: 1.4 }}>
-                                {c.authorLabel}
-                              </div>
-                              <div style={{ fontSize: 13, color: "#3D4A42", lineHeight: 1.4 }}>
-                                {dateStr}
-                              </div>
-                            </>
-                          ) : (
-                            <>
-                              <div style={{ fontSize: 14, fontWeight: 600, color: C.textDark, lineHeight: 1.4 }}>
-                                {c.pharmacist.name}
-                              </div>
-                              <div style={{ fontSize: 13, color: "#3D4A42", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                                {c.pharmacist.pharmacyName} · {c.pharmacist.location}
-                                {c.pharmacist.distance && ` · ${c.pharmacist.distance}`}
-                                {` · ${dateStr}`}
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* 본문 */}
-                      <div style={{ padding: "0 20px 20px" }}>
-                        {!isPatient && (
-                          <div style={{ fontSize: 14, color: C.textMid, marginBottom: 8 }}>
-                            {c.patientInfo}
-                          </div>
-                        )}
-                        <ExpandableText text={c.summary} />
-
-                        {/* 사진 힌트 */}
-                        {images.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => openLightbox(images, 0)}
-                            style={{
-                              background: "none",
-                              border: "none",
-                              padding: 0,
-                              margin: "0 0 14px",
-                              fontSize: 14,
-                              color: C.sageMid,
-                              cursor: "pointer",
-                              display: "inline-block",
-                              textDecoration: "none",
-                            }}
-                            onMouseEnter={(e) => {
-                              e.currentTarget.style.textDecoration = "underline";
-                            }}
-                            onMouseLeave={(e) => {
-                              e.currentTarget.style.textDecoration = "none";
-                            }}
-                          >
-                            📷 사진 {images.length}장 보기
-                          </button>
-                        )}
-
-                        {/* 개선 결과 */}
-                        {c.showHealthScore && c.scores.length > 0 && (
-                          <div
-                            style={{
-                              background: lightBg,
-                              borderRadius: 12,
-                              padding: 16,
-                              marginBottom: 14,
-                              display: "flex",
-                              flexDirection: "column",
-                              gap: 10,
-                            }}
-                          >
-                            <div style={{ fontSize: 13, fontWeight: 700, color: accent, letterSpacing: "0.02em" }}>
-                              개선 결과
-                            </div>
-                            {c.scores.map((s) => {
-                              const improved = s.after > s.before;
-                              const diff = Math.abs(s.after - s.before);
-                              return (
-                                <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                  <span style={{ minWidth: 52, fontSize: 14, color: C.textMid, fontWeight: 500 }}>
-                                    {s.label}
-                                  </span>
-                                  <span style={{ fontSize: 13, color: "#3D4A42", minWidth: 16, textAlign: "right" }}>
-                                    {s.before}
-                                  </span>
-                                  <div
-                                    style={{
-                                      flex: 1,
-                                      height: 8,
-                                      background: "#E0E0E0",
-                                      borderRadius: 4,
-                                      position: "relative",
-                                      overflow: "hidden",
-                                    }}
-                                  >
-                                    <div
-                                      style={{
-                                        position: "absolute",
-                                        left: 0,
-                                        top: 0,
-                                        bottom: 0,
-                                        width: `${s.after * 10}%`,
-                                        background: accent,
-                                        borderRadius: 4,
-                                      }}
-                                    />
-                                  </div>
-                                  <span style={{ fontSize: 14, color: accent, fontWeight: 700, minWidth: 16, textAlign: "right" }}>
-                                    {s.after}
-                                  </span>
-                                  <span style={{ fontSize: 13, color: accent, fontWeight: 700, minWidth: 40, textAlign: "right" }}>
-                                    {improved ? `+${diff}↑` : `-${diff}↓`}
-                                  </span>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-
-                        {/* 관리 기간 */}
-                        <div style={{ fontSize: 14, color: "#3D4A42", marginBottom: 14 }}>
-                          🗓 <span style={{ fontWeight: 500 }}>{c.durationWeeks}주 관리</span>
-                        </div>
-
-                        {/* 하단: 좋아요 + 상담 */}
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            paddingTop: 14,
-                            borderTop: `1px solid ${C.border}`,
-                          }}
-                        >
-                          <button
-                            className={`feed-like-btn${liked ? " liked" : ""}`}
-                            onClick={() => toggleLike(c.id)}
-                          >
-                            {liked ? "❤️" : "🤍"} {liked ? c.likesCount + 1 : c.likesCount}
-                          </button>
-                          <button className="feed-consult-btn" onClick={() => handleConsult(c)}>
-                            이 약사에게 상담받기
-                          </button>
-                        </div>
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </>
-      )}
-
-      {/* ══════════════ 탭 2: 약사의 이야기 ══════════════ */}
-      {mainTab === "recs" && (
-        <>
-          {/* 필터 */}
-          <div className="feed-filter-bar">
-            <div className="feed-filter-scroll">
-              {STORY_FILTERS.map((f) => (
-                <button
-                  key={f.key}
-                  onClick={() => setStoryFilter(f.key)}
-                  className={`feed-filter-tab${storyFilter === f.key ? " active" : ""}`}
-                >
-                  {f.label}
-                </button>
-              ))}
+                }}>글쓰기</button>
+              )}
             </div>
+          ) : (
+            <div className="feed-empty">조건에 맞는 글이 아직 없습니다.</div>
+          )
+        ) : (
+          <div className="feed-list">
+            {items.map((item, i) => (
+              <FeedExperienceCard
+                key={item.id}
+                item={item}
+                index={i}
+                onRef={addRevealRef}
+                liked={likedSet.has(item.id)}
+                onToggleLike={() => toggleLike(item.id)}
+                onConsult={() => { if (item.pharmacist) router.push(`/pharmacist/${item.pharmacist.id}`); }}
+                onOpenLightbox={openLightbox}
+                isOwner={!!user && item.authorId === user.id}
+                onDelete={() => setDeleteTarget(item)}
+                onEdit={() => router.push(item.kind === "case" ? `/feed/new?edit=${item.id}` : `/feed/recommend?edit=${item.id}`)}
+              />
+            ))}
           </div>
-
-          {/* 카드 리스트 */}
-          <div className="feed-container">
-            {showEmptyState ? (
-              <div style={{
-                display: "flex", flexDirection: "column", alignItems: "center",
-                justifyContent: "center", padding: "48px 20px", textAlign: "center",
-              }}>
-                <div style={{ fontSize: 48, marginBottom: 12, lineHeight: 1 }}>💊</div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, marginBottom: 6 }}>아직 약사의 이야기가 없어요</div>
-                <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6 }}>약사 선생님들의 경험이 곧 올라올 예정이에요</div>
-              </div>
-            ) : filteredStories.length === 0 ? (
-              <div className="feed-empty">해당 분야의 이야기가 아직 없습니다.</div>
-            ) : (
-              <div className="feed-list">
-                {filteredStories.map((s, i) => {
-                  const liked = storyLiked.has(s.id);
-                  const likeCount = liked ? s.likes + 1 : s.likes;
-                  return (
-                    <article
-                      key={s.id}
-                      className="reveal"
-                      ref={addRevealRef}
-                      style={{
-                        animationDelay: `${0.1 * i}s`,
-                        background: "#fff",
-                        borderRadius: 16,
-                        border: "1px solid rgba(94,125,108,0.1)",
-                        boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
-                        padding: 20,
-                        marginBottom: 16,
-                      }}
-                    >
-                      {/* 약사 프로필 */}
-                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
-                        <div
-                          style={{
-                            width: 44, height: 44, borderRadius: "50%",
-                            background: C.sagePale, display: "flex",
-                            alignItems: "center", justifyContent: "center",
-                            fontSize: 18, fontWeight: 700, color: C.sageDeep, flexShrink: 0,
-                          }}
-                        >
-                          {s.pharmacist.avatar}
-                        </div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, fontFamily: "'Gothic A1', sans-serif" }}>
-                            {s.pharmacist.name}
-                          </div>
-                          <div style={{ fontSize: 14, color: "#3D4A42", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                            {s.pharmacist.pharmacy} · {s.pharmacist.career}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* 대상 */}
-                      <div style={{ fontSize: 14, color: C.sageMid, fontWeight: 500, marginBottom: 6 }}>
-                        {s.target}
-                      </div>
-
-                      {/* 증상 태그 */}
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
-                        {s.tags.map((t) => (
-                          <span key={t.label} className={`feed-tag feed-tag-${t.variant}`}>{t.label}</span>
-                        ))}
-                      </div>
-
-                      {/* 제목 */}
-                      <div
-                        style={{
-                          fontSize: 17, fontWeight: 700, color: C.textDark,
-                          lineHeight: 1.5, marginBottom: 12,
-                          fontFamily: "'Gothic A1', sans-serif",
-                        }}
-                      >
-                        {s.title}
-                      </div>
-
-                      {/* 본문 (description이 있을 때) */}
-                      {s.description && <ExpandableText text={s.description} />}
-
-                      {/* 전/후 변화 */}
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
-                        {s.changes.map((ch, ci) => (
-                          <div key={ci} style={{
-                            padding: "10px 14px", borderRadius: 10,
-                            background: C.sagePale, fontSize: 14, lineHeight: 1.6,
-                          }}>
-                            <div style={{ color: C.textMid }}>
-                              <span style={{ marginRight: 6 }}>😫</span>
-                              <span style={{ fontWeight: 500 }}>{ch.before}</span>
-                            </div>
-                            <div style={{ color: C.sageDeep, marginTop: 4 }}>
-                              <span style={{ marginRight: 6 }}>😊</span>
-                              <span style={{ fontWeight: 600 }}>{ch.after}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* 기간 */}
-                      <div style={{ fontSize: 14, color: "#3D4A42", marginBottom: 14 }}>
-                        🗓 <span style={{ fontWeight: 500 }}>{s.duration}</span>
-                      </div>
-
-                      {/* 하단: 좋아요 + 상담 */}
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setStoryLiked((prev) => {
-                                const n = new Set(prev);
-                                n.has(s.id) ? n.delete(s.id) : n.add(s.id);
-                                return n;
-                              });
-                            }}
-                            style={{
-                              background: "none", border: "none", cursor: "pointer",
-                              fontSize: 14, fontWeight: 600,
-                              color: liked ? "#E0574F" : C.textMid,
-                              display: "flex", alignItems: "center", gap: 5, padding: "4px 0",
-                            }}
-                          >
-                            {liked ? "❤️" : "🤍"} {likeCount}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => router.push(`/pharmacist/${s.pharmacist.id}`)}
-                            style={{
-                              background: "none", border: "none", cursor: "pointer",
-                              fontSize: 14, fontWeight: 700, color: C.terra, padding: "4px 0",
-                            }}
-                          >
-                            이 약사에게 상담받기 →
-                          </button>
-                        </div>
-
-                      {/* 면책 문구 */}
-                      <div style={{
-                        fontSize: 12, color: C.sageMid, marginTop: 12,
-                        padding: "8px 12px", background: C.sageBg,
-                        borderRadius: 8, lineHeight: 1.5, textAlign: "center",
-                      }}>
-                        개인의 경험이며, 같은 증상이라도 사람마다 원인이 다릅니다.
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </>
+        )}
+      </div>
+      </>
       )}
 
       <Footer />
-
-      {/* 상담 안내 모달 (개선 사례 탭용) */}
-      {showModal && selectedCase && (
-        <div className="feed-modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="feed-modal animate-slide-up" onClick={(e) => e.stopPropagation()}>
-            <div className="feed-modal-pharmacist">
-              <div className="feed-modal-avatar">{selectedCase.pharmacist.avatar}</div>
-              <div>
-                <div className="feed-modal-name">{selectedCase.pharmacist.name}</div>
-                <div className="feed-modal-pharmacy">{selectedCase.pharmacist.pharmacyName} · {selectedCase.pharmacist.location}</div>
-              </div>
-            </div>
-            {isNearby ? (
-              <>
-                <div className="feed-modal-info nearby">
-                  <div className="feed-modal-info-title">무료 상담 요청</div>
-                  <p>근처 약국이에요! AI 문답 후 약사에게 무료 상담을 요청할 수 있습니다. 약국 방문 시 맞춤 분석을 받아보세요.</p>
-                </div>
-                <button className="feed-modal-btn nearby" onClick={handleConfirm}>무료 상담 요청하기</button>
-              </>
-            ) : (
-              <>
-                <div className="feed-modal-info remote">
-                  <div className="feed-modal-info-title">원격 상담 (유료)</div>
-                  <p>멀리 있는 약사입니다. 온라인 채팅으로 전문 상담을 받을 수 있으며, 상담료가 발생합니다.</p>
-                  <div className="feed-modal-fee">상담료: 9,900원~19,900원</div>
-                </div>
-                <button className="feed-modal-btn remote" onClick={handleConfirm}>원격 상담 신청하기</button>
-              </>
-            )}
-            <button className="feed-modal-cancel" onClick={() => setShowModal(false)}>취소</button>
-          </div>
-        </div>
-      )}
 
       {/* 사진 라이트박스 */}
       {lightboxImages && (
@@ -1179,6 +1018,125 @@ function FeedContent() {
           startIndex={lightboxStart}
           onClose={() => setLightboxImages(null)}
         />
+      )}
+
+      {/* ── 글쓰기 FAB (약사만) ── */}
+      {isPharmacist && (
+        <button
+          type="button"
+          onClick={() => setShowWriteSheet(true)}
+          aria-label="글쓰기"
+          style={{
+            position: "fixed",
+            right: 20,
+            bottom: "calc(76px + env(safe-area-inset-bottom, 0px))", // 하단 네비 위
+            zIndex: 80,
+            display: "flex", alignItems: "center", gap: 6,
+            height: 52, padding: "0 20px",
+            borderRadius: 26,
+            background: C.sageDeep, color: "#fff",
+            border: "none", cursor: "pointer",
+            fontSize: 15, fontWeight: 700,
+            fontFamily: "'Gothic A1', sans-serif",
+            boxShadow: "0 6px 20px rgba(74,99,85,0.35)",
+          }}
+        >
+          <span style={{ fontSize: 20, lineHeight: 1 }}>＋</span> 글쓰기
+        </button>
+      )}
+
+      {/* ── 글쓰기 종류 선택 모달 (중앙, 약사만) ── */}
+      {isPharmacist && showWriteSheet && (
+        <div
+          onClick={() => setShowWriteSheet(false)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 200,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "100%", maxWidth: 400,
+              background: "#fff",
+              borderRadius: 20,
+              padding: 20,
+              boxShadow: "0 20px 60px rgba(0,0,0,0.18)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: C.textDark, fontFamily: "'Gothic A1', sans-serif" }}>어떤 글을 올릴까요?</div>
+              <button
+                type="button"
+                onClick={() => setShowWriteSheet(false)}
+                aria-label="닫기"
+                style={{ width: 32, height: 32, borderRadius: "50%", background: "rgba(94,125,108,0.12)", color: C.textMid, border: "none", fontSize: 15, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 1 }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => { setShowWriteSheet(false); router.push("/feed/new"); }}
+              style={{
+                width: "100%", textAlign: "left",
+                padding: "14px 16px", marginBottom: 10,
+                borderRadius: 12, border: `1px solid ${C.border}`,
+                background: "#F8F9F7", cursor: "pointer",
+              }}
+            >
+              <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, marginBottom: 4 }}>환자 사례</div>
+              <div style={{ fontSize: 13, color: C.textMid, lineHeight: 1.5 }}>상담한 환자의 개선 경험을 약사가 기록</div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => { setShowWriteSheet(false); router.push("/feed/recommend"); }}
+              style={{
+                width: "100%", textAlign: "left",
+                padding: "14px 16px",
+                borderRadius: 12, border: `1px solid ${C.border}`,
+                background: "#F8F9F7", cursor: "pointer",
+              }}
+            >
+              <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, marginBottom: 4 }}>내 경험·가족</div>
+              <div style={{ fontSize: 13, color: C.textMid, lineHeight: 1.5 }}>약사 본인 또는 가족의 개선 경험</div>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── 삭제 확인 팝업 ── */}
+      {deleteTarget && (
+        <div
+          onClick={() => !deleting && setDeleteTarget(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: "#fff", borderRadius: 16, padding: "26px 22px 18px", width: "min(92vw, 360px)", boxShadow: "0 10px 40px rgba(0,0,0,0.2)" }}
+          >
+            <h3 style={{ fontSize: 17, fontWeight: 700, color: "#2C3630", textAlign: "center", margin: "0 0 8px" }}>이 글을 삭제할까요?</h3>
+            <p style={{ fontSize: 14, color: "#3D4A42", textAlign: "center", lineHeight: 1.5, margin: "0 0 18px" }}>삭제한 글은 되돌릴 수 없어요.</p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={() => setDeleteTarget(null)}
+                disabled={deleting}
+                style={{ flex: 1, padding: "12px", borderRadius: 10, border: "1px solid #DDE3DF", background: "#fff", color: "#3D4A42", fontSize: 15, fontWeight: 600, cursor: "pointer" }}
+              >취소</button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                style={{ flex: 1, padding: "12px", borderRadius: 10, border: "none", background: "#C0392B", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}
+              >
+                {deleting ? "삭제 중..." : "삭제하기"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

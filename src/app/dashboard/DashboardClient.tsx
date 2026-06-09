@@ -1728,295 +1728,15 @@ function DashboardContent() {
   const [sortBy, setSortBy] = useState<SortKey>("recent");
   const [search, setSearch] = useState("");
 
-  /* ── 실시간 상담 요청 (DB) — 상단 배너 + 전용 리스트 ── */
-  interface DbQuestionnaireDetail {
-    symptoms: string[] | null;
-    symptom_duration: string | null;
-    severity: string | null;
-    occupation: string | null;
-    sleep_hours: number | null;
-    water_intake: number | null;
-    meal_pattern: string | null;
-    snack_frequency: string | null;
-    exercise_frequency: string | null;
-    exercise_types: string[] | null;
-    alcohol: string | null;
-    caffeine: string | null;
-    smoking: string | null;
-    current_supplements: string[] | null;
-    current_medications: string[] | null;
-    allergies: string[] | null;
-    monthly_budget: number | null;
-    free_text: string | null;
-    detailed_answers: Record<string, unknown> | null;
-  }
-  interface DbPendingRow {
-    id: string;
-    created_at: string;
-    patient: { id: string; name: string; avatar_url: string | null } | null;
-    questionnaire: DbQuestionnaireDetail | null;
-    patient_profile: { birth_year: number | null; gender: string | null } | null;
-  }
-  interface DbActiveRow {
-    id: string;
-    status: string;
-    created_at: string;
-    last_message_at: string | null;
-    patient: { id: string; name: string; avatar_url: string | null } | null;
-    questionnaire: { symptoms: string[] | null } | null;
-    patient_profile: { birth_year: number | null; gender: string | null } | null;
-  }
   const { user: authUser } = useAuth();
 
   // 약사 페이지 접근 가드 — 비로그인/환자/면허없음 리다이렉트. checking=true 동안 본문 대신 로딩 화면.
   //   /dashboard 와 /dashboard/patients 등 약사 전용 페이지가 동일 hook 호출로 일관 적용.
   const { checking, failed } = usePharmacistGuard();
 
-  const [dbPendingCount, setDbPendingCount] = useState<number | null>(null);
-  const [dbPendingList, setDbPendingList] = useState<DbPendingRow[] | null>(null);
-  const [dbPendingLoading, setDbPendingLoading] = useState(true);
-  const [expandedPendingId, setExpandedPendingId] = useState<string | null>(null);
-  const [dbActiveList, setDbActiveList] = useState<DbActiveRow[] | null>(null);
-  const [dbActiveLoading, setDbActiveLoading] = useState(true);
   const [actingId, setActingId] = useState<string | null>(null);
 
-  const fetchPendingRequests = async (myUserId: string | null) => {
-    setDbPendingLoading(true);
 
-    // 1) consultations 만 단순 SELECT — 임베드(JOIN) 없이 가져와 400 회피
-    const unassignedQuery = supabase
-      .from("consultations")
-      .select("*")
-      .eq("status", "pending")
-      .is("pharmacist_id", null);
-
-    const myQuery = myUserId
-      ? supabase
-          .from("consultations")
-          .select("*")
-          .eq("status", "pending")
-          .eq("pharmacist_id", myUserId)
-      : Promise.resolve({ data: [] as unknown[], error: null });
-
-    const [unRes, myRes] = await Promise.all([unassignedQuery, myQuery]);
-
-    if (unRes.error) {
-      console.error("[dashboard] pending unassigned query FAILED:", {
-        message: unRes.error.message,
-        code: unRes.error.code,
-        details: unRes.error.details,
-        hint: unRes.error.hint,
-      });
-    }
-    if (myRes && "error" in myRes && myRes.error) {
-      console.error("[dashboard] pending mine query FAILED:", {
-        message: myRes.error.message,
-        code: (myRes.error as { code?: string }).code,
-        details: (myRes.error as { details?: string }).details,
-        hint: (myRes.error as { hint?: string }).hint,
-      });
-    }
-
-    interface ConsRow {
-      id: string;
-      status: string;
-      pharmacist_id: string | null;
-      patient_id: string;
-      questionnaire_id: string | null;
-      created_at: string;
-    }
-    const unRows = ((unRes.data ?? []) as unknown) as ConsRow[];
-    const myRows =
-      myRes && "data" in myRes ? ((myRes.data ?? []) as unknown as ConsRow[]) : [];
-
-    // id 기준 중복 제거
-    const byId = new Map<string, ConsRow>();
-    for (const r of [...unRows, ...myRows]) byId.set(r.id, r);
-
-    // 본인(약사)이 환자로서 보낸 요청은 제외
-    const filtered = Array.from(byId.values()).filter(
-      (c) => !myUserId || c.patient_id !== myUserId,
-    );
-
-    const consultations = filtered.sort(
-      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    );
-
-    if (consultations.length === 0) {
-      setDbPendingList([]);
-      setDbPendingCount(0);
-      setDbPendingLoading(false);
-      return;
-    }
-
-    // 2) 각 consultation의 patient/questionnaire/patient_profile 을 IN 쿼리로 일괄 조회
-    const patientIds = Array.from(new Set(consultations.map((c) => c.patient_id)));
-    const questionnaireIds = consultations
-      .map((c) => c.questionnaire_id)
-      .filter((v): v is string => !!v);
-
-    const [profilesRes, qRes, patientProfRes] = await Promise.all([
-      patientIds.length > 0
-        ? supabase
-            .from("profiles")
-            .select("id, name, avatar_url")
-            .in("id", patientIds)
-        : Promise.resolve({ data: [] as unknown[], error: null }),
-      questionnaireIds.length > 0
-        ? supabase
-            .from("ai_questionnaires")
-            .select(
-              "id, symptoms, symptom_duration, severity, occupation, sleep_hours, water_intake, meal_pattern, snack_frequency, exercise_frequency, exercise_types, alcohol, caffeine, smoking, current_supplements, current_medications, allergies, monthly_budget, free_text, detailed_answers",
-            )
-            .in("id", questionnaireIds)
-        : Promise.resolve({ data: [] as unknown[], error: null }),
-      patientIds.length > 0
-        ? supabase
-            .from("patient_profiles")
-            .select("id, birth_year, gender")
-            .in("id", patientIds)
-        : Promise.resolve({ data: [] as unknown[], error: null }),
-    ]);
-
-    if ("error" in profilesRes && profilesRes.error) {
-      console.error("[dashboard] profiles fetch FAILED:", profilesRes.error);
-    }
-    if ("error" in qRes && qRes.error) {
-      console.error("[dashboard] ai_questionnaires fetch FAILED:", qRes.error);
-    }
-    if ("error" in patientProfRes && patientProfRes.error) {
-      console.error("[dashboard] patient_profiles fetch FAILED:", patientProfRes.error);
-    }
-
-    const profileById = new Map<string, { id: string; name: string; avatar_url: string | null }>();
-    for (const p of (profilesRes.data ?? []) as { id: string; name: string; avatar_url: string | null }[]) {
-      profileById.set(p.id, p);
-    }
-    type QFull = DbQuestionnaireDetail & { id: string };
-    const qById = new Map<string, QFull>();
-    for (const q of (qRes.data ?? []) as QFull[]) {
-      qById.set(q.id, q);
-    }
-    const patientProfById = new Map<string, { id: string; birth_year: number | null; gender: string | null }>();
-    for (const pp of (patientProfRes.data ?? []) as { id: string; birth_year: number | null; gender: string | null }[]) {
-      patientProfById.set(pp.id, pp);
-    }
-
-    const rows: DbPendingRow[] = consultations.map((c) => ({
-      id: c.id,
-      created_at: c.created_at,
-      patient: profileById.get(c.patient_id) ?? null,
-      questionnaire: c.questionnaire_id ? qById.get(c.questionnaire_id) ?? null : null,
-      patient_profile: patientProfById.get(c.patient_id) ?? null,
-    }));
-
-    setDbPendingList(rows);
-    setDbPendingCount(rows.length);
-    setDbPendingLoading(false);
-  };
-
-  const fetchActiveConsultations = async (pharmacistId: string) => {
-    setDbActiveLoading(true);
-
-    // 1) consultations 만 단순 SELECT — 임베드 없이 (400 회피)
-    const consRes = await supabase
-      .from("consultations")
-      .select("*")
-      .in("status", ["accepted", "chatting", "visit_scheduled"])
-      .eq("pharmacist_id", pharmacistId)
-      .order("last_message_at", { ascending: false, nullsFirst: false });
-
-    if (consRes.error) {
-      console.error("[dashboard] active list failed:", {
-        message: consRes.error.message,
-        code: consRes.error.code,
-        details: consRes.error.details,
-        hint: consRes.error.hint,
-      });
-      setDbActiveList([]);
-      setDbActiveLoading(false);
-      return;
-    }
-
-    interface ActiveConsRow {
-      id: string;
-      status: string;
-      created_at: string;
-      last_message_at: string | null;
-      patient_id: string;
-      questionnaire_id: string | null;
-    }
-    const consultations = ((consRes.data ?? []) as unknown) as ActiveConsRow[];
-
-    if (consultations.length === 0) {
-      setDbActiveList([]);
-      setDbActiveLoading(false);
-      return;
-    }
-
-    // 2) IN 쿼리로 patient/questionnaire/patient_profile 일괄 조회
-    const patientIds = Array.from(new Set(consultations.map((c) => c.patient_id)));
-    const questionnaireIds = consultations
-      .map((c) => c.questionnaire_id)
-      .filter((v): v is string => !!v);
-
-    const [profilesRes, qRes, patientProfRes] = await Promise.all([
-      patientIds.length > 0
-        ? supabase
-            .from("profiles")
-            .select("id, name, avatar_url")
-            .in("id", patientIds)
-        : Promise.resolve({ data: [] as unknown[], error: null }),
-      questionnaireIds.length > 0
-        ? supabase
-            .from("ai_questionnaires")
-            .select("id, symptoms")
-            .in("id", questionnaireIds)
-        : Promise.resolve({ data: [] as unknown[], error: null }),
-      patientIds.length > 0
-        ? supabase
-            .from("patient_profiles")
-            .select("id, birth_year, gender")
-            .in("id", patientIds)
-        : Promise.resolve({ data: [] as unknown[], error: null }),
-    ]);
-
-    if ("error" in profilesRes && profilesRes.error) {
-      console.error("[dashboard] active profiles fetch FAILED:", profilesRes.error);
-    }
-    if ("error" in qRes && qRes.error) {
-      console.error("[dashboard] active ai_questionnaires fetch FAILED:", qRes.error);
-    }
-    if ("error" in patientProfRes && patientProfRes.error) {
-      console.error("[dashboard] active patient_profiles fetch FAILED:", patientProfRes.error);
-    }
-
-    const profileById = new Map<string, { id: string; name: string; avatar_url: string | null }>();
-    for (const p of (profilesRes.data ?? []) as { id: string; name: string; avatar_url: string | null }[]) {
-      profileById.set(p.id, p);
-    }
-    const qById = new Map<string, { id: string; symptoms: string[] | null }>();
-    for (const q of (qRes.data ?? []) as { id: string; symptoms: string[] | null }[]) {
-      qById.set(q.id, q);
-    }
-    const patientProfById = new Map<string, { id: string; birth_year: number | null; gender: string | null }>();
-    for (const pp of (patientProfRes.data ?? []) as { id: string; birth_year: number | null; gender: string | null }[]) {
-      patientProfById.set(pp.id, pp);
-    }
-
-    const rows: DbActiveRow[] = consultations.map((c) => ({
-      id: c.id,
-      status: c.status,
-      created_at: c.created_at,
-      last_message_at: c.last_message_at,
-      patient: profileById.get(c.patient_id) ?? null,
-      questionnaire: c.questionnaire_id ? qById.get(c.questionnaire_id) ?? null : null,
-      patient_profile: patientProfById.get(c.patient_id) ?? null,
-    }));
-
-    setDbActiveList(rows);
-    setDbActiveLoading(false);
-  };
 
   /** 통합 환자 목록 로더 — src/lib/pharmacistConsults 의 fetchAllConsultations 를 호출해 setConsults 적용.
    *  본문(쿼리·매핑) 은 모두 lib 으로 이동(2026-05-27). dashboard·환자 목록 페이지에서 공유. */
@@ -2026,20 +1746,6 @@ function DashboardContent() {
   };
 
 
-  useEffect(() => {
-    fetchPendingRequests(authUser?.id ?? null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUser]);
-
-  useEffect(() => {
-    if (!authUser) {
-      setDbActiveList([]);
-      setDbActiveLoading(false);
-      return;
-    }
-    fetchActiveConsultations(authUser.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authUser]);
 
   // 통합 환자 목록(consults state) — pharmacistId 확정 시 fetch. 미로그인이면 빈 배열.
   useEffect(() => {
@@ -2063,166 +1769,6 @@ function DashboardContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authUser]);
 
-  const updatePendingStatus = async (
-    id: string,
-    nextStatus: "accepted" | "rejected",
-  ) => {
-    if (actingId) return;
-    setActingId(id);
-
-    type Patch = {
-      status: string;
-      rejected_at?: string;
-      pharmacist_id?: string;
-    };
-    const patch: Patch = { status: nextStatus };
-    if (nextStatus === "rejected") {
-      patch.rejected_at = new Date().toISOString();
-    }
-    if (nextStatus === "accepted" && authUser) {
-      // 수락 시 자기 자신을 pharmacist_id 로 설정
-      patch.pharmacist_id = authUser.id;
-    }
-
-    const { error } = await (supabase
-      .from("consultations") as unknown as {
-        update: (p: Patch) => {
-          eq: (col: string, val: string) => Promise<{ error: Error | null }>;
-        };
-      })
-      .update(patch)
-      .eq("id", id);
-
-    if (error) {
-      console.error(`[dashboard] consultation ${nextStatus} failed:`, error);
-      setActingId(null);
-      return;
-    }
-
-    // 수락 시: 회차(round) 부트스트랩.
-    //   1) 기존 'active' round 가 남아있으면 먼저 'completed' 로 UPDATE (정합성 보장 —
-    //      DB 에 (consultation_id) WHERE status='active' 부분 unique 제약이 있어도 통과).
-    //   2) max(round_number)+1 으로 새 round INSERT (status='active').
-    //   3) [ROUND_START] 시스템 메시지 INSERT (message_type='system', is_read=true).
-    //   부분 실패해도 수락 자체는 성공으로 간주 — console.error 로 명확히 로깅.
-    if (nextStatus === "accepted" && authUser) {
-      try {
-        // (a) 기존 active round 가 있으면 닫기 (legacy 데이터 정합성 보호용).
-        //     ended_at 도 같이 채워서 통계 일관성 유지. 실패해도 다음 단계 진행.
-        type RoundUpdate = { status: string; ended_at: string };
-        const closePrevResp = await (supabase
-          .from("consultation_rounds") as unknown as {
-            update: (p: RoundUpdate) => {
-              eq: (col: string, val: string) => {
-                eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
-              };
-            };
-          })
-          .update({ status: "completed", ended_at: new Date().toISOString() })
-          .eq("consultation_id", id)
-          .eq("status", "active");
-        if (closePrevResp.error) {
-          console.error("[ACCEPT] close previous active rounds failed:", closePrevResp.error);
-        }
-
-        // (b) 다음 round_number 계산
-        const maxResp = await supabase
-          .from("consultation_rounds")
-          .select("round_number")
-          .eq("consultation_id", id)
-          .order("round_number", { ascending: false })
-          .limit(1)
-          .maybeSingle<{ round_number: number }>();
-        if (maxResp.error) {
-          console.error("[ACCEPT] max round_number lookup failed:", maxResp.error);
-        }
-        const nextRoundNumber =
-          typeof maxResp.data?.round_number === "number"
-            ? maxResp.data.round_number + 1
-            : 1;
-
-        // (c) consultations.questionnaire_id 조회 — round 의 questionnaire_id 로 사용
-        const consResp = await supabase
-          .from("consultations")
-          .select("questionnaire_id")
-          .eq("id", id)
-          .maybeSingle<{ questionnaire_id: string | null }>();
-        if (consResp.error) {
-          console.error("[ACCEPT] consultation questionnaire_id lookup failed:", consResp.error);
-        }
-        const qId = consResp.data?.questionnaire_id ?? null;
-
-        // (d) consultation_rounds INSERT
-        type RoundInsert = {
-          consultation_id: string;
-          round_number: number;
-          questionnaire_id: string | null;
-          status: string;
-        };
-        const roundPayload: RoundInsert = {
-          consultation_id: id,
-          round_number: nextRoundNumber,
-          questionnaire_id: qId,
-          status: "active",
-        };
-        const roundResp = await (supabase
-          .from("consultation_rounds") as unknown as {
-            insert: (p: RoundInsert) => {
-              select: (cols: string) => {
-                maybeSingle: () => Promise<{
-                  data: { id: string } | null;
-                  error: { message: string } | null;
-                }>;
-              };
-            };
-          })
-          .insert(roundPayload)
-          .select("id")
-          .maybeSingle();
-
-        if (roundResp.error || !roundResp.data?.id) {
-          console.error("[ACCEPT] round insert failed:", roundResp.error);
-        } else {
-          // (e) 회차 시작 시스템 메시지 INSERT
-          type SysMsgInsert = {
-            consultation_id: string;
-            round_id: string;
-            sender_id: string;
-            content: string;
-            message_type: string;
-            is_read: boolean;
-          };
-          const sysPayload: SysMsgInsert = {
-            consultation_id: id,
-            round_id: roundResp.data.id,
-            sender_id: authUser.id,
-            content: "[ROUND_START]",
-            message_type: "system",
-            is_read: true,
-          };
-          const sysResp = await (supabase
-            .from("messages") as unknown as {
-              insert: (p: SysMsgInsert) => Promise<{ error: { message: string } | null }>;
-            })
-            .insert(sysPayload);
-          if (sysResp.error) {
-            console.error("[ACCEPT] round-start system message INSERT failed:", sysResp.error);
-          }
-        }
-      } catch (roundErr) {
-        console.error("[ACCEPT] round bootstrap threw:", roundErr);
-      }
-    }
-
-    setActingId(null);
-    // 목록에서 즉시 제거
-    setDbPendingList((prev) => prev?.filter((r) => r.id !== id) ?? null);
-    setDbPendingCount((prev) => (prev !== null ? Math.max(0, prev - 1) : null));
-    // 수락한 건은 진행 중 영역에 즉시 반영
-    if (nextStatus === "accepted" && authUser) {
-      fetchActiveConsultations(authUser.id);
-    }
-  };
   // 4단계: 리스트뷰 분리(/dashboard/patients) 이후 카드 전용. viewMode/sessionStorage/리스트 전용 필터 제거.
   const [filterSource, setFilterSource] = useState<"app" | "offline" | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -2244,18 +1790,178 @@ function DashboardContent() {
     toastTimerRef.current = setTimeout(() => setToast(null), 2200);
   };
 
-  const handleAccept = (id: string) => {
+  const handleAccept = async (id: string) => {
+    if (actingId) return; // 중복 클릭 가드
+    if (!authUser) { showToast("로그인이 필요해요"); return; }
+    setActingId(id);
+
+    // (공통) consultations UPDATE — status=accepted, 본인을 담당 약사로 배정
+    type Patch = { status: string; pharmacist_id: string };
+    const patch: Patch = { status: "accepted", pharmacist_id: authUser.id };
+    const { error } = await (supabase
+      .from("consultations") as unknown as {
+        update: (p: Patch) => {
+          eq: (col: string, val: string) => Promise<{ error: Error | null }>;
+        };
+      })
+      .update(patch)
+      .eq("id", id);
+    if (error) {
+      console.error("[dashboard] consultation accept failed:", error);
+      setActingId(null);
+      showToast("수락 처리에 실패했어요. 다시 시도해주세요");
+      return;
+    }
+
+    // (수락 전용) 회차(round) 부트스트랩 — 옛 updatePendingStatus 와 동일.
+    //   기존 active round 닫기 → max(round_number)+1 → questionnaire_id 조회 →
+    //   consultation_rounds INSERT(active) → [ROUND_START] 시스템 메시지 INSERT.
+    //   부분 실패는 console.error 만, 수락 자체는 성공으로 간주.
+    try {
+      // (a) 기존 active round 닫기
+      type RoundUpdate = { status: string; ended_at: string };
+      const closePrevResp = await (supabase
+        .from("consultation_rounds") as unknown as {
+          update: (p: RoundUpdate) => {
+            eq: (col: string, val: string) => {
+              eq: (col: string, val: string) => Promise<{ error: { message: string } | null }>;
+            };
+          };
+        })
+        .update({ status: "completed", ended_at: new Date().toISOString() })
+        .eq("consultation_id", id)
+        .eq("status", "active");
+      if (closePrevResp.error) {
+        console.error("[ACCEPT] close previous active rounds failed:", closePrevResp.error);
+      }
+
+      // (b) 다음 round_number 계산
+      const maxResp = await supabase
+        .from("consultation_rounds")
+        .select("round_number")
+        .eq("consultation_id", id)
+        .order("round_number", { ascending: false })
+        .limit(1)
+        .maybeSingle<{ round_number: number }>();
+      if (maxResp.error) {
+        console.error("[ACCEPT] max round_number lookup failed:", maxResp.error);
+      }
+      const nextRoundNumber =
+        typeof maxResp.data?.round_number === "number"
+          ? maxResp.data.round_number + 1
+          : 1;
+
+      // (c) consultations.questionnaire_id 조회
+      const consResp = await supabase
+        .from("consultations")
+        .select("questionnaire_id")
+        .eq("id", id)
+        .maybeSingle<{ questionnaire_id: string | null }>();
+      if (consResp.error) {
+        console.error("[ACCEPT] consultation questionnaire_id lookup failed:", consResp.error);
+      }
+      const qId = consResp.data?.questionnaire_id ?? null;
+
+      // (d) consultation_rounds INSERT
+      type RoundInsert = {
+        consultation_id: string;
+        round_number: number;
+        questionnaire_id: string | null;
+        status: string;
+      };
+      const roundPayload: RoundInsert = {
+        consultation_id: id,
+        round_number: nextRoundNumber,
+        questionnaire_id: qId,
+        status: "active",
+      };
+      const roundResp = await (supabase
+        .from("consultation_rounds") as unknown as {
+          insert: (p: RoundInsert) => {
+            select: (cols: string) => {
+              maybeSingle: () => Promise<{
+                data: { id: string } | null;
+                error: { message: string } | null;
+              }>;
+            };
+          };
+        })
+        .insert(roundPayload)
+        .select("id")
+        .maybeSingle();
+
+      if (roundResp.error || !roundResp.data?.id) {
+        console.error("[ACCEPT] round insert failed:", roundResp.error);
+      } else {
+        // (e) 회차 시작 시스템 메시지 INSERT
+        type SysMsgInsert = {
+          consultation_id: string;
+          round_id: string;
+          sender_id: string;
+          content: string;
+          message_type: string;
+          is_read: boolean;
+        };
+        const sysPayload: SysMsgInsert = {
+          consultation_id: id,
+          round_id: roundResp.data.id,
+          sender_id: authUser.id,
+          content: "[ROUND_START]",
+          message_type: "system",
+          is_read: true,
+        };
+        const sysResp = await (supabase
+          .from("messages") as unknown as {
+            insert: (p: SysMsgInsert) => Promise<{ error: { message: string } | null }>;
+          })
+          .insert(sysPayload);
+        if (sysResp.error) {
+          console.error("[ACCEPT] round-start system message INSERT failed:", sysResp.error);
+        }
+      }
+    } catch (roundErr) {
+      console.error("[ACCEPT] round bootstrap threw:", roundErr);
+    }
+
+    setActingId(null);
+    // 낙관적 패치(즉시 반영) + 서버 최신화(loadConsults)
     setConsults((prev) => prev.map((c) => c.id === id ? { ...c, patientStatus: "managing" } : c));
+    await loadConsults(authUser.id);
     showToast("✓ 수락됨");
   };
 
-  const handleReject = (id: string, reason: string) => {
+  const handleReject = async (id: string, reason: string) => {
+    if (actingId) return; // 중복 클릭 가드
+    if (!authUser) { showToast("로그인이 필요해요"); return; }
+    setActingId(id);
+
+    // consultations UPDATE — status=rejected, rejected_at. 거절은 차수/메시지 처리 없음(옛 코드와 동일).
+    type Patch = { status: string; rejected_at: string };
+    const patch: Patch = { status: "rejected", rejected_at: new Date().toISOString() };
+    const { error } = await (supabase
+      .from("consultations") as unknown as {
+        update: (p: Patch) => {
+          eq: (col: string, val: string) => Promise<{ error: Error | null }>;
+        };
+      })
+      .update(patch)
+      .eq("id", id);
+    if (error) {
+      console.error("[dashboard] consultation reject failed:", error);
+      setActingId(null);
+      showToast("거절 처리에 실패했어요. 다시 시도해주세요");
+      return;
+    }
+
+    setActingId(null);
     // 거절일 — mock 시각 상수 제거 후 실제 오늘 날짜로 "YYYY.MM.DD" 형식 채움.
     const today = (() => {
       const d = new Date();
       return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
     })();
+    // 낙관적 패치(즉시 반영) + 서버 최신화(loadConsults)
     setConsults((prev) => prev.map((c) => c.id === id ? { ...c, isRejected: true, rejectedReason: reason, rejectedAt: today, patientStatus: "inactive" } : c));
+    await loadConsults(authUser.id);
     showToast("거절 처리되었습니다");
   };
 
@@ -2348,6 +2054,19 @@ function DashboardContent() {
   // "방문 후 처리" 탭 카운트 — 구매리스트 미작성 또는 복용가이드 미발송 환자 수.
   const totalPostVisit = consults.filter((c) => c.needsPurchaseList || c.needsDosageGuide).length;
 
+  // 필터 칩 카운트 배지 — 각 칩을 눌렀을 때 나오는 목록 개수와 일치하도록 applyFilters 의 탭별 술어를
+  //   그대로 사용(dashboardFilters.ts if-체인 기준). "전체"(all)는 개수 의미가 약해 배지 미부착(키 없음).
+  //   주의: 통계 카드용 totalUrgent(needsUrgentReply‖needsAcceptUrgent)·totalVisitToday(hasVisitToday)는
+  //   med_ending_soon(isMedEndingSoon)·visit_scheduled(nextVisitDate) 탭 술어와 달라 칩 카운트로 재사용하지 않음.
+  const chipCount: Partial<Record<CardFilterKey, number>> = {
+    requested: totalRequested,
+    med_ending_soon: consults.filter((c) => c.isMedEndingSoon === true).length,
+    visit_scheduled: consults.filter((c) => !!c.nextVisitDate).length,
+    visit_check: totalNoShow,
+    post_visit: totalPostVisit,
+    unread: consults.filter((c) => c.unreadCount > 0).length,
+  };
+
   // 판정 실패(재시도까지 소진) — 영구 "확인 중" 멈춤 대신 안내 + 새로고침.
   if (failed) {
     return (
@@ -2405,695 +2124,6 @@ function DashboardContent() {
             : { transition: "margin 0.25s ease" }
         }
       >
-        {/* DB 실시간 상담 요청 섹션 */}
-        <section
-          style={{
-            background: "#fff",
-            borderRadius: 14,
-            border: "1px solid rgba(94,125,108,0.14)",
-            padding: 16,
-            marginBottom: 16,
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              marginBottom: 12,
-            }}
-          >
-            <div
-              style={{
-                fontSize: 16,
-                fontWeight: 700,
-                color: "#2C3630",
-                fontFamily: "'Gothic A1', sans-serif",
-              }}
-            >
-              🔔 새 상담 요청{" "}
-              {dbPendingCount !== null && (
-                <span style={{ color: "#B06D00" }}>{dbPendingCount}</span>
-              )}
-            </div>
-          </div>
-
-          {dbPendingLoading ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {[0, 1].map((i) => (
-                <div
-                  key={i}
-                  style={{
-                    height: 84,
-                    borderRadius: 10,
-                    background: "linear-gradient(90deg, #F4F6F3 0%, #ECEFEB 50%, #F4F6F3 100%)",
-                    backgroundSize: "200% 100%",
-                    animation: "dash-skel 1.4s ease-in-out infinite",
-                  }}
-                />
-              ))}
-              <style>{`@keyframes dash-skel { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }`}</style>
-            </div>
-          ) : !dbPendingList || dbPendingList.length === 0 ? (
-            <div
-              style={{
-                padding: "20px 12px",
-                textAlign: "center",
-                fontSize: 14,
-                color: "#3D4A42",
-                background: "#F8F9F7",
-                borderRadius: 10,
-              }}
-            >
-              새 상담 요청이 없어요
-            </div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {dbPendingList.map((r) => {
-                const age = r.patient_profile?.birth_year
-                  ? new Date().getFullYear() - r.patient_profile.birth_year
-                  : null;
-                // 안전 정규화 — 배열이 아닌 값(string/null/undefined)이 와도 .slice/.map/.join 보호
-                const rawSymptoms: unknown = r.questionnaire?.symptoms;
-                const symptoms: string[] = Array.isArray(rawSymptoms)
-                  ? (rawSymptoms.filter((x) => typeof x === "string" && x.trim()) as string[])
-                  : typeof rawSymptoms === "string" && rawSymptoms.trim()
-                    ? [rawSymptoms.trim()]
-                    : [];
-                const elapsedMs = Date.now() - new Date(r.created_at).getTime();
-                const elapsedHr = Math.max(0, Math.floor(elapsedMs / (1000 * 60 * 60)));
-                const elapsedMin = Math.max(0, Math.floor(elapsedMs / (1000 * 60)));
-                const elapsedLabel =
-                  elapsedHr >= 1 ? `${elapsedHr}시간 전` : `${elapsedMin}분 전`;
-                const isActing = actingId === r.id;
-                const isExpanded = expandedPendingId === r.id;
-                const q = r.questionnaire;
-                return (
-                  <div
-                    key={r.id}
-                    style={{
-                      padding: 14,
-                      borderRadius: 12,
-                      background: "#FFF8E1",
-                      border: "1px solid #F5DCA0",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        marginBottom: 8,
-                      }}
-                    >
-                      <div
-                        style={{
-                          width: 36,
-                          height: 36,
-                          borderRadius: "50%",
-                          background: "#fff",
-                          border: "1px solid #E8D5A0",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          fontSize: 16,
-                          flexShrink: 0,
-                        }}
-                        aria-hidden="true"
-                      >
-                        👤
-                      </div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div
-                          style={{
-                            fontSize: 15,
-                            fontWeight: 700,
-                            color: "#2C3630",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <span>{r.patient?.name?.trim() || "이름 없음"}</span>
-                          {age !== null && (
-                            <span
-                              style={{
-                                fontSize: 13,
-                                fontWeight: 500,
-                                color: "#3D4A42",
-                              }}
-                            >
-                              {age}세
-                              {r.patient_profile?.gender ? ` · ${r.patient_profile.gender}` : ""}
-                            </span>
-                          )}
-                        </div>
-                        <div style={{ fontSize: 13, color: "#7A5300", marginTop: 2 }}>
-                          {elapsedLabel}
-                        </div>
-                      </div>
-                    </div>
-                    {symptoms.length > 0 && (
-                      <div
-                        style={{
-                          display: "flex",
-                          flexWrap: "wrap",
-                          gap: 6,
-                          marginBottom: 10,
-                        }}
-                      >
-                        {symptoms.slice(0, 5).map((s) => (
-                          <span
-                            key={s}
-                            style={{
-                              fontSize: 12,
-                              fontWeight: 600,
-                              padding: "3px 8px",
-                              borderRadius: 6,
-                              background: "#fff",
-                              color: "#7A5300",
-                              border: "1px solid #F5DCA0",
-                            }}
-                          >
-                            {s}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    {q?.free_text && !isExpanded && (
-                      <div
-                        style={{
-                          fontSize: 13,
-                          color: "#3D4A42",
-                          lineHeight: 1.5,
-                          marginBottom: 10,
-                          display: "-webkit-box",
-                          WebkitLineClamp: 2,
-                          WebkitBoxOrient: "vertical",
-                          overflow: "hidden",
-                        }}
-                      >
-                        {q.free_text}
-                      </div>
-                    )}
-                    {/* 상세 보기 토글 (접힘 상태) */}
-                    {!isExpanded && (
-                      <button
-                        type="button"
-                        onClick={() => setExpandedPendingId(r.id)}
-                        style={{
-                          width: "100%",
-                          minHeight: 44,
-                          padding: "10px 0",
-                          borderRadius: 10,
-                          background: "#fff",
-                          color: "#7A5300",
-                          fontSize: 14,
-                          fontWeight: 600,
-                          border: "1px solid #F5DCA0",
-                          cursor: "pointer",
-                          fontFamily: "'Noto Sans KR', sans-serif",
-                        }}
-                      >
-                        상세 보기 ▾
-                      </button>
-                    )}
-                    {/* 펼침: 문답 전체 + 수락/거절 */}
-                    {isExpanded && (
-                      <div
-                        style={{
-                          marginTop: 4,
-                          padding: 14,
-                          background: "#fff",
-                          borderRadius: 10,
-                          border: "1px solid #F0E1B4",
-                        }}
-                      >
-                        <div
-                          style={{
-                            fontSize: 14,
-                            fontWeight: 700,
-                            color: "#2C3630",
-                            marginBottom: 10,
-                            fontFamily: "'Gothic A1', sans-serif",
-                          }}
-                        >
-                          문답 전체
-                        </div>
-                        <div
-                          style={{
-                            display: "grid",
-                            gridTemplateColumns: "100px 1fr",
-                            rowGap: 8,
-                            columnGap: 12,
-                            fontSize: 14,
-                            color: "#2C3630",
-                            lineHeight: 1.5,
-                          }}
-                        >
-                          {(() => {
-                            // detailed_answers 폴백 — 컬럼이 비어 있어도 원본 답변에서 추출
-                            const da = (q?.detailed_answers ?? {}) as Record<string, unknown>;
-
-                            // 비어 있음 판정: null/undefined/빈 문자열/빈 배열/빈 객체 모두 빈 것으로 처리
-                            const isEmpty = (v: unknown): boolean => {
-                              if (v === null || v === undefined) return true;
-                              if (typeof v === "string") return v.trim().length === 0;
-                              if (Array.isArray(v)) return v.length === 0;
-                              if (typeof v === "object") {
-                                try {
-                                  return Object.keys(v as Record<string, unknown>).length === 0;
-                                } catch {
-                                  return true;
-                                }
-                              }
-                              return false;
-                            };
-                            // 안전 정규화: 어떤 값이 와도 string 배열로 변환
-                            // - 배열이면 string 항목만 추림 (객체/빈 항목은 제외)
-                            // - 문자열이면 단일 항목 배열
-                            // - 그 외(null/undefined/숫자/객체)는 빈 배열
-                            const toStrArr = (v: unknown): string[] => {
-                              if (Array.isArray(v)) {
-                                return v
-                                  .map((x) => {
-                                    if (typeof x === "string") return x.trim();
-                                    if (typeof x === "number" && Number.isFinite(x)) return String(x);
-                                    return "";
-                                  })
-                                  .filter((s): s is string => s.length > 0);
-                              }
-                              if (typeof v === "string" && v.trim()) return [v.trim()];
-                              return [];
-                            };
-                            // 안전 정규화: 어떤 값이 와도 string 또는 null
-                            // - 문자열이면 그대로 (빈 문자열은 null)
-                            // - 배열이면 join (빈 배열은 null)
-                            // - 숫자는 String()
-                            // - 객체/그 외는 null (JSON 출력 금지 — 사람이 읽을 수 있는 값만)
-                            const toStrOrNull = (v: unknown): string | null => {
-                              if (isEmpty(v)) return null;
-                              if (typeof v === "string") {
-                                const t = v.trim();
-                                return t ? t : null;
-                              }
-                              if (Array.isArray(v)) {
-                                const arr = toStrArr(v);
-                                return arr.length > 0 ? arr.join(", ") : null;
-                              }
-                              if (typeof v === "number" && Number.isFinite(v)) return String(v);
-                              return null;
-                            };
-
-                            const daStr = (k: string): string | null => toStrOrNull(da[k]);
-                            const daArr = (k: string): string[] => toStrArr(da[k]);
-
-                            // 배열/문자열 어느 쪽이든 안전하게 join — string 또는 string[]
-                            // 어느 것이 와도 "—" 폴백까지 일관 처리
-                            const fmtList = (value: unknown, fallbackKey?: string): string => {
-                              const arr = toStrArr(value);
-                              if (arr.length > 0) return arr.join(", ");
-                              // 단일 문자열로 들어왔지만 trim 후 비어 있을 수도 있음
-                              const single = toStrOrNull(value);
-                              if (single) return single;
-                              if (fallbackKey) {
-                                const fbArr = daArr(fallbackKey);
-                                if (fbArr.length > 0) return fbArr.join(", ");
-                                const fbStr = daStr(fallbackKey);
-                                if (fbStr) return fbStr;
-                              }
-                              return "—";
-                            };
-                            const fmtTxt = (value: unknown, fallbackKey?: string): string => {
-                              const s = toStrOrNull(value);
-                              if (s) return s;
-                              if (fallbackKey) {
-                                const fb = daStr(fallbackKey);
-                                if (fb) return fb;
-                              }
-                              return "—";
-                            };
-                            const fmtNum = (
-                              value: unknown,
-                              suffix: string,
-                              fallbackKey?: string,
-                            ): string => {
-                              if (typeof value === "number" && Number.isFinite(value)) {
-                                return `${value}${suffix}`;
-                              }
-                              if (fallbackKey) {
-                                const fb = daStr(fallbackKey);
-                                if (fb) return fb; // 라벨 형태는 그대로 표시
-                              }
-                              return "—";
-                            };
-
-                            const rows: { label: string; value: string }[] = [
-                              { label: "증상", value: fmtList(q?.symptoms, "symptoms") },
-                              { label: "기간", value: fmtTxt(q?.symptom_duration, "duration") },
-                              { label: "심각도", value: fmtTxt(q?.severity, "severity") },
-                              { label: "직업", value: fmtTxt(q?.occupation, "occupation") },
-                              { label: "수면", value: fmtNum(q?.sleep_hours, "시간", "sleep_hours") },
-                              { label: "물 섭취", value: fmtNum(q?.water_intake, "잔", "water_amount") },
-                              { label: "식사 패턴", value: fmtList(q?.meal_pattern, "meal_pattern") },
-                              { label: "간식", value: fmtTxt(q?.snack_frequency, "meal_amount") },
-                              { label: "운동 빈도", value: fmtTxt(q?.exercise_frequency, "exercise") },
-                              { label: "운동 종류", value: fmtList(q?.exercise_types, "exercise_type") },
-                              { label: "음주", value: fmtTxt(q?.alcohol, "alcohol") },
-                              { label: "카페인", value: fmtTxt(q?.caffeine, "caffeine") },
-                              { label: "흡연", value: fmtTxt(q?.smoking, "smoking") },
-                              { label: "복용 영양제", value: fmtList(q?.current_supplements, "supplements") },
-                              { label: "복용 약", value: fmtList(q?.current_medications, "current_medications") },
-                              { label: "알레르기", value: fmtList(q?.allergies, "allergies") },
-                              {
-                                label: "예산(월)",
-                                value:
-                                  typeof q?.monthly_budget === "number" &&
-                                  Number.isFinite(q.monthly_budget)
-                                    ? `${q.monthly_budget.toLocaleString()}원`
-                                    : (daStr("budget") ?? "—"),
-                              },
-                            ];
-                            return rows.map((row) => (
-                              <React.Fragment key={row.label}>
-                                <div
-                                  style={{
-                                    color: "#5E7D6C",
-                                    fontWeight: 600,
-                                    fontSize: 13,
-                                  }}
-                                >
-                                  {row.label}
-                                </div>
-                                <div
-                                  style={{
-                                    color: "#2C3630",
-                                    wordBreak: "break-word",
-                                    overflowWrap: "anywhere",
-                                    minWidth: 0,
-                                  }}
-                                >
-                                  {row.value}
-                                </div>
-                              </React.Fragment>
-                            ));
-                          })()}
-                        </div>
-                        {q?.free_text && q.free_text.trim() && (
-                          <div style={{ marginTop: 12 }}>
-                            <div
-                              style={{
-                                color: "#5E7D6C",
-                                fontWeight: 600,
-                                fontSize: 13,
-                                marginBottom: 4,
-                              }}
-                            >
-                              자유 서술
-                            </div>
-                            <div
-                              style={{
-                                fontSize: 14,
-                                color: "#2C3630",
-                                lineHeight: 1.6,
-                                whiteSpace: "pre-wrap",
-                                wordBreak: "break-word",
-                                overflowWrap: "anywhere",
-                                width: "100%",
-                                maxWidth: "100%",
-                                background: "#FBF7E9",
-                                padding: 10,
-                                borderRadius: 8,
-                                border: "1px solid #F0E1B4",
-                                boxSizing: "border-box",
-                              }}
-                            >
-                              {q.free_text}
-                            </div>
-                          </div>
-                        )}
-                        {/* 수락/거절 버튼 (상세 안에 배치) */}
-                        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-                          <button
-                            type="button"
-                            onClick={() => setExpandedPendingId(null)}
-                            disabled={isActing}
-                            style={{
-                              flex: "0 0 auto",
-                              minHeight: 44,
-                              padding: "10px 14px",
-                              borderRadius: 10,
-                              background: "#fff",
-                              color: "#5E7D6C",
-                              fontSize: 14,
-                              fontWeight: 600,
-                              border: "1px solid #D5DCD7",
-                              cursor: isActing ? "default" : "pointer",
-                              opacity: isActing ? 0.6 : 1,
-                            }}
-                          >
-                            접기
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updatePendingStatus(r.id, "rejected")}
-                            disabled={isActing}
-                            style={{
-                              flex: 1,
-                              minHeight: 44,
-                              padding: "10px 0",
-                              borderRadius: 10,
-                              background: "#fff",
-                              color: "#993C1D",
-                              fontSize: 14,
-                              fontWeight: 600,
-                              border: "1px solid #E8C9BD",
-                              cursor: isActing ? "default" : "pointer",
-                              opacity: isActing ? 0.6 : 1,
-                            }}
-                          >
-                            거절
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updatePendingStatus(r.id, "accepted")}
-                            disabled={isActing}
-                            style={{
-                              flex: 1,
-                              minHeight: 44,
-                              padding: "10px 0",
-                              borderRadius: 10,
-                              background: "#4A6355",
-                              color: "#fff",
-                              fontSize: 14,
-                              fontWeight: 700,
-                              border: "none",
-                              cursor: isActing ? "default" : "pointer",
-                              opacity: isActing ? 0.7 : 1,
-                            }}
-                          >
-                            {isActing ? "처리 중..." : "수락"}
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-
-        {/* 진행 중 상담 (DB) */}
-        <section
-          style={{
-            background: "#fff",
-            borderRadius: 14,
-            border: "1px solid rgba(94,125,108,0.14)",
-            padding: 16,
-            marginBottom: 16,
-          }}
-        >
-          <div
-            style={{
-              fontSize: 16,
-              fontWeight: 700,
-              color: "#2C3630",
-              fontFamily: "'Gothic A1', sans-serif",
-              marginBottom: 12,
-            }}
-          >
-            💬 진행 중 상담{" "}
-            {dbActiveList !== null && (
-              <span style={{ color: "#4A6355" }}>{dbActiveList.length}</span>
-            )}
-          </div>
-
-          {dbActiveLoading ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {[0, 1].map((i) => (
-                <div
-                  key={i}
-                  style={{
-                    height: 72,
-                    borderRadius: 10,
-                    background:
-                      "linear-gradient(90deg, #F4F6F3 0%, #ECEFEB 50%, #F4F6F3 100%)",
-                    backgroundSize: "200% 100%",
-                    animation: "dash-skel 1.4s ease-in-out infinite",
-                  }}
-                />
-              ))}
-            </div>
-          ) : !dbActiveList || dbActiveList.length === 0 ? (
-            <div
-              style={{
-                padding: "20px 12px",
-                textAlign: "center",
-                fontSize: 14,
-                color: "#3D4A42",
-                background: "#F8F9F7",
-                borderRadius: 10,
-              }}
-            >
-              진행 중인 상담이 없어요
-            </div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {dbActiveList.map((r) => {
-                const age = r.patient_profile?.birth_year
-                  ? new Date().getFullYear() - r.patient_profile.birth_year
-                  : null;
-                // 안전 정규화 — 배열이 아닌 값(string/null/undefined)이 와도 .slice/.map/.join 보호
-                const rawSymptoms: unknown = r.questionnaire?.symptoms;
-                const symptoms: string[] = Array.isArray(rawSymptoms)
-                  ? (rawSymptoms.filter((x) => typeof x === "string" && x.trim()) as string[])
-                  : typeof rawSymptoms === "string" && rawSymptoms.trim()
-                    ? [rawSymptoms.trim()]
-                    : [];
-                const lastIso = r.last_message_at ?? r.created_at;
-                const elapsedMs = Date.now() - new Date(lastIso).getTime();
-                const elapsedHr = Math.max(0, Math.floor(elapsedMs / (1000 * 60 * 60)));
-                const elapsedMin = Math.max(0, Math.floor(elapsedMs / (1000 * 60)));
-                const elapsedLabel =
-                  elapsedHr >= 24
-                    ? `${Math.floor(elapsedHr / 24)}일 전`
-                    : elapsedHr >= 1
-                      ? `${elapsedHr}시간 전`
-                      : `${elapsedMin}분 전`;
-                const statusLabel =
-                  r.status === "chatting"
-                    ? "상담 중"
-                    : r.status === "visit_scheduled"
-                      ? "방문 예정"
-                      : "수락됨";
-                return (
-                  <button
-                    key={r.id}
-                    type="button"
-                    onClick={() => router.push(`/chat/${r.id}?role=pharmacist`)}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 12,
-                      padding: 14,
-                      borderRadius: 12,
-                      background: "#EDF4F0",
-                      border: "1px solid rgba(74,99,85,0.18)",
-                      cursor: "pointer",
-                      textAlign: "left",
-                      width: "100%",
-                      fontFamily: "'Noto Sans KR', sans-serif",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: 36,
-                        height: 36,
-                        borderRadius: "50%",
-                        background: "#fff",
-                        border: "1px solid #B3CCBE",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        fontSize: 16,
-                        flexShrink: 0,
-                      }}
-                      aria-hidden="true"
-                    >
-                      👤
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div
-                        style={{
-                          fontSize: 15,
-                          fontWeight: 700,
-                          color: "#2C3630",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 6,
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <span>{r.patient?.name?.trim() || "이름 없음"}</span>
-                        {age !== null && (
-                          <span
-                            style={{
-                              fontSize: 13,
-                              fontWeight: 500,
-                              color: "#3D4A42",
-                            }}
-                          >
-                            {age}세
-                            {r.patient_profile?.gender ? ` · ${r.patient_profile.gender}` : ""}
-                          </span>
-                        )}
-                        <span
-                          style={{
-                            fontSize: 12,
-                            fontWeight: 600,
-                            padding: "2px 8px",
-                            borderRadius: 6,
-                            background: "#fff",
-                            color: "#4A6355",
-                            border: "1px solid #B3CCBE",
-                          }}
-                        >
-                          {statusLabel}
-                        </span>
-                      </div>
-                      {symptoms.length > 0 && (
-                        <div
-                          style={{
-                            fontSize: 13,
-                            color: "#3D4A42",
-                            marginTop: 4,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {symptoms.slice(0, 3).join(" · ")}
-                        </div>
-                      )}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: "#5E7D6C",
-                        flexShrink: 0,
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {elapsedLabel}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </section>
 
         {/* 환자 직접 등록 버튼 */}
         <button
@@ -3244,21 +2274,13 @@ function DashboardContent() {
                 onClick={() => setFilter(key)}
               >
                 {label}
-                {key === "visit_check" && totalNoShow > 0 && (
+                {(chipCount[key] ?? 0) > 0 && (
                   <span style={{
                     marginLeft: 6, display: "inline-flex", alignItems: "center", justifyContent: "center",
                     minWidth: 18, height: 18, padding: "0 6px", borderRadius: 9,
                     background: "#FFF0E6", color: "#E05A1A",
                     fontSize: 11, fontWeight: 700, lineHeight: 1,
-                  }}>{totalNoShow}</span>
-                )}
-                {key === "post_visit" && totalPostVisit > 0 && (
-                  <span style={{
-                    marginLeft: 6, display: "inline-flex", alignItems: "center", justifyContent: "center",
-                    minWidth: 18, height: 18, padding: "0 6px", borderRadius: 9,
-                    background: "#FFF0E6", color: "#E05A1A",
-                    fontSize: 11, fontWeight: 700, lineHeight: 1,
-                  }}>{totalPostVisit}</span>
+                  }}>{chipCount[key]}</span>
                 )}
               </button>
             ))}

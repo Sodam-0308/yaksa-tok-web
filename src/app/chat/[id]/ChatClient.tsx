@@ -3395,6 +3395,30 @@ function ChatContent() {
                   )}
                   {formatSystemMessageContent(msg.content, role, dbCounterpartLicenseName || dbCounterpartName, msg.metadata)}
                 </div>
+                {/* 환자 전용 CTA — 복용 가이드 전송 알림에서 마이페이지로 바로 이동. 약사 뷰엔 미노출. */}
+                {msg.content === "[DOSAGE_GUIDE_SENT]" && role === "patient" && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const gid = msg.metadata?.dosage_guide_id;
+                      router.push(typeof gid === "string" && gid ? `/mypage?guide=${gid}` : "/mypage");
+                    }}
+                    style={{
+                      marginTop: 6,
+                      padding: "12px 22px",
+                      minHeight: 48,
+                      borderRadius: 100,
+                      background: "#4A6355",
+                      color: "#fff",
+                      fontSize: 14,
+                      fontWeight: 700,
+                      border: "none",
+                      cursor: "pointer",
+                    }}
+                  >
+                    복용 가이드 보기
+                  </button>
+                )}
                 {role === "pharmacist" && msg.pharmacistOnly && (
                   <span style={{ fontSize: 11, color: "#9AA8A0" }}>내부 메모 (환자에게 안 보임)</span>
                 )}
