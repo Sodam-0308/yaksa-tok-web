@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, Suspense } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
+import { fetchTotalConsultations, fetchAvgResponseMinutes } from "@/lib/pharmacistStats";
 import { geocodeAddress } from "@/lib/geocode";
 import AddressSearchButton from "@/components/AddressSearchButton";
 
@@ -27,33 +28,6 @@ const ALL_SPECIALTIES = [
 
 const INITIAL_EXPERT = new Set(["만성피로", "불면", "소화장애"]);
 
-const DAYS = ["월", "화", "수", "목", "금", "토", "일"] as const;
-
-interface TimeRange { start: string; end: string }
-
-const INITIAL_SCHEDULE: Record<string, { on: boolean; ranges: TimeRange[] }> = {
-  월: { on: true, ranges: [{ start: "10:00", end: "12:00" }, { start: "14:00", end: "18:00" }] },
-  화: { on: true, ranges: [{ start: "10:00", end: "12:00" }, { start: "14:00", end: "18:00" }] },
-  수: { on: true, ranges: [{ start: "10:00", end: "18:00" }] },
-  목: { on: true, ranges: [{ start: "10:00", end: "12:00" }, { start: "14:00", end: "18:00" }] },
-  금: { on: true, ranges: [{ start: "10:00", end: "17:00" }] },
-  토: { on: false, ranges: [] },
-  일: { on: false, ranges: [] },
-};
-
-interface BlockedDate { id: number; start: string; end: string; reason: string }
-
-const INITIAL_BLOCKED: BlockedDate[] = [
-  { id: 1, start: "2026-05-01", end: "2026-05-05", reason: "연차 휴가" },
-];
-
-interface Template { id: number; title: string; content: string }
-
-const INITIAL_TEMPLATES: Template[] = [
-  { id: 1, title: "첫 인사", content: "안녕하세요, 그린약국 김서연 약사입니다. 문답 내용 잘 확인했어요. 궁금한 점 편하게 물어봐 주세요!" },
-  { id: 2, title: "방문 안내", content: "약국 방문하시면 더 정확한 상담이 가능해요. 영업시간은 평일 10시~7시입니다." },
-];
-
 /* avg_response_minutes → 사람이 읽는 형식 (60→"약 1시간", 90→"약 1시간 30분") */
 function formatAvgResponse(min: number): string {
   if (min < 60) return `약 ${min}분`;
@@ -62,19 +36,6 @@ function formatAvgResponse(min: number): string {
   return m === 0 ? `약 ${h}시간` : `약 ${h}시간 ${m}분`;
 }
 
-/* ── 개별 문답 세트 ── */
-interface QuestionSetSummary {
-  id: string;
-  name: string;
-  questionCount: number;
-  isDefault: boolean;
-}
-
-const INITIAL_QUESTION_SETS: QuestionSetSummary[] = [
-  { id: "set-1", name: "소화 문제용", questionCount: 5, isDefault: true },
-  { id: "set-2", name: "수면 문제용", questionCount: 3, isDefault: false },
-  { id: "set-3", name: "피로·무기력용", questionCount: 4, isDefault: false },
-];
 
 /* ══════════════════════════════════════════
    컬러
@@ -123,7 +84,9 @@ function Content() {
   // 약사 경력 신고 — input 은 문자열로 보관(빈칸 = 미입력 = NULL)
   const [pCareerYears, setPCareerYears] = useState("");
   const [pOfflineCount, setPOfflineCount] = useState("");
-  const [saved, setSaved] = useState({ name: "", pharmacy: "", address: "", careerYears: "", offlineCount: "" });
+  // 약사 소개 (환자에게 보이는 bio)
+  const [pBio, setPBio] = useState("");
+  const [saved, setSaved] = useState({ name: "", pharmacy: "", address: "", careerYears: "", offlineCount: "", bio: "" });
 
   /* ── DB 상태 ──
    * profileLoaded 를 boolean state 로 두면, useAuth.user 가 null→object 로 바뀌는
@@ -134,9 +97,11 @@ function Content() {
   const [hasPharmacistProfile, setHasPharmacistProfile] = useState(false);
   // 개선 확인 카운트 (improvement_confirmations 행 개수, pharmacist_id=본인)
   const [improvementCount, setImprovementCount] = useState<number | null>(null);
-  // 내 실적 — pharmacist_profiles 실컬럼
+  // 내 실적 — 실집계 (consultations / messages 기반)
   const [totalConsultations, setTotalConsultations] = useState<number | null>(null);
   const [avgResponseMinutes, setAvgResponseMinutes] = useState<number | null>(null);
+  // 내가 쓴 글 — case_studies + pharmacist_stories (본인, is_published) 합 (null=로딩)
+  const [myPostsCount, setMyPostsCount] = useState<number | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
   // license_name 이 DB 에 존재하면 "이름" 인풋을 잠금 (면허 인증 무결성 보호)
   const [licenseNameLocked, setLicenseNameLocked] = useState(false);
@@ -156,6 +121,7 @@ function Content() {
     pharmacy_photos: string[];
     career_years: number | null;
     offline_consult_count: number | null;
+    bio: string | null;
   }>) => {
     if (!user) return;
     type PpUpsert = {
@@ -169,6 +135,7 @@ function Content() {
       pharmacy_photos?: string[];
       career_years?: number | null;
       offline_consult_count?: number | null;
+      bio?: string | null;
       // license_name 은 의도적으로 제외 — 면허 인증 무결성 보호
     };
     const payload: PpUpsert = { id: user.id, ...fields };
@@ -218,7 +185,7 @@ function Content() {
 
   const cancelEdit = () => {
     setPName(saved.name); setPPharmacy(saved.pharmacy); setPAddress(saved.address); setPAddressDetail("");
-    setPCareerYears(saved.careerYears); setPOfflineCount(saved.offlineCount);
+    setPCareerYears(saved.careerYears); setPOfflineCount(saved.offlineCount); setPBio(saved.bio);
     setEditMode(false);
   };
   const saveEdit = async () => {
@@ -231,6 +198,9 @@ function Content() {
     const combinedAddress = [road, detail].filter(Boolean).join(" ");
     const careerYearsVal = parseNonNegInt(pCareerYears);
     const offlineCountVal = parseNonNegInt(pOfflineCount);
+    // 소개 — 공백만이면 null 로 저장(공개 프로필은 빈값이면 소개 섹션 숨김)
+    const bioTrimmed = pBio.trim();
+    const bioVal = bioTrimmed === "" ? null : bioTrimmed;
     // license_name 이 잠겨 있으면 profiles.name 도 건드리지 않음 (이름 변경 시도 차단)
     const tasks: Promise<void>[] = [
       persistPharmacistFields({
@@ -238,6 +208,7 @@ function Content() {
         address: combinedAddress,
         career_years: careerYearsVal,
         offline_consult_count: offlineCountVal,
+        bio: bioVal,
       }),
     ];
     if (!licenseNameLocked) {
@@ -247,12 +218,13 @@ function Content() {
     // 정규화된 값(null→"" / 정수→문자열)으로 입력란·스냅샷 동기화
     const careerStr = careerYearsVal != null ? String(careerYearsVal) : "";
     const offlineStr = offlineCountVal != null ? String(offlineCountVal) : "";
-    setSaved({ name: pName, pharmacy: pPharmacy, address: combinedAddress, careerYears: careerStr, offlineCount: offlineStr });
+    setSaved({ name: pName, pharmacy: pPharmacy, address: combinedAddress, careerYears: careerStr, offlineCount: offlineStr, bio: bioTrimmed });
     // 저장 후 도로명 칸을 합쳐진 전체 주소로 갱신, 상세 칸은 비움 (다음 편집 시 깨끗한 상태).
     setPAddress(combinedAddress);
     setPAddressDetail("");
     setPCareerYears(careerStr);
     setPOfflineCount(offlineStr);
+    setPBio(bioTrimmed);
     setEditMode(false);
     setSavingProfile(false);
   };
@@ -413,6 +385,25 @@ function Content() {
       setImprovementCount(count ?? 0);
     })();
 
+    // 내 실적 — 실집계 (consultations count / messages.response_minutes 평균)
+    (async () => {
+      const [total, avg] = await Promise.all([
+        fetchTotalConsultations(user.id),
+        fetchAvgResponseMinutes(user.id),
+      ]);
+      setTotalConsultations(total);
+      setAvgResponseMinutes(avg);
+    })();
+
+    // 내가 쓴 글 — case_studies + pharmacist_stories (본인, is_published) 수 합
+    (async () => {
+      const [cs, ps] = await Promise.all([
+        supabase.from("case_studies").select("*", { count: "exact", head: true }).eq("pharmacist_id", user.id).eq("is_published", true),
+        supabase.from("pharmacist_stories").select("*", { count: "exact", head: true }).eq("pharmacist_id", user.id).eq("is_published", true),
+      ]);
+      setMyPostsCount((cs.error ? 0 : (cs.count ?? 0)) + (ps.error ? 0 : (ps.count ?? 0)));
+    })();
+
     (async () => {
       const [profileRes, ppRes] = await Promise.all([
         supabase
@@ -422,7 +413,7 @@ function Content() {
           .maybeSingle<{ name: string }>(),
         supabase
           .from("pharmacist_profiles")
-          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name, pharmacy_photos, career_years, offline_consult_count, total_consultations, avg_response_minutes")
+          .select("pharmacy_name, address, expert_specialties, available_specialties, license_name, pharmacy_photos, career_years, offline_consult_count, bio")
           .eq("id", user.id)
           .maybeSingle<{
             pharmacy_name: string | null;
@@ -433,8 +424,7 @@ function Content() {
             pharmacy_photos: string[] | null;
             career_years: number | null;
             offline_consult_count: number | null;
-            total_consultations: number | null;
-            avg_response_minutes: number | null;
+            bio: string | null;
           }>(),
       ]);
 
@@ -458,17 +448,17 @@ function Content() {
         // 경력 신고 — NULL 이면 빈칸
         const careerStr = pp.career_years != null ? String(pp.career_years) : "";
         const offlineStr = pp.offline_consult_count != null ? String(pp.offline_consult_count) : "";
+        const bioStr = pp.bio ?? "";
         setPCareerYears(careerStr);
         setPOfflineCount(offlineStr);
-        // 내 실적 통계
-        setTotalConsultations(pp.total_consultations ?? 0);
-        setAvgResponseMinutes(pp.avg_response_minutes ?? null);
+        setPBio(bioStr);
         setSaved({
           name: displayName,
           pharmacy: pp.pharmacy_name ?? "",
           address: pp.address ?? "",
           careerYears: careerStr,
           offlineCount: offlineStr,
+          bio: bioStr,
         });
       } else {
         setSaved({
@@ -477,6 +467,7 @@ function Content() {
           address: "",
           careerYears: "",
           offlineCount: "",
+          bio: "",
         });
       }
       setLoadedForUid(user.id);
@@ -484,38 +475,25 @@ function Content() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-  /* ── 스케줄 ── */
-  const [schedule, setSchedule] = useState(INITIAL_SCHEDULE);
-  const [blocked, setBlocked] = useState<BlockedDate[]>(INITIAL_BLOCKED);
-  const [maxConcurrent, setMaxConcurrent] = useState(5);
-  const [bStart, setBStart] = useState("");
-  const [bEnd, setBEnd] = useState("");
-  const [bReason, setBReason] = useState("");
+  /* ── 템플릿·문답 세트 개수 (실데이터 count, null=로딩) ── */
+  const [templateCount, setTemplateCount] = useState<number | null>(null);
+  const [questionSetCount, setQuestionSetCount] = useState<number | null>(null);
 
-  const toggleDay = (d: string) => {
-    setSchedule({ ...schedule, [d]: { ...schedule[d], on: !schedule[d].on, ranges: schedule[d].on ? [] : [{ start: "10:00", end: "18:00" }] } });
-  };
-  const updateRange = (d: string, i: number, field: "start" | "end", val: string) => {
-    const ranges = [...schedule[d].ranges];
-    ranges[i] = { ...ranges[i], [field]: val };
-    setSchedule({ ...schedule, [d]: { ...schedule[d], ranges } });
-  };
-  const addRange = (d: string) => {
-    setSchedule({ ...schedule, [d]: { ...schedule[d], ranges: [...schedule[d].ranges, { start: "14:00", end: "18:00" }] } });
-  };
-  const removeRange = (d: string, i: number) => {
-    const ranges = schedule[d].ranges.filter((_, idx) => idx !== i);
-    setSchedule({ ...schedule, [d]: { ...schedule[d], ranges, on: ranges.length > 0 } });
-  };
-  const addBlocked = () => {
-    if (!bStart || !bEnd) return;
-    setBlocked([...blocked, { id: Date.now(), start: bStart, end: bEnd, reason: bReason.trim() }]);
-    setBStart(""); setBEnd(""); setBReason("");
-  };
-  const removeBlocked = (id: number) => setBlocked(blocked.filter((b) => b.id !== id));
-
-  /* ── 템플릿 (개수만 표시, 관리 페이지로 이동) ── */
-  const [templates] = useState<Template[]>(INITIAL_TEMPLATES);
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    (async () => {
+      const [tRes, qRes] = await Promise.all([
+        supabase.from("reply_templates").select("*", { count: "exact", head: true }).eq("pharmacist_id", user.id),
+        supabase.from("pharmacist_question_sets").select("*", { count: "exact", head: true }).eq("pharmacist_id", user.id),
+      ]);
+      if (cancelled) return;
+      setTemplateCount(tRes.error ? 0 : (tRes.count ?? 0));
+      setQuestionSetCount(qRes.error ? 0 : (qRes.count ?? 0));
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   /* ── 설정 ── */
   const [remoteOn, setRemoteOn] = useState(false);
@@ -523,30 +501,6 @@ function Content() {
   const [showLogout, setShowLogout] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
 
-  /* ── 개별 문답 세트 ── */
-  const [questionSets, setQuestionSets] = useState<QuestionSetSummary[]>(INITIAL_QUESTION_SETS);
-  const [deleteSetId, setDeleteSetId] = useState<string | null>(null);
-
-  const duplicateSet = (id: string) => {
-    const src = questionSets.find((s) => s.id === id);
-    if (!src) return;
-    const newSet: QuestionSetSummary = {
-      id: `set-${Date.now()}`,
-      name: `복사본 - ${src.name}`,
-      questionCount: src.questionCount,
-      isDefault: false,
-    };
-    setQuestionSets((prev) => [...prev, newSet]);
-  };
-
-  const confirmDeleteSet = () => {
-    if (!deleteSetId) return;
-    setQuestionSets((prev) => prev.filter((s) => s.id !== deleteSetId));
-    setDeleteSetId(null);
-  };
-
-  /* ── 날짜 포맷 ── */
-  const fmtDate = (d: string) => d.replace(/-/g, ".");
 
   return (
     <>
@@ -593,7 +547,7 @@ function Content() {
           {/* ── 2. 프로필 ── */}
           <div style={card}>
             <style>{`@keyframes pm-skel { 0%{background-position:200% 0} 100%{background-position:-200% 0} }`}</style>
-            <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 16 }}>
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", marginBottom: 16 }}>
               <div style={{ width: 80, height: 80, borderRadius: "50%", background: C.sagePale, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, fontWeight: 700, color: C.sageDeep, flexShrink: 0 }}>
                 {/* 로드 전에는 빈 원, 로드 후 첫 글자. saved.name 이 빈 문자열이면 자연스럽게 빈 원 유지 */}
                 {profileLoaded && saved.name ? saved.name.charAt(0) : ""}
@@ -635,6 +589,22 @@ function Content() {
                   <div style={{ fontSize: 15, fontWeight: 600, color: C.sageDeep }}>프로필 수정 중</div>
                 )}
               </div>
+              {!editMode && profileLoaded && user && hasPharmacistProfile && (
+                <button
+                  type="button"
+                  onClick={() => router.push(`/pharmacist/${user.id}`)}
+                  style={{
+                    flexShrink: 0, whiteSpace: "nowrap",
+                    padding: "7px 12px", borderRadius: 8,
+                    fontSize: 13, fontWeight: 600,
+                    background: C.sagePale, color: C.sageDeep,
+                    border: `1px solid ${C.sageLight}`, cursor: "pointer",
+                    fontFamily: "'Noto Sans KR', sans-serif",
+                  }}
+                >
+                  공개 프로필 미리보기
+                </button>
+              )}
             </div>
             {editMode ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -704,6 +674,24 @@ function Content() {
                   </div>
                 </div>
 
+                {/* ── 약사 소개 (공개 프로필 bio) ── */}
+                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+                    <label style={{ fontSize: 13, fontWeight: 600, color: C.textMid }}>약사 소개</label>
+                    <span style={{ fontSize: 12, color: C.sageMid }}>{pBio.length}/300</span>
+                  </div>
+                  <textarea
+                    value={pBio}
+                    onChange={(e) => { if (e.target.value.length <= 300) setPBio(e.target.value); }}
+                    placeholder="환자에게 보여줄 소개를 작성하세요. 예: 20년 상담 경력으로 환자 이야기를 경청하고 체질 맞춤 약을 조제합니다."
+                    rows={4}
+                    style={{ ...inp, minHeight: 96, resize: "vertical", lineHeight: 1.6, fontFamily: "'Noto Sans KR', sans-serif" }}
+                  />
+                  <div style={{ fontSize: 13, color: C.sageMid, marginTop: 6, lineHeight: 1.5 }}>
+                    공개 프로필 &apos;소개&apos; 영역에 환자에게 보여요. 비워두면 표시되지 않아요.
+                  </div>
+                </div>
+
                 <div style={{ fontSize: 14, color: C.textMid, padding: "10px 14px", background: C.sagePale, borderRadius: 8 }}>면허번호: {PROFILE.license}</div>
                 <div style={{ display: "flex", gap: 10 }}>
                   <button type="button" style={btnS} onClick={cancelEdit}>취소</button>
@@ -720,6 +708,19 @@ function Content() {
             ) : (
               <>
                 <div style={{ fontSize: 14, color: C.textMid, marginBottom: 12 }}><span style={{ color: C.sageMid }}>주소</span> {saved.address}</div>
+                {/* 약사 소개 (bio) — 비편집 모드 표시 */}
+                <div style={{ padding: "12px 14px", background: C.sageBg, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 12 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.sageDeep, marginBottom: 6 }}>💬 소개</div>
+                  {saved.bio ? (
+                    <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                      {saved.bio}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 13, color: C.sageMid, lineHeight: 1.6 }}>
+                      아직 소개가 없어요. &apos;프로필 수정&apos;에서 환자에게 보여줄 소개를 작성할 수 있어요.
+                    </div>
+                  )}
+                </div>
                 <button type="button" onClick={() => setEditMode(true)} style={{ ...btnS, padding: "10px 0" }}>프로필 수정</button>
               </>
             )}
@@ -847,7 +848,7 @@ function Content() {
           {/* ── 내 실적 (약국 사진 아래, 전문 분야 위) ── */}
           <div style={card}>
             <div style={secTitle}>내 실적</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <StatBox label="총 상담" value={`${totalConsultations ?? 0}건`} />
               <StatBox
                 label="평균 답변 시간"
@@ -858,21 +859,24 @@ function Content() {
                 value={improvementCount !== null ? `${improvementCount}건` : "—"}
                 accent
               />
-            </div>
-            <div style={{ textAlign: "right" }}>
+              {/* 내가 쓴 글 — 클릭 시 관리 페이지 이동 (StatBox 와 동일 스타일) */}
               <button
                 type="button"
                 onClick={() => router.push("/pharmacist/performance")}
                 style={{
-                  background: "none", border: "none",
-                  padding: "4px 0",
-                  fontSize: 14, fontWeight: 600,
-                  color: C.sageMid,
-                  cursor: "pointer",
+                  display: "block", textAlign: "left", width: "100%", cursor: "pointer",
+                  padding: "14px 16px", borderRadius: 12,
+                  background: C.sageBg, border: `1px solid ${C.border}`,
                   fontFamily: "'Noto Sans KR', sans-serif",
                 }}
               >
-                상세 보기 →
+                <div style={{ fontSize: 13, color: C.sageMid, marginBottom: 4 }}>내가 쓴 글</div>
+                <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 6 }}>
+                  <span style={{ fontSize: 18, fontWeight: 800, color: C.textDark }}>
+                    {myPostsCount === null ? "…" : `${myPostsCount}개`}
+                  </span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: C.sageMid }}>관리 →</span>
+                </div>
               </button>
             </div>
           </div>
@@ -910,123 +914,83 @@ function Content() {
                 </div>
               </div>
 
-              {/* ── 4. 맞춤 추가 문답 (세트 기반) ── */}
-              <div style={card}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6, gap: 8, flexWrap: "wrap" }}>
-                  <div style={secTitle}>맞춤 추가 문답</div>
-                  {questionSets.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => router.push("/pharmacist/questionnaire/new")}
-                      style={{
-                        padding: "8px 14px", borderRadius: 10,
-                        fontSize: 14, fontWeight: 700,
-                        background: C.sageDeep, color: C.white,
-                        border: "none", cursor: "pointer",
-                      }}
-                    >
-                      + 새 세트 만들기
-                    </button>
-                  )}
-                </div>
-                <div style={{ ...secDesc, marginBottom: 14 }}>
-                  자주 묻는 문답을 세트로 만들어 환자에게 보낼 수 있어요. ★ 기본 세트는 매칭 수락 후 자동 전송돼요.
-                </div>
+            </div>
 
-                {questionSets.length === 0 ? (
-                  <div style={{
-                    padding: "28px 20px", borderRadius: 12,
-                    background: C.sageBg, border: `1px dashed ${C.sageLight}`,
-                    textAlign: "center",
-                  }}>
-                    <div style={{ fontSize: 32, marginBottom: 8 }}>📝</div>
-                    <div style={{ fontSize: 15, fontWeight: 700, color: C.textDark, marginBottom: 4 }}>
-                      아직 만든 문답 세트가 없어요
-                    </div>
-                    <div style={{ fontSize: 14, color: C.textMid, lineHeight: 1.6, marginBottom: 14 }}>
-                      자주 묻는 문답을 세트로 만들어 환자에게 보낼 수 있어요
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => router.push("/pharmacist/questionnaire/new")}
-                      style={{
-                        padding: "10px 18px", borderRadius: 10,
-                        fontSize: 14, fontWeight: 700,
-                        background: C.sageDeep, color: C.white,
-                        border: "none", cursor: "pointer",
-                      }}
-                    >
-                      + 새 세트 만들기
-                    </button>
+            {/* ── 우측 ── */}
+            <div>
+              {/* ── 5. 상담 스케줄 (요약 + 관리 페이지로 이동) ── */}
+              <div style={card}>
+                <div style={secTitle}>상담 스케줄 설정</div>
+                <div style={{ ...secDesc, marginBottom: 12 }}>
+                  새 상담이 배정되는 시간을 설정합니다. 진행 중인 채팅은 언제든 답변할 수 있어요.
+                </div>
+                <div style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  gap: 10, flexWrap: "wrap",
+                  padding: "12px 14px",
+                  background: C.sageBg,
+                  border: `1px solid ${C.border}`,
+                  borderRadius: 12,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 18 }}>🕐</span>
+                    <span style={{ fontSize: 15, fontWeight: 700, color: C.textDark }}>
+                      상담 가능 시간·불가 날짜
+                    </span>
                   </div>
-                ) : (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    {questionSets.map((s) => (
-                      <div key={s.id} style={{
-                        background: C.white, border: `1px solid ${C.border}`,
-                        borderRadius: 16, padding: 16,
-                      }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
-                          <span style={{ fontSize: 16, fontWeight: 600, color: C.textDark }}>{s.name}</span>
-                          {s.isDefault && (
-                            <span style={{
-                              padding: "2px 8px", borderRadius: 8,
-                              fontSize: 13, fontWeight: 700,
-                              background: "#FFF8E1", color: "#F59E0B",
-                              display: "inline-flex", alignItems: "center", gap: 3,
-                            }}>
-                              ★ 기본 세트
-                            </span>
-                          )}
-                        </div>
-                        <div style={{ fontSize: 14, color: C.textMid, marginBottom: 12 }}>
-                          문답 {s.questionCount}개
-                        </div>
-                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                          <button
-                            type="button"
-                            onClick={() => router.push(`/pharmacist/questionnaire/${s.id}`)}
-                            style={{
-                              padding: "6px 14px", borderRadius: 8,
-                              fontSize: 14, fontWeight: 600,
-                              background: C.sagePale, color: C.sageMid,
-                              border: `1px solid ${C.sageLight}`, cursor: "pointer",
-                            }}
-                          >
-                            수정
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => duplicateSet(s.id)}
-                            style={{
-                              padding: "6px 14px", borderRadius: 8,
-                              fontSize: 14, fontWeight: 600,
-                              background: C.white, color: C.sageMid,
-                              border: `1px solid ${C.border}`, cursor: "pointer",
-                            }}
-                          >
-                            복제
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setDeleteSetId(s.id)}
-                            style={{
-                              padding: "6px 14px", borderRadius: 8,
-                              fontSize: 14, fontWeight: 600,
-                              background: C.white, color: C.error,
-                              border: `1px solid ${C.border}`, cursor: "pointer",
-                            }}
-                          >
-                            삭제
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                  <button
+                    type="button"
+                    onClick={() => router.push("/pharmacist/schedule")}
+                    style={{
+                      padding: "7px 14px", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600,
+                      background: C.sagePale, color: C.sageDeep,
+                      border: `1px solid ${C.sageLight}`, cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                  >
+                    스케줄 관리 →
+                  </button>
+                </div>
               </div>
 
-              {/* ── 답변 템플릿 (맞춤 추가 문답 아래, 좌측 열) ── */}
+              {/* ── 맞춤 추가 문답 (요약 + 관리 페이지로 이동) ── */}
+              <div style={card}>
+                <div style={secTitle}>맞춤 추가 문답</div>
+                <div style={{ ...secDesc, marginBottom: 12 }}>
+                  자주 묻는 문답을 세트로 만들어 환자에게 보낼 수 있어요. ★ 기본 세트는 매칭 수락 후 자동 전송돼요.
+                </div>
+                <div style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  gap: 10, flexWrap: "wrap",
+                  padding: "12px 14px",
+                  background: C.sageBg,
+                  border: `1px solid ${C.border}`,
+                  borderRadius: 12,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 18 }}>📋</span>
+                    <span style={{ fontSize: 15, fontWeight: 700, color: C.textDark }}>
+                      {questionSetCount === null ? "…" : questionSetCount}개 세트
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => router.push("/pharmacist/questionnaire")}
+                    style={{
+                      padding: "7px 14px", borderRadius: 8,
+                      fontSize: 14, fontWeight: 600,
+                      background: C.sagePale, color: C.sageDeep,
+                      border: `1px solid ${C.sageLight}`, cursor: "pointer",
+                      fontFamily: "'Noto Sans KR', sans-serif",
+                    }}
+                  >
+                    문답 세트 관리 →
+                  </button>
+                </div>
+              </div>
+
+              {/* ── 답변 템플릿 (요약 + 관리 페이지로 이동) ── */}
               <div style={card}>
                 <div style={secTitle}>답변 템플릿</div>
                 <div style={{ ...secDesc, marginBottom: 12 }}>
@@ -1043,7 +1007,7 @@ function Content() {
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={{ fontSize: 18 }}>💬</span>
                     <span style={{ fontSize: 15, fontWeight: 700, color: C.textDark }}>
-                      {templates.length}개 저장됨
+                      {templateCount === null ? "…" : templateCount}개 저장됨
                     </span>
                   </div>
                   <button
@@ -1059,81 +1023,6 @@ function Content() {
                   >
                     템플릿 관리 →
                   </button>
-                </div>
-              </div>
-            </div>
-
-            {/* ── 우측 ── */}
-            <div>
-              {/* ── 5. 상담 스케줄 ── */}
-              <div style={card}>
-                <div style={secTitle}>상담 스케줄 설정</div>
-                <div style={secDesc}>새 상담이 배정되는 시간을 설정합니다. 진행 중인 채팅은 언제든 답변할 수 있어요.</div>
-
-                {/* 요일별 */}
-                <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
-                  {DAYS.map((day) => {
-                    const s = schedule[day];
-                    return (
-                      <div key={day} style={{ padding: "12px 14px", borderRadius: 12, background: s.on ? C.sagePale : C.sageBg, border: `1px solid ${s.on ? C.sageLight : C.border}`, transition: "all 0.15s" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: s.on && s.ranges.length > 0 ? 10 : 0 }}>
-                          <span style={{ fontSize: 15, fontWeight: 700, color: s.on ? C.sageDeep : C.sageMid, width: 24 }}>{day}</span>
-                          <Toggle checked={s.on} onChange={() => toggleDay(day)} />
-                          {!s.on && <span style={{ fontSize: 14, color: C.sageMid }}>휴무</span>}
-                        </div>
-                        {s.on && s.ranges.map((r, ri) => (
-                          <div key={ri} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
-                            <input type="time" value={r.start} onChange={(e) => updateRange(day, ri, "start", e.target.value)} style={{ ...inp, padding: "6px 8px", fontSize: 14, flex: 1, minWidth: 0 }} />
-                            <span style={{ fontSize: 14, color: C.textMid }}>~</span>
-                            <input type="time" value={r.end} onChange={(e) => updateRange(day, ri, "end", e.target.value)} style={{ ...inp, padding: "6px 8px", fontSize: 14, flex: 1, minWidth: 0 }} />
-                            <button type="button" onClick={() => removeRange(day, ri)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: C.sageMid, padding: 4, flexShrink: 0 }}>&times;</button>
-                          </div>
-                        ))}
-                        {s.on && (
-                          <button type="button" onClick={() => addRange(day)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.sageMid, padding: "4px 0" }}>+ 시간대 추가</button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* 상담 불가 날짜 */}
-                <div style={{ marginBottom: 20 }}>
-                  <div style={{ fontSize: 15, fontWeight: 600, color: C.textDark, marginBottom: 4 }}>상담 불가 날짜</div>
-                  <div style={{ ...secDesc, marginBottom: 12 }}>휴가 등으로 상담을 받지 못하는 날짜를 설정해주세요.</div>
-
-                  {blocked.map((b) => (
-                    <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderRadius: 10, background: C.terraPale, border: `1px solid ${C.terraLight}`, marginBottom: 8 }}>
-                      <div>
-                        <div style={{ fontSize: 14, fontWeight: 600, color: C.textDark }}>{fmtDate(b.start)} ~ {fmtDate(b.end)}</div>
-                        {b.reason && <div style={{ fontSize: 13, color: C.textMid, marginTop: 2 }}>{b.reason}</div>}
-                      </div>
-                      <button type="button" onClick={() => removeBlocked(b.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: C.sageMid }}>&times;</button>
-                    </div>
-                  ))}
-
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "12px 14px", borderRadius: 10, background: C.sageBg, border: `1px solid ${C.border}` }}>
-                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      <input type="date" value={bStart} onChange={(e) => setBStart(e.target.value)} style={{ ...inp, padding: "8px 10px", fontSize: 14, flex: 1, minWidth: 0 }} />
-                      <span style={{ fontSize: 14, color: C.textMid }}>~</span>
-                      <input type="date" value={bEnd} onChange={(e) => setBEnd(e.target.value)} style={{ ...inp, padding: "8px 10px", fontSize: 14, flex: 1, minWidth: 0 }} />
-                    </div>
-                    <input placeholder="사유 (선택) 예: 연차 휴가" value={bReason} onChange={(e) => setBReason(e.target.value)} style={{ ...inp, padding: "8px 10px", fontSize: 14 }} />
-                    <div style={{ fontSize: 13, color: C.sageMid, marginTop: 2 }}>💡 입력한 사유는 환자에게 표시됩니다</div>
-                    <button type="button" onClick={addBlocked} style={{ ...btnS, padding: "8px 0", fontSize: 14, opacity: (!bStart || !bEnd) ? 0.5 : 1 }}>+ 불가 날짜 추가</button>
-                  </div>
-                </div>
-
-                {/* 최대 동시 상담 */}
-                <div style={{ padding: "14px 16px", borderRadius: 12, background: C.sageBg, border: `1px solid ${C.border}` }}>
-                  <div style={{ fontSize: 14, fontWeight: 600, color: C.textDark, marginBottom: 4 }}>최대 동시 상담 수</div>
-                  <div style={{ fontSize: 14, color: C.textMid, marginBottom: 10 }}>한 번에 진행할 수 있는 상담 수를 제한합니다</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                    <RoundBtn label="−" onClick={() => setMaxConcurrent(Math.max(1, maxConcurrent - 1))} />
-                    <span style={{ fontSize: 22, fontWeight: 800, color: C.sageDeep, minWidth: 32, textAlign: "center" }}>{maxConcurrent}</span>
-                    <RoundBtn label="+" onClick={() => setMaxConcurrent(Math.min(10, maxConcurrent + 1))} />
-                    <span style={{ fontSize: 14, color: C.textMid }}>건</span>
-                  </div>
                 </div>
               </div>
 
@@ -1160,7 +1049,6 @@ function Content() {
       </div>
 
       {/* ═══ 확인 모달 ═══ */}
-      {deleteSetId && <ConfirmModal title="이 세트를 삭제하시겠습니까?" desc="삭제된 세트는 복구할 수 없어요." onCancel={() => setDeleteSetId(null)} onConfirm={confirmDeleteSet} confirmLabel="삭제" danger />}
       {showLogout && <ConfirmModal title="로그아웃 하시겠습니까?" desc="다시 로그인하면 이용할 수 있어요." onCancel={() => setShowLogout(false)} onConfirm={() => { setShowLogout(false); router.push("/"); }} confirmLabel="로그아웃" />}
       {showWithdraw && <ConfirmModal title="정말 탈퇴하시겠습니까?" desc="탈퇴 시 모든 상담 기록과 데이터가 영구 삭제되며 복구할 수 없습니다." onCancel={() => setShowWithdraw(false)} onConfirm={() => { setShowWithdraw(false); router.push("/"); }} confirmLabel="탈퇴하기" danger />}
     </>
@@ -1170,18 +1058,6 @@ function Content() {
 /* ══════════════════════════════════════════
    서브 컴포넌트
    ══════════════════════════════════════════ */
-
-function Toggle({ checked, onChange, size }: { checked: boolean; onChange: () => void; size?: "small" }) {
-  const w = size === "small" ? 36 : 44;
-  const h = size === "small" ? 20 : 24;
-  const dot = size === "small" ? 16 : 20;
-  const off = 2;
-  return (
-    <button type="button" onClick={onChange} style={{ position: "relative", width: w, height: h, borderRadius: h / 2, background: checked ? C.sageDeep : "#D1D5D3", border: "none", cursor: "pointer", flexShrink: 0, transition: "background 0.2s" }}>
-      <div style={{ position: "absolute", top: off, left: checked ? w - dot - off : off, width: dot, height: dot, borderRadius: "50%", background: C.white, transition: "left 0.2s", boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }} />
-    </button>
-  );
-}
 
 function Field({
   label, value, onChange, placeholder, disabled, helpText,
@@ -1221,12 +1097,6 @@ function StatBox({ label, value, accent }: { label: string; value: string; accen
       <div style={{ fontSize: 13, color: C.sageMid, marginBottom: 4 }}>{label}</div>
       <div style={{ fontSize: 18, fontWeight: 800, color: accent ? C.sageDeep : C.textDark }}>{value}</div>
     </div>
-  );
-}
-
-function RoundBtn({ label, onClick }: { label: string; onClick: () => void }) {
-  return (
-    <button type="button" onClick={onClick} style={{ width: 36, height: 36, borderRadius: "50%", border: `1.5px solid ${C.sageLight}`, background: C.white, cursor: "pointer", fontSize: 18, fontWeight: 700, color: C.sageDeep, display: "flex", alignItems: "center", justifyContent: "center" }}>{label}</button>
   );
 }
 

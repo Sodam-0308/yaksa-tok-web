@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
+import { fetchTotalConsultations, fetchAvgResponseMinutes } from "@/lib/pharmacistStats";
 import type { WeeklySlots } from "@/types/database";
 
 /* 카테고리 키 → 한글 라벨 (피드와 동일) */
@@ -65,6 +66,9 @@ export default function PharmacistClient() {
   const [cases, setCases] = useState<CaseStudyItem[]>([]);
   const [casesExpanded, setCasesExpanded] = useState(false);
   const [requested, setRequested] = useState(false);
+  // 상단 지표 실집계 (마이페이지·performance 와 동일 소스)
+  const [statTotal, setStatTotal] = useState<number>(0);
+  const [statAvgMinutes, setStatAvgMinutes] = useState<number | null>(null);
 
   /* 약사 프로필 + 상담 사례 로드 */
   useEffect(() => {
@@ -124,6 +128,15 @@ export default function PharmacistClient() {
             outcome: ((row.outcome as string) ?? "").trim(),
           }))
         );
+
+        /* 상단 지표 실집계 — 보고 있는 약사 id 기준 (정적 컬럼 대신) */
+        const [total, avg] = await Promise.all([
+          fetchTotalConsultations(id),
+          fetchAvgResponseMinutes(id),
+        ]);
+        if (cancelled) return;
+        setStatTotal(total);
+        setStatAvgMinutes(avg);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -188,13 +201,13 @@ export default function PharmacistClient() {
   }
   const careerLine = careerParts.join(" · ");
 
-  // Stats 칸 구성 (약사톡 플랫폼 통계 — 실값 있는 것만)
+  // Stats 칸 구성 (약사톡 플랫폼 통계 — 실집계, 실값 있는 것만)
   const statCells: { num: string; label: string }[] = [];
-  if (profile.avgResponseMinutes != null) {
-    statCells.push({ num: formatResponse(profile.avgResponseMinutes), label: "평균 응답" });
+  if (statAvgMinutes != null) {
+    statCells.push({ num: formatResponse(statAvgMinutes), label: "평균 응답" });
   }
-  if (profile.totalConsultations > 0) {
-    statCells.push({ num: profile.totalConsultations.toLocaleString(), label: "약사톡 상담" });
+  if (statTotal > 0) {
+    statCells.push({ num: statTotal.toLocaleString(), label: "약사톡 상담" });
   }
   if (cases.length > 0) {
     statCells.push({ num: cases.length.toLocaleString(), label: "개선 사례" });

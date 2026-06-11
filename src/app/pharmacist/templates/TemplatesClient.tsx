@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, Suspense } from "react";
+import { useState, useEffect, Suspense } from "react";
 import { useRouter } from "next/navigation";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
 import {
   type Category,
   type Template,
   CATEGORIES,
   CATEGORY_STYLE,
-  INITIAL_TEMPLATES,
 } from "@/data/templatesMock";
 
 /* ══════════════════════════════════════════
@@ -37,9 +38,15 @@ const C = {
    메인
    ══════════════════════════════════════════ */
 
+/* 화면 모델 — Template + DB sort_order */
+type TemplateRow = Template & { sortOrder: number };
+
 function Content() {
   const router = useRouter();
-  const [templates, setTemplates] = useState<Template[]>(INITIAL_TEMPLATES);
+  const { user } = useAuth();
+
+  const [templates, setTemplates] = useState<TemplateRow[]>([]);
+  const [loading, setLoading] = useState(true);
 
   // 인라인 편집: "new" = 새로 추가, templateId = 편집, null = 닫힘
   const [formMode, setFormMode] = useState<string | null>(null);
@@ -49,6 +56,62 @@ function Content() {
 
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 1500);
+  };
+
+  // DB category(자유 text) → 화면 6종, 외/없음은 "기타" 폴백
+  const toCategory = (raw: string | null): Category =>
+    raw && (CATEGORIES as string[]).includes(raw) ? (raw as Category) : "기타";
+
+  /* reply_templates 접근 — created_at/updated_at 등 타입 미정의 컬럼 우회용 캐스팅 */
+  type RawRow = { id: string; title: string | null; content: string | null; category: string | null; sort_order: number | null };
+  type OrderStep = { order: (c: string, o: { ascending: boolean; nullsFirst?: boolean }) => OrderStep } & Promise<{ data: RawRow[] | null; error: { message: string } | null }>;
+  type Reader = { select: (c: string) => { eq: (c: string, v: string) => OrderStep } };
+  type Writer = {
+    insert: (p: Record<string, unknown>) => { select: () => { single: () => Promise<{ data: RawRow | null; error: { message: string } | null }> } };
+    update: (p: Record<string, unknown>) => { eq: (c: string, v: string) => Promise<{ error: { message: string } | null }> };
+    delete: () => { eq: (c: string, v: string) => Promise<{ error: { message: string } | null }> };
+  };
+  const rtRead = () => supabase.from("reply_templates") as unknown as Reader;
+  const rtWrite = () => supabase.from("reply_templates") as unknown as Writer;
+
+  /* ── 로드 ── */
+  useEffect(() => {
+    if (!user) { setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      try {
+        const { data, error } = await rtRead()
+          .select("id, title, content, category, sort_order, created_at")
+          .eq("pharmacist_id", user.id)
+          .order("sort_order", { ascending: true, nullsFirst: false })
+          .order("created_at", { ascending: true });
+        if (cancelled) return;
+        if (error) {
+          console.error("[templates] load failed:", error);
+          showToast("템플릿을 불러오지 못했어요");
+          return;
+        }
+        const rows = (data ?? []) as RawRow[];
+        setTemplates(rows.map((r) => ({
+          id: r.id,
+          title: (r.title ?? "").trim(),
+          content: (r.content ?? "").trim(),
+          category: toCategory(r.category),
+          sortOrder: r.sort_order ?? 0,
+        })));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   const openAddForm = () => {
     setFormMode("new");
@@ -56,7 +119,7 @@ function Content() {
     setFormTitle("");
     setFormContent("");
   };
-  const openEditForm = (t: Template) => {
+  const openEditForm = (t: TemplateRow) => {
     setFormMode(t.id);
     setFormCategory(t.category);
     setFormTitle(t.title);
@@ -70,35 +133,54 @@ function Content() {
 
   const canSaveForm = formTitle.trim().length > 0 && formContent.trim().length > 0;
 
-  const saveForm = () => {
-    if (!canSaveForm) return;
-    if (formMode === "new") {
-      const newT: Template = {
-        id: `t-${Date.now()}`,
-        category: formCategory,
-        title: formTitle.trim(),
-        content: formContent.trim(),
-      };
-      setTemplates((prev) => [...prev, newT]);
-    } else if (formMode) {
-      setTemplates((prev) => prev.map((t) => (t.id === formMode ? { ...t, category: formCategory, title: formTitle.trim(), content: formContent.trim() } : t)));
+  const saveForm = async () => {
+    if (!canSaveForm || saving || !user) return;
+    setSaving(true);
+    const title = formTitle.trim();
+    const content = formContent.trim();
+    const category = formCategory;
+    try {
+      if (formMode === "new") {
+        const nextSort = templates.length ? Math.max(...templates.map((t) => t.sortOrder)) + 1 : 0;
+        const { data, error } = await rtWrite()
+          .insert({ pharmacist_id: user.id, title, content, category, sort_order: nextSort })
+          .select().single();
+        if (error || !data) throw error ?? new Error("insert failed");
+        setTemplates((prev) => [...prev, { id: data.id, title, content, category, sortOrder: data.sort_order ?? nextSort }]);
+      } else if (formMode) {
+        const id = formMode;
+        const { error } = await rtWrite()
+          .update({ title, content, category, updated_at: new Date().toISOString() })
+          .eq("id", id);
+        if (error) throw error;
+        setTemplates((prev) => prev.map((t) => (t.id === id ? { ...t, title, content, category } : t)));
+      }
+      closeForm();
+    } catch (e) {
+      console.error("[templates] save failed:", e);
+      showToast("저장에 실패했어요");
+    } finally {
+      setSaving(false);
     }
-    closeForm();
   };
 
-  const confirmDelete = () => {
-    if (!deleteTargetId) return;
-    setTemplates((prev) => prev.filter((t) => t.id !== deleteTargetId));
-    if (formMode === deleteTargetId) closeForm();
+  const confirmDelete = async () => {
+    if (!deleteTargetId || saving) return;
+    setSaving(true);
+    const id = deleteTargetId;
+    const { error } = await rtWrite().delete().eq("id", id);
+    setSaving(false);
+    if (error) {
+      console.error("[templates] delete failed:", error);
+      showToast("삭제에 실패했어요");
+      return;
+    }
+    setTemplates((prev) => prev.filter((t) => t.id !== id));
+    if (formMode === id) closeForm();
     setDeleteTargetId(null);
   };
 
-  const showToast = (msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 1500);
-  };
-
-  const handleCopy = async (t: Template) => {
+  const handleCopy = async (t: TemplateRow) => {
     try {
       if (typeof navigator !== "undefined" && navigator.clipboard) {
         await navigator.clipboard.writeText(t.content);
@@ -174,8 +256,12 @@ function Content() {
             </div>
           )}
 
-          {/* 빈 상태 */}
-          {templates.length === 0 && formMode !== "new" ? (
+          {/* 로딩 / 빈 상태 / 목록 */}
+          {loading ? (
+            <div style={{ padding: "40px 20px", textAlign: "center", fontSize: 15, color: C.textMid }}>
+              불러오는 중이에요…
+            </div>
+          ) : templates.length === 0 && formMode !== "new" ? (
             <div style={{
               padding: "36px 24px",
               background: C.white,

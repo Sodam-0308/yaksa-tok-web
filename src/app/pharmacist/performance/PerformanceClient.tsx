@@ -27,14 +27,6 @@ const C = {
   error: "#D4544C",
 };
 
-/* avg_response_minutes → 사람이 읽는 형식 (60→"약 1시간", 90→"약 1시간 30분") */
-function formatAvgResponse(min: number): string {
-  if (min < 60) return `약 ${min}분`;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return m === 0 ? `약 ${h}시간` : `약 ${h}시간 ${m}분`;
-}
-
 /* 카테고리 키 → 한글 라벨 (피드와 동일) */
 const CATEGORY_LABELS: Record<string, string> = {
   digestion: "소화·장", sleep: "수면·마음", fatigue: "피로·기력",
@@ -94,12 +86,6 @@ function Content() {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
 
-  /* ── 상담 실적 (실데이터) ── */
-  const [statsLoading, setStatsLoading] = useState(true);
-  const [totalConsultations, setTotalConsultations] = useState<number | null>(null);
-  const [avgResponseMinutes, setAvgResponseMinutes] = useState<number | null>(null);
-  const [improvementCount, setImprovementCount] = useState<number | null>(null);
-
   /* tags 정규화 — categories(한글) 우선, 없으면 symptoms */
   const tagsFromRow = (row: Record<string, unknown>): string[] => {
     const categories = Array.isArray(row.categories) ? (row.categories as string[]) : [];
@@ -108,22 +94,12 @@ function Content() {
   };
 
   useEffect(() => {
-    if (!user) { setStatsLoading(false); setPostsLoading(false); return; }
+    if (!user) { setPostsLoading(false); return; }
     let cancelled = false;
-    setStatsLoading(true);
     setPostsLoading(true);
     (async () => {
       try {
-        const [ppRes, impRes, csRes, psRes] = await Promise.all([
-          supabase
-            .from("pharmacist_profiles")
-            .select("total_consultations, avg_response_minutes")
-            .eq("id", user.id)
-            .maybeSingle<{ total_consultations: number | null; avg_response_minutes: number | null }>(),
-          supabase
-            .from("improvement_confirmations")
-            .select("id", { count: "exact", head: true })
-            .eq("pharmacist_id", user.id),
+        const [csRes, psRes] = await Promise.all([
           supabase
             .from("case_studies")
             .select("*")
@@ -138,9 +114,6 @@ function Content() {
             .order("created_at", { ascending: false }),
         ]);
         if (cancelled) return;
-        setTotalConsultations(ppRes.data?.total_consultations ?? 0);
-        setAvgResponseMinutes(ppRes.data?.avg_response_minutes ?? null);
-        setImprovementCount(impRes.error ? 0 : (impRes.count ?? 0));
 
         const caseRows = (csRes.data ?? []) as Record<string, unknown>[];
         const storyRows = (psRes.data ?? []) as Record<string, unknown>[];
@@ -175,7 +148,7 @@ function Content() {
         );
         setPosts(merged);
       } finally {
-        if (!cancelled) { setStatsLoading(false); setPostsLoading(false); }
+        if (!cancelled) setPostsLoading(false);
       }
     })();
     return () => { cancelled = true; };
@@ -243,37 +216,13 @@ function Content() {
             style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: C.textDark, padding: 6, lineHeight: 1 }}
           >←</button>
           <div style={{ flex: 1, textAlign: "center", fontFamily: "'Gothic A1', sans-serif", fontSize: 16, fontWeight: 700, color: C.textDark, marginRight: 36 }}>
-            내 실적
+            내 사례·이야기 관리
           </div>
         </nav>
 
         <div className="perf-c">
           {/* ══════════════════════════════════════════
-              섹션 2 — 상담 실적
-              ══════════════════════════════════════════ */}
-          <section style={{ background: C.white, borderRadius: 16, padding: 20, marginBottom: 16, boxShadow: "0 2px 12px rgba(74,99,85,0.07)" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
-              <h2 style={{ fontSize: 17, fontWeight: 700, color: C.textDark, fontFamily: "'Gothic A1', sans-serif", margin: 0 }}>
-                상담 실적
-              </h2>
-            </div>
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <StatBox label="총 상담" value={statsLoading ? "—" : `${totalConsultations ?? 0}건`} />
-              <StatBox
-                label="평균 답변 시간"
-                value={statsLoading ? "—" : (avgResponseMinutes != null ? formatAvgResponse(avgResponseMinutes) : "—")}
-              />
-              <StatBox
-                label="개선 확인"
-                value={statsLoading ? "—" : (improvementCount != null ? `${improvementCount}건` : "—")}
-                accent
-              />
-            </div>
-          </section>
-
-          {/* ══════════════════════════════════════════
-              섹션 3 — 내 개선 사례
+              섹션 — 내 개선 사례
               ══════════════════════════════════════════ */}
           <section style={{ background: C.white, borderRadius: 16, padding: 20, boxShadow: "0 2px 12px rgba(74,99,85,0.07)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
@@ -539,25 +488,6 @@ function Content() {
         </div>
       )}
     </>
-  );
-}
-
-function StatBox({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
-  return (
-    <div style={{
-      padding: "14px 16px", borderRadius: 12,
-      background: accent ? C.sagePale : C.sageBg,
-      border: `1px solid ${accent ? C.sageLight : C.border}`,
-    }}>
-      <div style={{ fontSize: 13, color: C.textMid, marginBottom: 4 }}>{label}</div>
-      <div style={{
-        fontSize: 20, fontWeight: 800,
-        color: accent ? C.sageDeep : C.textDark,
-        fontFamily: "'Gothic A1', sans-serif",
-      }}>
-        {value}
-      </div>
-    </div>
   );
 }
 
